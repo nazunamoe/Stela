@@ -255,7 +255,7 @@ pub fn complete() -> Vec<(&'static Artifact, &'static Artifact)> {
 impl<'a> Bundle<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, Error> {
         if bytes.len() > MAX_MANIFEST_BYTES {
-            return Err(fail("host firmware bundle manifest exceeds 128 KiB"));
+            return Err(fail("host firmware bundle manifest exceeds 512 KiB"));
         }
         let bundle: Self = serde_json::from_slice(bytes)
             .map_err(|e| Error(format!("host firmware bundle manifest: {e}")))?;
