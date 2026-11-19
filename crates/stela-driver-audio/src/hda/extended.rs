@@ -99,7 +99,9 @@ pub(super) fn inspect<R: Registers>(
         let header = control(registers, offset)?;
         let id = ((header >> 16) & 0xfff) as u16;
         let version = (header >> 28) as u8;
-        if version != 1 || !(CAP_GTS..=CAP_DRSM).contains(&id) {
+        // Raptor Lake PCH (8086:7a50) reports its multi-link header as
+        // version 0; Linux's capability walk never checks the version.
+        if version > 1 || !(CAP_GTS..=CAP_DRSM).contains(&id) {
             return Err(Error::UnsupportedExtendedCapability { id, version });
         }
         if seen[usize::from(id)] {
@@ -133,11 +135,9 @@ pub(super) fn inspect<R: Registers>(
         }
         ranges.push(current);
         match id {
-            CAP_GTS => {
-                if registers.read32(offset + 4) != 0 {
-                    return Err(Error::UnsupportedExtendedCapability { id, version });
-                }
-            }
+            // Never touched: a nonzero descriptor count only lengthens a
+            // region this walk under-measures, which never forges overlap.
+            CAP_GTS => {}
             CAP_PP | CAP_SPB | CAP_DRSM => {
                 if control(registers, offset + 4)? != 0 {
                     return Err(Error::ProcessingOwned { offset: offset + 4 });
@@ -149,7 +149,12 @@ pub(super) fn inspect<R: Registers>(
                     let base = offset + LINK_BASE + index * LINK_INTERVAL;
                     let capabilities = registers.read32(base);
                     if capabilities & ALT != 0 || capabilities & FREQUENCIES == 0 {
-                        return Err(Error::UnsupportedLink { offset: base });
+                        // Only the first (conventional) link is ever clocked;
+                        // later alternate links are left to firmware.
+                        if index == 0 {
+                            return Err(Error::UnsupportedLink { offset: base });
+                        }
+                        continue;
                     }
                     result.links.push(Link {
                         base,

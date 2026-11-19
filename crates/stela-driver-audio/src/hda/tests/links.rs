@@ -69,8 +69,40 @@ fn clock_selection_preserves_other_links() {
 }
 
 #[test]
+fn raptor_lake_capability_layout_is_accepted() {
+    // 8086:7a50 on hardware: version-0 headers, a described GTS unit and an
+    // alternate second link. Only the first link is clocked.
+    let mut fixture = Fixture::new();
+    let model = extended_model();
+    {
+        let mut m = model.borrow_mut();
+        m.set(0x500, 0x0001_0800, 4);
+        m.set(0x504, 1, 4);
+        m.set(0xc00, 0x0002_0700, 4);
+        m.set(0xc80, 1 << 28, 4);
+    }
+    let (mut function, _state) = reset_pci(&model);
+    let prepared = pci::tests::modern_prepared_model(function.address);
+    let registers =
+        // SAFETY: The prepared PCI fixture and ModelRegisters share the same BDF/BAR.
+        // The Rc-backed model is driven synchronously and outlives this adapter.
+        unsafe { prepared.bind_registers(&mut function, ModelRegisters(model.clone())) }
+            .unwrap();
+    let timer = model.borrow().clock.clone();
+    // SAFETY: The bound PCI fixture owns the register model exclusively. fixture
+    // keeps the aligned DMA backing, and polling is the only model execution.
+    let controller = unsafe {
+        Controller::new(registers, timer, &mut fixture.allocator, modern_config())
+            .map_err(|failure| failure.error)
+    }
+    .unwrap();
+    assert_eq!(controller.link_clock().unwrap().unwrap().encoding, 2);
+    assert_eq!(model.borrow().get(0xc84, 4), 3 | (1 << 16) | (1 << 23));
+}
+
+#[test]
 fn invalid_link_preflight() {
-    for variant in 0..17 {
+    for variant in 0..16 {
         let mut fixture = Fixture::new();
         let model = extended_model();
         match variant {
@@ -89,8 +121,7 @@ fn invalid_link_preflight() {
             12 => model.borrow_mut().set(0x500, 0x2001_0800, 4),
             13 => model.borrow_mut().set(0x804, u32::MAX, 4),
             14 => model.borrow_mut().set(0x1000, 0x1005_0700, 4), //Repeated SPB.
-            15 => model.borrow_mut().bytes.truncate(0xc60),
-            _ => model.borrow_mut().set(0x504, 1, 4), //Undecoded GTS geometry.
+            _ => model.borrow_mut().bytes.truncate(0xc60),
         }
         let (mut function, state) = reset_pci(&model);
         let prepared = pci::tests::modern_prepared_model(function.address);
