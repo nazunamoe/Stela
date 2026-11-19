@@ -229,7 +229,7 @@ fn number(value: &str) -> Option<u8> {
 /// the ID lists expanded from `ids`.
 pub fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, Described>, String> {
     let lists = lists(ids)?;
-    let joined = strip_comments(&table.replace("\\\n", " "));
+    let joined = strip_comments(&table.replace("\r\n", "\n").replace("\\\n", " "));
     let macros = macros(&joined);
     let mut descriptors = BTreeMap::new();
     for descriptor in joined
@@ -322,7 +322,7 @@ fn strip_comments(text: &str) -> String {
 type Lists = BTreeMap<String, (Vec<u16>, Vec<String>)>;
 fn lists(ids: &str) -> Result<Lists, String> {
     let mut lists = BTreeMap::new();
-    for definition in ids.replace("\\\n", " ").lines() {
+    for definition in ids.replace("\r\n", "\n").replace("\\\n", " ").lines() {
         let Some(rest) = definition.strip_prefix("#define ") else {
             continue;
         };

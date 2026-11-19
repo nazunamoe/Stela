@@ -82,7 +82,7 @@ fn expand(text: &str, macros: &BTreeMap<&str, &str>, depth: u8) -> Option<String
 /// last `.ver` of its initializer with the macros it names expanded, as C
 /// takes the last designator (Gen9's features start from Gen8's).
 fn versions(info: &str) -> Result<BTreeMap<String, u8>, String> {
-    let joined = info.replace("\\\n", " ");
+    let joined = info.replace("\r\n", "\n").replace("\\\n", " ");
     // Each macro's body by name, object-like or function-like.
     let macros: BTreeMap<&str, &str> = joined
         .lines()

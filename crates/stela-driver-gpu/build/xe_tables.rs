@@ -16,7 +16,7 @@ pub type Described = (u8, bool, String, bool, bool, bool);
 pub fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, Described>, String> {
     // Each list macro's own IDs and the list macros it includes.
     let mut lists = BTreeMap::new();
-    for definition in ids.replace("\\\n", " ").lines() {
+    for definition in ids.replace("\r\n", "\n").replace("\\\n", " ").lines() {
         let Some(rest) = definition.strip_prefix("#define ") else {
             continue;
         };
@@ -48,7 +48,7 @@ pub fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, Described>, Strin
     }
     // The table's object-like macros, which descriptors include whole
     // (`DG2_FEATURES`).
-    let joined = table.replace("\\\n", " ");
+    let joined = table.replace("\r\n", "\n").replace("\\\n", " ");
     let macros: BTreeMap<&str, &str> = joined
         .lines()
         .filter_map(|line| line.trim_start().strip_prefix("#define "))
@@ -160,7 +160,7 @@ const MAKE_FW_PATH: &str = "__stringify(dir__) \"/\" __stringify(shortname__) \"
 /// `XE_*_FIRMWARE_DEFS` lists expanded with the file name forms their
 /// `MODULE_FIRMWARE` declarations pass.
 pub fn uc_firmware(source: &str) -> Result<BTreeMap<String, [Option<String>; 3]>, String> {
-    let joined = source.replace("\\\n", " ");
+    let joined = source.replace("\r\n", "\n").replace("\\\n", " ");
     let path = joined
         .lines()
         .find_map(|line| {
