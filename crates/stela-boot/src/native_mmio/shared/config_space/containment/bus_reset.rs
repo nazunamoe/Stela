@@ -4,7 +4,7 @@
 use super::*;
 use stela_drivers::{
     block::BlockError,
-    bus::pci::{ConfigSpace, Function, bus_reset, capability, power::Timer},
+    bus::pci::{ConfigSpace, Function, bus_reset, capability, power::Timer, substates},
 };
 
 /// PCI Express device/port types whose link carries a single device: a
@@ -117,21 +117,123 @@ fn members(fabric: &Fabric, address: Address) -> Result<(usize, Vec<usize>), &'s
 }
 
 impl Source {
+    /// The bridge directly above the function at `address` in the contained
+    /// fabric, as the census routed it; `None` for a function on a root bus,
+    /// outside the fabric, or before containment. Reads only.
+    pub(crate) fn parent_bridge(&self, address: Address) -> Option<Address> {
+        let cohort = self.pci_slots.0.try_borrow().ok()?;
+        let Cohort::Parked(fabric) = &*cohort else {
+            return None;
+        };
+        let at = fabric
+            .slots
+            .binary_search_by_key(&address, |slot| slot.address)
+            .ok()?;
+        match fabric.slots[at].route {
+            topology::Parent::Bridge(bridge) => Some(bridge),
+            _ => None,
+        }
+    }
+
     /// Whether [`Self::reset_parent_bus`] would find a bus it may reset for
     /// the cold requester at `address`. Reads only.
     pub(crate) fn parent_bus_reset_available(&self, address: Address) -> bool {
+        self.parent_bus_reset_refusal(address).is_none()
+    }
+
+    /// Why [`Self::reset_parent_bus`] would refuse the cold requester at
+    /// `address` now; `None` when it would find a bus it may reset. Reads
+    /// only.
+    pub(crate) fn parent_bus_reset_refusal(&self, address: Address) -> Option<&'static str> {
         let Ok(cohort) = self.pci_slots.0.try_borrow() else {
-            return false;
+            return Some("the PCI fabric is busy");
         };
         let Cohort::Parked(fabric) = &*cohort else {
-            return false;
+            return Some("the PCI fabric is not contained");
         };
-        members(fabric, address).is_ok_and(|(parent, _)| {
-            fabric.slots[parent]
-                .forwarding
-                .as_ref()
-                .is_some_and(|forwarding| forwarding.check().is_ok())
-        })
+        let (parent, _) = match members(fabric, address) {
+            Ok(members) => members,
+            Err(why) => return Some(why),
+        };
+        match &fabric.slots[parent].forwarding {
+            Some(forwarding) if forwarding.check().is_ok() => None,
+            _ => Some("the bridge's forwarding changed"),
+        }
+    }
+
+    /// Set the L1 PM Substates of the link above the cold requester at
+    /// `address` as Linux's ASPM core leaves a link the firmware set up
+    /// ([`substates::configure`]), with LTR's path read from the function
+    /// and every forwarding bridge above it up to the root port; a bridge
+    /// whose configuration is not held counts as one without LTR. Only the
+    /// bridge directly above is written, and only its Link Control and L1
+    /// PM Substates controls.
+    ///
+    /// # Safety
+    /// `function` is the cold owner of `address` this source promoted, in
+    /// D0, with Bus Master sealed. The caller keeps every other
+    /// configuration and topology writer excluded.
+    pub(crate) unsafe fn configure_link_substates(
+        &self,
+        address: Address,
+        function: &mut Function<OwnedConfig>,
+    ) -> Result<substates::Configured, alloc::string::String> {
+        use alloc::string::ToString;
+        if function.address != address || function.config().address() != address {
+            return Err("the PCI function's owner does not match".to_string());
+        }
+        let mut cohort = self
+            .pci_slots
+            .0
+            .try_borrow_mut()
+            .map_err(|_| "the PCI fabric is busy".to_string())?;
+        let Cohort::Parked(fabric) = &mut *cohort else {
+            return Err("the PCI fabric is not contained".to_string());
+        };
+        let slot_of = |fabric: &Fabric, address: Address| {
+            fabric
+                .slots
+                .binary_search_by_key(&address, |slot| slot.address)
+                .ok()
+        };
+        let at = slot_of(fabric, address)
+            .ok_or_else(|| "the PCI function is outside the contained fabric".to_string())?;
+        let topology::Parent::Bridge(bridge) = fabric.slots[at].route else {
+            return Err("the PCI function sits on a root bus, with no link above it".to_string());
+        };
+        // LTR from the function up to the root complex, as Linux's
+        // `pci_configure_ltr` sets `ltr_path`.
+        let own = substates::ltr(function.config())
+            .map_err(|error| alloc::format!("{error:?}"))?
+            .unwrap_or_default();
+        let mut chain = alloc::vec![own];
+        let mut above = Some(bridge);
+        while let Some(current) = above.take() {
+            let Some(index) = slot_of(fabric, current) else {
+                chain.push(substates::Ltr::default());
+                break;
+            };
+            let ltr = match &fabric.slots[index].forwarding {
+                Some(Forwarding::Open { config, .. }) => {
+                    substates::ltr(config).ok().flatten().unwrap_or_default()
+                }
+                _ => substates::Ltr::default(),
+            };
+            chain.push(ltr);
+            if let topology::Parent::Bridge(next) = fabric.slots[index].route
+                && chain.len() < 32
+            {
+                above = Some(next);
+            }
+        }
+        let path = substates::ltr_path(&chain);
+        let parent = slot_of(fabric, bridge)
+            .ok_or_else(|| "the bridge above is outside the contained fabric".to_string())?;
+        let Some(Forwarding::Open { config, .. }) = &mut fabric.slots[parent].forwarding else {
+            return Err("the bridge above the PCI function does not forward".to_string());
+        };
+        substates::configure(config, function.config(), path)
+            .map_err(|error| alloc::format!("{error:?}"))
     }
 
     /// Reset the bus of the cold requester at `address` by Secondary Bus

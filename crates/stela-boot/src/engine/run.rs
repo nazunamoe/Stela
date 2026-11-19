@@ -858,8 +858,8 @@ pub(super) const HOME_SLICES_PER_SECOND: u64 = 250;
 
 /// Seconds between heartbeat lines, which locate a guest that runs without
 /// output: every one a full beat for a boot's first ten minutes and under
-/// `--profile`, then a full beat once a minute and a short line between
-/// (`stela_boot_core::beat_pace`).
+/// `--profile`, then a full beat once a minute, and after an hour once in
+/// ten minutes, with a short line between (`stela_boot_core::beat_pace`).
 pub(super) const BEAT_SECONDS: u64 = beat_pace::BEAT_SECONDS;
 
 /// The counter when the guest first ran in this boot, which the beat's
@@ -1033,11 +1033,14 @@ pub(super) fn run<H: Host>(
         let due = now - heartbeat.beat.at;
         if heartbeat.stage.is_some() {
             // The beat's later reports, one bounded stage per boundary.
+            let _periodic = output::periodic();
             host_work(machine, "beat step", |machine| {
                 heartbeat.step(machine, tsc_hz)
             });
             continue;
         }
+        // The beat's reports, whose size their pace bounds, pass the log's
+        // per-family budgets (`output::periodic`).
         match beat_pace::due(
             now.wrapping_sub(ran_since),
             due,
@@ -1047,12 +1050,14 @@ pub(super) fn run<H: Host>(
             quiet,
         ) {
             beat_pace::Due::Full => {
+                let _periodic = output::periodic();
                 host_work(machine, "beat", |machine| {
                     heartbeat.beat(machine, &mut service, now, tsc_hz)
                 });
                 output::arguments(format_args!("{}", cursor.report(now, tsc_hz)));
             }
             beat_pace::Due::Short => {
+                let _periodic = output::periodic();
                 host_work(machine, "beat", |machine| {
                     heartbeat.short_beat(machine, now)
                 });
@@ -1067,6 +1072,7 @@ pub(super) fn run<H: Host>(
                 .compare_exchange(ident_at, now, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
+            let _periodic = output::periodic();
             super::ident::report();
         }
     }
@@ -1429,6 +1435,10 @@ pub(super) struct Heartbeat {
     pub(super) retired: u128,
     /// Each PE's counts at the last beat.
     pub(super) pe_counts: Vec<parallel::Counts>,
+    /// The host package's energy counter at the last beat (`PES CLOCK`).
+    pub(super) package_energy: stela_boot_core::host_clock::PackageEnergy,
+    /// `HOST CLOCK ALL BUSY` was written.
+    pub(super) all_busy_written: bool,
     /// The shared count at the last beat, 0 before the first.
     pub(super) clock_count: u64,
     /// Lock waits at the last beat: the devices', by call, and the heap's.
@@ -1512,6 +1522,8 @@ impl Heartbeat {
             line: Beat::at(machine, now),
             retired: machine.retired_instructions(),
             pe_counts: parallel::counts(machine),
+            package_energy: stela_boot_core::host_clock::PackageEnergy::new(),
+            all_busy_written: false,
             clock_count: 0,
             lock_waits: ([0; Call::ALL.len()], 0),
             lock_times: Default::default(),
@@ -2446,9 +2458,47 @@ impl Heartbeat {
                 "{}\n",
                 stela_boot_core::exit_times::pes_exit_time(tsc_hz / 1000, &pe_exits)
             ));
+            // Once, the clock with every PE running at least 80 % of the beat
+            // against the boot's single-core clock.
+            if !self.all_busy_written {
+                let deltas: Vec<_> = pe_clocks
+                    .iter()
+                    .map(|clock| {
+                        clock.now.counters.then(|| {
+                            (
+                                clock.now.actual.wrapping_sub(clock.before.actual),
+                                clock.now.reference.wrapping_sub(clock.before.reference),
+                            )
+                        })
+                    })
+                    .collect();
+                if let Some((mhz, least)) =
+                    stela_boot_core::host_speed::all_busy_mhz(tsc_hz, elapsed, &deltas, 80)
+                {
+                    self.all_busy_written = true;
+                    output::arguments(format_args!(
+                        "{}",
+                        stela_boot_core::host_speed::all_busy_line(
+                            mhz,
+                            super::speed::single_core_hz(),
+                            least
+                        )
+                    ));
+                }
+            }
+            // This core's package: one RAPL counter read a beat.
+            let package_milliwatts = host::pmu::package_energy().and_then(|(unit, counter)| {
+                self.package_energy
+                    .sample(unit, counter, host::rdtsc(), tsc_hz)
+            });
             output::arguments(format_args!(
                 "{}\n",
-                stela_boot_core::host_clock::pes_clock(tsc_hz, elapsed, &pe_clocks)
+                stela_boot_core::host_clock::pes_clock(
+                    tsc_hz,
+                    elapsed,
+                    &pe_clocks,
+                    package_milliwatts
+                )
             ));
             output::arguments(format_args!("{fetches}\n"));
             let mut cache = None;
@@ -2562,7 +2612,8 @@ impl Heartbeat {
 
 /// The board's code cache since `was`, holding `blocks`, in the plain terms
 /// of `CODE CACHE` (`stela_boot_core::load_lines`): its size, fill, turns
-/// and whole flushes, and what the beat took away and installed again.
+/// and the whole flushes its PEs made, and what the beat took away and
+/// installed again.
 fn code_cache(
     now: &stela_engine::machine::engine::CodeReport,
     was: &stela_engine::machine::engine::CodeReport,

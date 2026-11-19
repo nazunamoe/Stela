@@ -100,6 +100,7 @@ pub(crate) fn layout(
     };
     let table = Table {
         disk_guid: guid()?,
+        slots: Default::default(),
         partitions: vec![esp.clone(), data.clone()],
     };
     let table = gpt::encode(disk, &table)

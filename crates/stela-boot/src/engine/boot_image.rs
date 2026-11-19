@@ -41,6 +41,16 @@ pub(super) fn load(
             display::boot_framebuffer(chosen.0, options.dram_base + options.ram_bytes)
         })
         .flatten();
+    if let Some(screen) = &framebuffer {
+        output::arguments(format_args!(
+            "DISPLAY macOS gets a {}x{} boot screen at display scale {} (/chosen \
+             display-scale); macOS reads that only for a built-in panel, so on a monitor the \
+             installer's Apple logo takes WindowServer's own first mode\n",
+            screen.width,
+            screen.height,
+            screen.display_scale()
+        ));
+    }
     if options.bundle {
         crate::status::begin("Loading macOS into memory");
         let files = &handoff.files[..handoff.file_count];

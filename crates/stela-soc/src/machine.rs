@@ -30,7 +30,7 @@ use crate::usb::{
 };
 pub use crate::usb::{
     ecm::Counters as UsbNetworkCounters,
-    hci::{Counters as UsbBluetoothCounters, Outbound},
+    hci::{Counters as UsbBluetoothCounters, Outbound, Traced as UsbBluetoothTrace},
     host::{Descriptor as UsbDescriptor, MuxEndpoints},
     mux::{
         Backpressure as MuxBackpressure, State as MuxState, StreamId as MuxStream,
@@ -387,9 +387,18 @@ pub struct UsbCables {
     pub disks: Vec<Box<dyn BlockDevice>>,
     /// A USB Ethernet adapter with this station address.
     pub network: Option<Mac>,
-    /// A USB Bluetooth controller: bridged to one of the host's, or the
-    /// model the owner selects with [`AppleDevices::bluetooth_model`].
-    pub bluetooth: bool,
+    /// A USB Bluetooth controller.
+    pub bluetooth: Option<UsbBluetooth>,
+}
+
+/// The USB Bluetooth controller on the native hub.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsbBluetooth {
+    /// A generic controller whose packets go to one of the host's.
+    Host,
+    /// Apple's internal USB Bluetooth module, answered by the controller
+    /// model: powered, with no radio, finding nothing.
+    Model,
 }
 
 impl UsbCables {

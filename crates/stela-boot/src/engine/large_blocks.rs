@@ -7,6 +7,7 @@ use crate::output;
 use alloc::{format, string::String, vec::Vec};
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
+use stela_boot_core::stack_scan;
 
 /// Live large blocks kept; past them a block is only counted.
 const SLOTS: usize = 256;
@@ -80,12 +81,21 @@ fn allocated_or_freed(pointer: usize, bytes: usize, allocated: bool) {
     slot.bytes.store(bytes as u64, Ordering::Release);
 }
 
-/// The image offsets among the stack's words from the stack pointer on, at
-/// most [`SCANNED`] words: its own page, which is mapped, then the page above
-/// through a read that a fault ends, as that page may be the stack's guard.
+/// The image offsets among the allocating stack's words, for its slot.
 /// Whether any was found.
 fn stack_offsets(out: &mut [u64; WORDS]) -> bool {
-    const PAGE: u64 = 4096;
+    stack_code_offsets(SCANNED, out) != 0
+}
+
+/// Fills `out` with the image offsets of code among this stack's words from
+/// the stack pointer up, at most `scanned` words, for the count kept: the
+/// stack pointer's own page, which is mapped, then the pages above through a
+/// read a fault ends ([`stela_boot_core::stack_scan`]), as a stack may end
+/// within a page of its pointer, below an absent guard page.
+///
+/// Only for hooks the engine runs after its host fault handler is active,
+/// as the heap's large-block and peak hooks are.
+pub(in crate::engine) fn stack_code_offsets(scanned: usize, out: &mut [u64]) -> usize {
     unsafe extern "C" {
         static __ImageBase: u8;
     }
@@ -100,44 +110,39 @@ fn stack_offsets(out: &mut [u64; WORDS]) -> bool {
             u64::from(pe.byte_add(0x1c).read_unaligned()),
         )
     };
-    let stack: *const u64;
+    let stack: u64;
     // SAFETY: reads the stack pointer.
     unsafe {
         core::arch::asm!("mov {}, rsp", out(reg) stack, options(nomem, nostack, preserves_flags));
     }
-    let own = ((PAGE - stack as u64 % PAGE) / 8) as usize;
     let mut kept = 0;
-    for word in 0..SCANNED {
-        let value = if word < own {
-            // SAFETY: within the stack pointer's own page.
-            unsafe { stack.add(word).read() }
-        } else {
+    let read = |address: u64, how| match how {
+        // SAFETY: within the stack pointer's own page, which is mapped.
+        stack_scan::Read::Own => Some(unsafe { (address as *const u64).read() }),
+        stack_scan::Read::Guarded => {
             let mut value = 0u64;
-            // SAFETY: the engine's host fault handler is active (the hook is
-            // installed after it), and `value` is this frame's own; a fault
+            // SAFETY: the engine's host fault handler is active (this
+            // function's contract), and `value` is this frame's own; a fault
             // ends the read with bytes unread.
             let unread = unsafe {
                 stela_boot_core::nofault_read::read(
                     (&raw mut value).cast(),
-                    stack.wrapping_add(word).cast(),
+                    address as *const u8,
                     8,
                 )
             };
-            if unread != 0 {
-                break;
-            }
-            value
-        };
+            (unread == 0).then_some(value)
+        }
+    };
+    stack_scan::scan(stack, scanned, read, |value| {
         let offset = value.wrapping_sub(base);
         if offset.wrapping_sub(code) < size {
             out[kept] = offset;
             kept += 1;
-            if kept == WORDS {
-                break;
-            }
         }
-    }
-    kept != 0
+        kept < out.len()
+    });
+    kept
 }
 
 /// `HEAP LARGE blocks=31 bytes=612M untracked=0 empty_stacks=0`, then each live block,

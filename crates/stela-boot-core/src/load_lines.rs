@@ -69,7 +69,9 @@ pub fn pes_share(interval: u64, pes: &[PeTime]) -> String {
 
 /// The board's code cache at a beat: the window's bytes, its parts and
 /// those holding code, the blocks it holds, the parts opened and the times
-/// every block was forgotten at once since boot; and since the last beat
+/// a PE forgot every block at once since boot (`flushes`: each PE that
+/// applies one guest invalidation of the whole instruction cache forgets
+/// them, so one such invalidation on 8 PEs counts 8); and since the last beat
 /// the parts taken away to make room, those of them taken early for want
 /// of a block slot, the installs and those of blocks the cache held before.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -86,9 +88,10 @@ pub struct CodeCache {
     pub again: u64,
 }
 
-/// `CODE CACHE size=768M parts=31/32 blocks=1594153 turns=14.7 flushes=6
+/// `CODE CACHE size=768M parts=31/32 blocks=1594153 turns=14.7 pe_flushes=6
 /// taken=10 forced=0 installs=523569 again=52%`: `turns` is how often the
-/// whole window was filled since boot (parts opened over its parts), and
+/// whole window was filled since boot (parts opened over its parts),
+/// `pe_flushes` the [`CodeCache::flushes`] by every PE together, and
 /// `again` the share of the beat's installs that were of blocks the cache
 /// held before and took away. A cache under pressure shows several parts
 /// taken a beat and `again` near or past half; a larger window lowers both.
@@ -96,7 +99,7 @@ pub fn code_cache(cache: &CodeCache) -> String {
     let parts = u64::from(cache.parts.max(1));
     let tenths = u64::from(cache.opened) * 10 / parts;
     format!(
-        "CODE CACHE size={}M parts={}/{} blocks={} turns={}.{} flushes={} taken={} forced={} \
+        "CODE CACHE size={}M parts={}/{} blocks={} turns={}.{} pe_flushes={} taken={} forced={} \
          installs={} again={}%",
         cache.window >> 20,
         cache.held,
@@ -164,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_line_states_size_fill_turns_flushes_and_what_came_back() {
+    fn the_cache_line_states_size_fill_turns_each_pes_flushes_and_what_came_back() {
         // A 16 GiB PC's desktop at 358 s: 768 MiB in 32 parts, 241 opened.
         let cache = CodeCache {
             window: 768 << 20,
@@ -180,13 +183,13 @@ mod tests {
         };
         assert_eq!(
             code_cache(&cache),
-            "CODE CACHE size=768M parts=31/32 blocks=1594153 turns=7.5 flushes=6 taken=10 \
+            "CODE CACHE size=768M parts=31/32 blocks=1594153 turns=7.5 pe_flushes=6 taken=10 \
              forced=0 installs=523569 again=52%"
         );
         // A quiet beat and a board with no window yet divide by nothing.
         assert_eq!(
             code_cache(&CodeCache::default()),
-            "CODE CACHE size=0M parts=0/0 blocks=0 turns=0.0 flushes=0 taken=0 forced=0 \
+            "CODE CACHE size=0M parts=0/0 blocks=0 turns=0.0 pe_flushes=0 taken=0 forced=0 \
              installs=0 again=0%"
         );
     }

@@ -426,9 +426,11 @@ fn a_link_change_waits_in_steps_and_ends_as_an_uncontended_one() {
         assert!(!net.controller.is_poisoned());
         let m = state.borrow();
         // The call that completes the change may then send or offer, and
-        // each run has its own ring memory.
+        // each run has its own ring memory: the rings' whole base address,
+        // high word too, since two runs' memory can lie on either side of
+        // a 4 GiB boundary.
         let mut mac = m.mac.clone();
-        for at in [TDT, RDT, TDBAL, RDBAL] {
+        for at in [TDT, RDT, TDBAL, RDBAL, TDBAH, RDBAH] {
             mac.remove(&at);
         }
         (calls, m.time - start, m.phy.clone(), m.emi.clone(), mac)

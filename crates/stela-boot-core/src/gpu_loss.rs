@@ -26,6 +26,75 @@ pub const REOPEN_SPAN_MS: u64 = 30_000;
 /// left the bus (nouveau's `nvkm_device_gone`): after it no reopen can work.
 const SILENT: &str = ": stopped answering";
 
+/// What a kernel driver's line says, after its device's name, of a GPU
+/// whose MMIO read all ones for a moment and then answered again
+/// (nouveau's `nvkm_device_gone`).
+const ANSWERS_AGAIN: &str = ": answers again";
+
+/// [`link_event`]'s name for a GPU that stopped answering.
+pub const STOPPED_ANSWERING: &str = "stopped answering";
+
+/// What a kernel driver's `line` says of its GPU's link, as the boot log
+/// names it beside the port's view: that it stopped answering, or that it
+/// answered again after a silence; `None` for any other line.
+pub fn link_event(line: &str) -> Option<&'static str> {
+    if line.contains(SILENT) {
+        Some(STOPPED_ANSWERING)
+    } else if line.contains(ANSWERS_AGAIN) {
+        Some("answered again after a silence")
+    } else {
+        None
+    }
+}
+
+/// Which recovery the port above a GPU that stopped answering still
+/// allows, for one boot-log line. Stela tries none of them: the session
+/// ends at the GPU's first failed reopen.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Recovery {
+    /// The port could not be read.
+    Unknown,
+    /// The port above does not answer either.
+    PortGone,
+    /// The port answers and a secondary bus reset through it is possible.
+    BusReset { port: String, link_up: bool },
+    /// The port answers, but the fabric would refuse the bus reset.
+    NoBusReset { why: &'static str, link_up: bool },
+}
+
+impl core::fmt::Display for Recovery {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let link = |up: bool| {
+            if up {
+                "its link is up"
+            } else {
+                "its link is down"
+            }
+        };
+        match self {
+            Self::Unknown => f.write_str("unknown: the port above it is not read"),
+            Self::PortGone => f.write_str(
+                "none from here: the port above it does not answer either, so the power or the \
+                 platform took the whole link, which no reset Stela can make reaches",
+            ),
+            Self::BusReset { port, link_up } => write!(
+                f,
+                "possible by a secondary bus reset through port {port} ({}) and a new start of \
+                 its driver and its GPU firmware, as Linux's AER recovery resets a bus (nouveau \
+                 has no error handler, so Linux does not restart it); Stela does not try it and \
+                 the session ends",
+                link(*link_up)
+            ),
+            Self::NoBusReset { why, link_up } => write!(
+                f,
+                "none bounded: the port answers ({}), but a secondary bus reset through it is \
+                 refused: {why}",
+                link(*link_up)
+            ),
+        }
+    }
+}
+
 /// A GPU that serves Metal, as [`verdict`] reads it.
 #[derive(Clone, Copy, Debug)]
 pub struct Gpu<'a> {
@@ -193,6 +262,25 @@ mod tests {
         }
     }
 
+    /// Both of nouveau's link lines are named for the port's line, and no
+    /// other line is.
+    #[test]
+    fn the_lines_that_go_with_the_ports_view_are_the_silence_and_its_end() {
+        assert_eq!(link_event(GONE), Some("stopped answering"));
+        assert_eq!(
+            link_event(
+                "nouveau 0000:02:00.0: answers again: BOOT_0 read ffffffff for 12 to 20 ms \
+                 (config vendor 10de link status 1043 then; ...); taken for a transient, said \
+                 once"
+            ),
+            Some("answered again after a silence")
+        );
+        assert_eq!(
+            link_event("nouveau 0000:02:00.0: timer: stalled at ffffffffffffffff"),
+            None
+        );
+    }
+
     #[test]
     fn a_working_gpu_or_one_that_may_still_reopen_goes_on() {
         assert_eq!(verdict(&[]), None);
@@ -281,5 +369,29 @@ mod tests {
         let cut = SilentLines::<1, 41>::new();
         assert!(cut.observe("amdgpu 0000:03:00.0: stopped answering: é"));
         assert!(cut.of("0000:03:00.0").expect("kept").ends_with(": "));
+    }
+
+    #[test]
+    fn a_silent_gpus_recovery_line_says_what_the_port_still_allows() {
+        assert!(format!("{}", Recovery::PortGone).starts_with("none from here"));
+        let reset = Recovery::BusReset {
+            port: String::from("0000:00:01.1"),
+            link_up: false,
+        };
+        let line = format!("{reset}");
+        assert!(line.starts_with("possible by a secondary bus reset through port 0000:00:01.1"));
+        assert!(line.contains("its link is down"));
+        let refused = Recovery::NoBusReset {
+            why: "another driver claimed a function on the PCI function's bus",
+            link_up: true,
+        };
+        assert!(
+            format!("{refused}")
+                .ends_with("refused: another driver claimed a function on the PCI function's bus")
+        );
+        assert_eq!(
+            link_event("nouveau 0000:01:00.0: stopped answering"),
+            Some(STOPPED_ANSWERING)
+        );
     }
 }

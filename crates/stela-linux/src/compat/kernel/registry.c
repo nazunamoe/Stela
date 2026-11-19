@@ -35,7 +35,13 @@ static const struct stela_linux_registry_image *owned_image;
 static bool permanently_retired;
 #if defined(STELA_LINUX_REGISTRY_TEST) || defined(STELA_LINUX_REGISTRY_SOURCE_TEST)
 static bool fail_registry_allocation;
-static size_t registry_allocations, registry_releases;
+static size_t registry_releases;
+#endif
+/* Only the registry test reads the allocation count; a source-test build
+ * that kept it would only write it, which Clang 23's
+ * -Wunused-but-set-global makes an error under -Werror. */
+#ifdef STELA_LINUX_REGISTRY_TEST
+static size_t registry_allocations;
 #endif
 
 struct call_guard {
@@ -340,7 +346,9 @@ int stela_linux_registry_begin(const struct stela_linux_registry_image *im,
  struct stela_linux_registry *r;
 #if defined(STELA_LINUX_REGISTRY_TEST) || defined(STELA_LINUX_REGISTRY_SOURCE_TEST)
  r = fail_registry_allocation ? NULL : stela_linux_heap_alloc(size, __alignof__(*r));
+#ifdef STELA_LINUX_REGISTRY_TEST
  if (r) registry_allocations++;
+#endif
 #else
  r = stela_linux_heap_alloc(size, __alignof__(*r));
 #endif

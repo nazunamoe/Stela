@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Raw scan-set-2 framing and the Linux atkbd set-2 keycode table.
+//! Scan-set-2 framing, the set 1 an i8042 translates it to, and the Linux
+//! atkbd set-2 keycode and unxlate tables.
 //! Copyright (c) 1999–2002 Vojtech Pavlik. See NOTICE.
 use super::{ErrorKind, Input, Port};
 use alloc::vec::Vec;
@@ -8,9 +9,33 @@ const EXTENDED: u8 = 0xe0;
 const PAUSE: u8 = 0xe1;
 const BREAK: u8 = 0xf0;
 const PAUSE_TAIL: [u8; 7] = [0x14, 0x77, 0xe1, 0xf0, 0x14, 0xf0, 0x77];
+const BAT: u8 = 0xaa;
+const ACK: u8 = 0xfa;
+const NAK: u8 = 0xfe;
+const ERR: u8 = 0xff;
+const HANJA: u8 = 0xf1;
+const HANGEUL: u8 = 0xf2;
+/// Linux atkbd's `xl_table`: translated bytes that are a reply or a lone key
+/// code as they arrive and also a key's release with bit 7 set.
+const XL_TABLE: [u8; 6] = [BAT, ERR, ACK, NAK, HANJA, HANGEUL];
+/// Linux `KEY_HANGEUL` and `KEY_HANJA`, keys with no release code.
+const KEY_HANGEUL: u16 = 122;
+const KEY_HANJA: u16 = 123;
+/// Linux `ATKBD_KEY_NULL`: a code that is framing, as Print Screen's fake
+/// shift, and gives no key.
+const KEY_NULL: u16 = 255;
 
 #[derive(Default)]
 pub(super) struct Keyboard {
+    /// The controller translates the keyboard's set 2 to set 1, as the
+    /// firmware left it; the bytes are then decoded as Linux atkbd decodes
+    /// a translated port.
+    translated: bool,
+    /// Translated: which [`XL_TABLE`] entries last arrived as a press, so
+    /// that the same byte with bit 7 is that key's release.
+    xl_bit: u8,
+    /// Translated: the E0 (1) or E1 (2) bytes still to come in a sequence.
+    emul: u8,
     extended: bool,
     released: bool,
     pause: Option<usize>,
@@ -25,13 +50,21 @@ impl Keyboard {
     pub(super) fn drain_observed(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.observed)
     }
+    /// Decode the bytes as set 1 from a translating controller, or as
+    /// set 2. Any sequence in progress is dropped.
+    pub(super) fn set_translated(&mut self, translated: bool) {
+        self.translated = translated;
+        self.xl_bit = 0;
+        self.reset_prefix();
+    }
     pub(super) fn reset_prefix(&mut self) {
         self.extended = false;
         self.released = false;
         self.pause = None;
+        self.emul = 0;
     }
     pub(super) fn prefix(&self) -> bool {
-        self.extended || self.released || self.pause.is_some()
+        self.extended || self.released || self.pause.is_some() || self.emul != 0
     }
     fn key(&mut self, usage: u8, pressed: bool, events: &mut Vec<Input>) {
         let word = usize::from(usage / 64);
@@ -71,6 +104,9 @@ impl Keyboard {
         // starts a sequence of its own.
         if self.prefix() && now.wrapping_sub(self.prefix_at) >= timeout {
             self.reset_prefix();
+        }
+        if self.translated {
+            return self.feed_translated(data, now, events);
         }
         if let Some(position) = self.pause {
             if data != PAUSE_TAIL[position] {
@@ -129,6 +165,98 @@ impl Keyboard {
         self.key(usage, !released, events);
         Ok(())
     }
+    /// One byte from a translating controller, as Linux
+    /// `atkbd_receive_byte` takes it on a translated port: bit 7 is the
+    /// release, except for a byte of [`XL_TABLE`] whose press did not come
+    /// last, which is a reply or a key without a release; E0 and E1 begin a
+    /// sequence of one and two more bytes.
+    fn feed_translated(
+        &mut self,
+        data: u8,
+        now: u64,
+        events: &mut Vec<Input>,
+    ) -> Result<(), ErrorKind> {
+        let mut code = data;
+        if self.emul != 0 || self.need_xlate(data) {
+            self.released = data & 0x80 != 0;
+            code &= 0x7f;
+        }
+        if self.emul == 0 {
+            self.calculate_xl_bit(data);
+        }
+        match code {
+            BAT => {
+                self.reset_prefix();
+                return Err(ErrorKind::DeviceReset(Port::Keyboard));
+            }
+            EXTENDED | PAUSE => {
+                self.emul = if code == EXTENDED { 1 } else { 2 };
+                self.prefix_at = now;
+                return Ok(());
+            }
+            BREAK => {
+                self.released = true;
+                self.prefix_at = now;
+                return Ok(());
+            }
+            // A reply nothing waits for, and the keyboard's overrun code:
+            // Linux drops them and keeps the sequence in progress.
+            ACK | NAK | ERR => return Ok(()),
+            _ => {}
+        }
+        let mut index = usize::from(code & 0x7f) | (usize::from(code & 0x80) << 1);
+        if self.emul == 1 {
+            index |= 0x80;
+        }
+        if self.emul != 0 {
+            self.emul -= 1;
+            if self.emul != 0 {
+                return Ok(());
+            }
+        }
+        let released = core::mem::take(&mut self.released);
+        let keycode = match index {
+            0..=0x7f => SET2[usize::from(UNXLATE[index])],
+            0x80..=0xff => SET2[usize::from(UNXLATE[index & 0x7f]) | 0x80],
+            _ if code == HANJA => KEY_HANJA,
+            _ if code == HANGEUL => KEY_HANGEUL,
+            _ => 0,
+        };
+        if keycode == KEY_NULL {
+            return Ok(());
+        }
+        let Some(usage) = super::super::virtio::usage(keycode) else {
+            return Err(ErrorKind::UnsupportedScanCode(index as u16));
+        };
+        self.key(usage, !released, events);
+        // Hanja and Hangeul send no release; Linux releases them at once.
+        if !released && matches!(keycode, KEY_HANJA | KEY_HANGEUL) {
+            self.key(usage, false, events);
+        }
+        Ok(())
+    }
+    /// Linux `atkbd_need_xlate`: whether bit 7 of `code` is a release.
+    fn need_xlate(&self, code: u8) -> bool {
+        if code == EXTENDED || code == PAUSE {
+            return false;
+        }
+        match XL_TABLE.iter().position(|entry| *entry == code) {
+            Some(bit) => self.xl_bit & (1 << bit) != 0,
+            None => true,
+        }
+    }
+    /// Linux `atkbd_calculate_xl_bit`: a press of an [`XL_TABLE`] code's key
+    /// marks that its release may follow; that release, or the reply,
+    /// clears the mark.
+    fn calculate_xl_bit(&mut self, code: u8) {
+        if let Some(bit) = XL_TABLE.iter().position(|entry| (code ^ entry) & 0x7f == 0) {
+            if code & 0x80 != 0 {
+                self.xl_bit &= !(1 << bit);
+            } else {
+                self.xl_bit |= 1 << bit;
+            }
+        }
+    }
     pub(super) fn release(&mut self, events: &mut Vec<Input>) {
         self.reset_prefix();
         for usage in 0..=u8::MAX {
@@ -136,6 +264,17 @@ impl Keyboard {
         }
     }
 }
+
+/// Linux `atkbd_unxlate_table`: the set-2 code an i8042 translated to each
+/// set-1 code below 0x80.
+const UNXLATE: [u8; 128] = [
+    0, 118, 22, 30, 38, 37, 46, 54, 61, 62, 70, 69, 78, 85, 102, 13, 21, 29, 36, 45, 44, 53, 60,
+    67, 68, 77, 84, 91, 90, 20, 28, 27, 35, 43, 52, 51, 59, 66, 75, 76, 82, 14, 18, 93, 26, 34, 33,
+    42, 50, 49, 58, 65, 73, 74, 89, 124, 17, 41, 88, 5, 6, 4, 12, 3, 11, 2, 10, 1, 9, 119, 126,
+    108, 117, 125, 123, 107, 115, 116, 121, 105, 114, 122, 112, 113, 127, 96, 97, 120, 7, 15, 23,
+    31, 39, 47, 55, 63, 71, 79, 86, 94, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 87, 111, 19, 25, 57,
+    81, 83, 92, 95, 98, 99, 100, 101, 103, 104, 106, 109, 110,
+];
 
 // The remaining zero-initialized upstream entries are handled by get().
 const SET2: [u16; 261] = [

@@ -80,6 +80,21 @@ pub(in crate::engine) fn load(
             acpi.jt,
             acpi.nvop
         ));
+        // Its power, and its port's, as the firmware reports them: Stela
+        // runs no ACPI events, so whatever powers the GPU off at run time
+        // is the firmware's own doing, and a loss's lines compare with this.
+        let port = path
+            .rsplit_once('.')
+            .map(|(port, _)| port)
+            .and_then(|port| Some((port, session.handle(port).ok()?)));
+        output::arguments(format_args!(
+            "GPU {address}: ACPI power {path}: {}; port {}\n",
+            power(device),
+            port.map_or_else(
+                || String::from("none in the namespace"),
+                |(port, handle)| format!("{port}: {}", power(handle))
+            )
+        ));
         if !stela_linux::backlight::provide(
             address.segment,
             address.bus,
@@ -91,6 +106,64 @@ pub(in crate::engine) fn load(
                 "GPU {address}: ACPI data not kept: every GPU's place is taken\n"
             ));
         }
+    }
+}
+
+/// A device's power as Linux's `acpi_bus_get_power_flags` and
+/// `acpi_bus_init_power` read it: `_PSC`, each `_PR0` and `_PR3` power
+/// resource with its `_STA`, and which of `_PS0`, `_PS3` and `_PRW` it has.
+/// Only those and the resources' `_STA` are evaluated.
+fn power(device: Handle<'static>) -> String {
+    let has = |name: &str| device.child(name).is_ok();
+    let mut text = match integer(device, "_PSC") {
+        Some(state) => format!("_PSC D{state}"),
+        None if has("_PSC") => String::from("_PSC failed"),
+        None => String::from("no _PSC"),
+    };
+    for list in ["_PR0", "_PR3"] {
+        if !has(list) {
+            continue;
+        }
+        text.push_str(&format!(", {list} ["));
+        match device.evaluate(Some(list), &[]) {
+            Ok(Some(Value::Package(resources))) => {
+                for (index, resource) in resources.iter().enumerate() {
+                    if index != 0 {
+                        text.push_str(", ");
+                    }
+                    let Value::Reference(resource) = resource else {
+                        text.push_str("not a reference");
+                        continue;
+                    };
+                    let name = resource.handle.path().unwrap_or_default();
+                    match integer(resource.handle, "_STA") {
+                        Some(0) => text.push_str(&format!("{name} off")),
+                        Some(_) => text.push_str(&format!("{name} on")),
+                        None => text.push_str(&format!("{name} _STA failed")),
+                    }
+                }
+            }
+            Ok(_) => text.push_str("not a package"),
+            Err(error) => text.push_str(&format!("failed: {error:?}")),
+        }
+        text.push(']');
+    }
+    for method in ["_PS0", "_PS3", "_PRW"] {
+        if has(method) {
+            text.push_str(", ");
+            text.push_str(method);
+        }
+    }
+    text
+}
+
+/// An integer object or method's value, `None` where it is missing or
+/// gives something else.
+fn integer(handle: Handle<'_>, name: &str) -> Option<u64> {
+    handle.child(name).ok()?;
+    match handle.evaluate(Some(name), &[]).ok()? {
+        Some(Value::Integer(value)) => Some(value),
+        _ => None,
     }
 }
 

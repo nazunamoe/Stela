@@ -8091,3 +8091,206 @@ fn every_choice_of_plain_stela_for_every_stick_state_runs_its_command_and_a_dry_
         }
     }
 }
+
+/// The stick's log file as it lies on its EFI partition.
+fn stick_log(f: &Fixture) -> Vec<u8> {
+    fs::read(f.esp.join(efi::BOOT_LOG)).unwrap()
+}
+
+/// Put an older Stela's loader and `log` on a set-up stick, as a stick an
+/// older version made holds them.
+fn as_an_older_stela_left_it(f: &Fixture, log: &[u8]) {
+    fs::write(f.esp.join(efi::LOADER), efi_image(b"stela-older")).unwrap();
+    fs::write(f.esp.join(efi::BOOT_LOG), log).unwrap();
+}
+
+/// `stela update` (and `stela repair`, which the menu's choices run as
+/// well) on a stick an older Stela made: its 4 MiB log becomes 32 MiB, the
+/// report says so in one line, and `stela log` of the stick's image writes
+/// the same boots before and after, each one it kept. Older logs come in
+/// two kinds: every released stela.efi (0.5.0 and older) writes the first
+/// format, a ring alone, and this tree's on a stick the CLI could not grow
+/// writes the second, with a record of each of its last 8 boots. Both have
+/// turned their ring.
+#[test]
+fn an_older_stick_s_log_is_made_longer_with_every_boot_it_held() {
+    use crate::boot_log::tests::{boot_lines, released_region, stick_log_text, written};
+    use stela_runtime::pc::boot_log::{self, FILE_BYTES};
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    assert_eq!(stick_log(&f).len() as u64, FILE_BYTES, "a new stick's");
+    // 9 boots of 496 KB in a 4,092 KiB ring: the first is overwritten, 8
+    // are kept.
+    let released = released_region(&boot_lines(1, 9, 16_000));
+    // 10 boots of 465 KB in a 3,068 KiB ring: 8 records, the first 3 boots'
+    // lines overwritten.
+    let records = written(&boot_lines(1, 10, 15_000));
+    let older = [
+        ("released", released),
+        ("records", records.clone()),
+        ("repair", records),
+    ];
+    for (kind, old) in older {
+        let before = boot_log::read(&old).unwrap();
+        assert!(before.overwritten() > 0, "{kind}");
+        let text = stick_log_text(&old);
+        // Every boot the log kept is listed: its marker is in the stream,
+        // or its first lines are written apart.
+        let marker = |boot: u64| format!("=== STELA BOOT {boot} ===\n");
+        let kept: Vec<u64> = (1..=before.boots)
+            .filter(|&boot| {
+                before.starts.iter().any(|start| start.boot == boot)
+                    || before
+                        .stream
+                        .windows(marker(boot).len())
+                        .any(|w| w == marker(boot).as_bytes())
+            })
+            .collect();
+        let listed: Vec<u64> = (1..=before.boots)
+            .filter(|&boot| text.contains(&marker(boot)))
+            .collect();
+        assert_eq!(listed, kept, "{kind}");
+        match kind {
+            "released" => assert_eq!(listed, (2..=9).collect::<Vec<_>>()),
+            _ => assert_eq!(listed, (3..=10).collect::<Vec<_>>(), "{kind}"),
+        }
+        for (start, _) in before.kept_starts() {
+            let apart = format!("=== BOOT {}: its first lines, kept apart", start.boot);
+            assert!(text.contains(&apart), "{kind}: {apart}");
+        }
+        assert_eq!(before.kept_starts().count() > 0, kind != "released");
+        // `repair` keeps the loader; an older loader makes it an update.
+        let repair = kind == "repair";
+        match repair {
+            true => fs::write(f.esp.join(efi::BOOT_LOG), &old).unwrap(),
+            false => as_an_older_stela_left_it(&f, &old),
+        }
+        let report = rerun(&f, |c| {
+            c.action = match repair {
+                true => Action::Repair,
+                false => Action::UpdateStela,
+            }
+        })
+        .unwrap();
+        let said = "\n  boot log       made longer, 33.6 MB from 4.2 MB, with every boot it held\n";
+        assert!(report.contains(said), "{kind}: {report}");
+        assert_eq!(
+            report.starts_with("Stela repair:"),
+            kind == "repair",
+            "{kind}: {report}"
+        );
+        let grown = stick_log(&f);
+        assert_eq!(grown.len() as u64, FILE_BYTES, "{kind}");
+        let after = boot_log::read(&grown).unwrap();
+        assert_eq!(
+            (after.boots, after.head, &after.stream, &after.starts),
+            (before.boots, before.head, &before.stream, &before.starts),
+            "{kind}"
+        );
+        assert_eq!(
+            stick_log_text(&grown),
+            text,
+            "{kind}: stela log reads the same"
+        );
+        assert_eq!(
+            fs::read(f.esp.join(efi::LOADER)).unwrap(),
+            efi_image(b"stela"),
+            "{kind}"
+        );
+    }
+    // A stick already at 32 MiB says nothing of its log.
+    as_an_older_stela_left_it(&f, &stick_log(&f));
+    let report = rerun(&f, |c| c.action = Action::UpdateStela).unwrap();
+    assert!(!report.contains("boot log"), "{report}");
+}
+
+/// An EFI partition too full for a longer log, a log whose header does not
+/// decode, and a stick that refuses writes: each keeps the log it had, which
+/// `stela log` reads as before, and the report says what happened.
+#[test]
+fn an_older_stick_s_log_that_cannot_be_made_longer_stays_readable() {
+    use crate::boot_log::tests::{boot_lines, released_region, stick_log_text};
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+    let old = released_region(&boot_lines(1, 3, 1_000));
+    let text = stick_log_text(&old);
+    assert!(text.contains("=== STELA BOOT 3 ===\n"), "{text}");
+    // Too full: 18 MiB free keeps no 32, 16 or 8 MiB log beside the room
+    // for another loader.
+    f.host.freed.set(0);
+    f.host.volumes.get_mut(&f.esp).unwrap().1 = 18 << 20;
+    as_an_older_stela_left_it(&f, &old);
+    let report = rerun(&f, |c| c.action = Action::UpdateStela).unwrap();
+    assert!(
+        report.contains(
+            "\n  boot log       stays 4.2 MB: the EFI partition has no room for a longer one\n"
+        ),
+        "{report}"
+    );
+    assert_eq!(stick_log(&f), old);
+    // Room for 8 MiB only.
+    f.host.freed.set(0);
+    f.host.volumes.get_mut(&f.esp).unwrap().1 = 24 << 20;
+    as_an_older_stela_left_it(&f, &old);
+    let report = rerun(&f, |c| c.action = Action::UpdateStela).unwrap();
+    assert!(
+        report.contains(
+            "\n  boot log       made longer, 8.4 MB from 4.2 MB, with every boot it held, as the \
+             EFI partition has no room for a longer one\n"
+        ),
+        "{report}"
+    );
+    assert_eq!(stick_log(&f).len(), 8 << 20);
+    assert_eq!(stick_log_text(&stick_log(&f)), text);
+    f.host.volumes.get_mut(&f.esp).unwrap().1 = 64 * GIB;
+    // A header that does not decode: its lines are read as they lie, and
+    // the file is left for that.
+    let mut torn = old.clone();
+    torn[16] ^= 0xff;
+    let raw = stick_log_text(&torn);
+    assert!(raw.contains("boot 3 line 000999"), "{raw}");
+    as_an_older_stela_left_it(&f, &torn);
+    let report = rerun(&f, |c| c.action = Action::UpdateStela).unwrap();
+    assert!(
+        report.contains(
+            "\n  boot log       left as it is (4.2 MB): it does not read as a log; stela log \
+             still shows its lines\n"
+        ),
+        "{report}"
+    );
+    assert_eq!(stick_log(&f), torn);
+    assert_eq!(stick_log_text(&torn), raw);
+    // A stick that refuses writes: the update stops with its error, and the
+    // log is as it was.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        as_an_older_stela_left_it(&f, &old);
+        let folder = f.esp.join("EFI/stela");
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o555)).unwrap();
+        let refused = tempfile::NamedTempFile::new_in(&folder).is_err();
+        let result = rerun(&f, |c| c.action = Action::UpdateStela);
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+        if refused {
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("ermission denied"), "{error}");
+            assert_eq!(stick_log(&f), old);
+            assert_eq!(stick_log_text(&old), text);
+        }
+    }
+}
+
+/// `stela create` makes the log 32 MiB where the EFI partition has the
+/// room, and the 4 MiB a boot needs where it does not.
+#[test]
+fn a_new_stick_s_log_is_as_long_as_its_efi_partition_allows() {
+    use stela_runtime::pc::boot_log::{FILE_BYTES, LOG_BYTES};
+    for (free, bytes) in [(64 * GIB, FILE_BYTES), (18 << 20, LOG_BYTES)] {
+        let mut f = fixture(free, false);
+        add_stela(&mut f);
+        setup(&environment(&f.host), command(&f, &f.esp)).unwrap();
+        assert_eq!(stick_log(&f), vec![0; bytes as usize]);
+    }
+}

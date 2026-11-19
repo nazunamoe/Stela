@@ -439,6 +439,11 @@ fn display_scale_and_rotation_follow_the_video_depth() -> Result<(), BundleError
     assert_eq!(&ram[0x4014..0x4018], &0u32.to_le_bytes());
     assert_eq!(&ram[0x4018..0x401c], &1u32.to_le_bytes());
     assert_eq!(&ram[0x401c..0x4020], &0u32.to_le_bytes());
+    // The scale the boot log names is the one written.
+    assert_eq!(
+        screen.framebuffer.map(|screen| screen.display_scale()),
+        Some(1)
+    );
     Ok(())
 }
 

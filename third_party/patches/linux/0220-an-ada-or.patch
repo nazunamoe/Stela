@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 12:00:00 +0000
+Subject: [PATCH] fix(nouveau): an Ada or Blackwell laptop panel gets the
+ backlight control an Ampere one gets, a level of zero at registration is
+ raised to the highest, and one line names the control with the level set and
+ read back, or what was looked for, where Ada and Blackwell registered none
+ and a panel their GPU drives stayed dark
+
+---
+ drivers/gpu/drm/nouveau/nouveau_backlight.c | 46 +++++++++++++++++++--
+ 1 file changed, 42 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nouveau_backlight.c b/drivers/gpu/drm/nouveau/nouveau_backlight.c
+index da1ee24a2531d21cc537f272586f70b23124b7a3..d02d67099c89366cb51c51c1be2b7cefd1bb6f26 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_backlight.c
++++ b/drivers/gpu/drm/nouveau/nouveau_backlight.c
+@@ -231,17 +231,25 @@ nv50_backlight_init(struct nouveau_backlight *bl,
+ 		    struct nouveau_connector *nv_conn,
+ 		    struct nouveau_encoder *nv_encoder,
+ 		    struct backlight_properties *props,
+-		    const struct backlight_ops **ops)
++		    const struct backlight_ops **ops,
++		    const char **why)
+ {
+ 	struct nouveau_drm *drm = nouveau_drm(nv_encoder->base.base.dev);
++	int level;
+ 
+ 	/*
+ 	 * Note when this runs the connectors have not been probed yet,
+ 	 * so nv_conn->base.status is not set yet.
+ 	 */
+-	if (nvif_outp_bl_get(&nv_encoder->outp) < 0 ||
+-	    drm_helper_probe_detect(&nv_conn->base, NULL, false) != connector_status_connected)
++	level = nvif_outp_bl_get(&nv_encoder->outp);
++	if (level < 0) {
++		*why = "the GPU's PWM control refused a read";
++		return -ENODEV;
++	}
++	if (drm_helper_probe_detect(&nv_conn->base, NULL, false) != connector_status_connected) {
++		*why = "the panel is not connected";
+ 		return -ENODEV;
++	}
+ 
+ 	if (nv_conn->type == DCB_CONNECTOR_eDP) {
+ 		int ret;
+@@ -254,6 +262,8 @@ nv50_backlight_init(struct nouveau_backlight *bl,
+ 		if (ret < 0)
+ 			return ret;
+ 
++		NV_INFO(drm, "backlight on %s: eDP DPCD revision %02x, capabilities %02x %02x\n",
++			nv_conn->base.name, edp_dpcd[0], edp_dpcd[1], edp_dpcd[2]);
+ 		/* TODO: Add support for hybrid PWM/DPCD panels */
+ 		if (drm_edp_backlight_supported(edp_dpcd) &&
+ 		    (edp_dpcd[1] & DP_EDP_BACKLIGHT_AUX_ENABLE_CAP) &&
+@@ -297,6 +307,7 @@ nouveau_backlight_init(struct drm_connector *connector)
+ 	char backlight_name[BL_NAME_SIZE];
+ 	struct backlight_properties props = {0};
+ 	const struct backlight_ops *ops;
++	const char *why = NULL;
+ 	int ret;
+ 
+ 	if (apple_gmux_present()) {
+@@ -330,10 +341,18 @@ nouveau_backlight_init(struct drm_connector *connector)
+ 	case NV_DEVICE_INFO_V0_VOLTA:
+ 	case NV_DEVICE_INFO_V0_TURING:
+ 	case NV_DEVICE_INFO_V0_AMPERE: //XXX: not confirmed
++	/*
++	 * Ada and Blackwell run their display on GSP-RM through the same
++	 * r535 display code as GA10x (ga102_disp_new, gb202_disp_new), whose
++	 * outputs answer the same backlight methods.
++	 */
++	case NV_DEVICE_INFO_V0_ADA:
++	case NV_DEVICE_INFO_V0_BLACKWELL:
+ 		ret = nv50_backlight_init(bl, nouveau_connector(connector),
+-					  nv_encoder, &props, &ops);
++					  nv_encoder, &props, &ops, &why);
+ 		break;
+ 	default:
++		why = "this GPU family has no backlight control in nouveau";
+ 		ret = 0;
+ 		goto fail_alloc;
+ 	}
+@@ -341,6 +360,8 @@ nouveau_backlight_init(struct drm_connector *connector)
+ 	if (ret) {
+ 		if (ret == -ENODEV)
+ 			ret = 0;
++		else
++			NV_INFO(drm, "backlight on %s: refused: %d\n", connector->name, ret);
+ 		goto fail_alloc;
+ 	}
+ 
+@@ -368,12 +389,29 @@ nouveau_backlight_init(struct drm_connector *connector)
+ 	if (!bl->dev->props.brightness)
+ 		bl->dev->props.brightness =
+ 			bl->dev->ops->get_brightness(bl->dev);
++	/*
++	 * A level of zero, as a GPU reset leaves the PWM, is a picture with
++	 * no light and no user space to restore one: take the highest, as
++	 * ACPI video does with a level outside its list.
++	 */
++	if (bl->dev->props.brightness <= 0)
++		bl->dev->props.brightness = bl->dev->props.max_brightness;
+ 	backlight_update_status(bl->dev);
++	NV_INFO(drm, "backlight on %s: %s, level %d of %d set, read back %d\n",
++		connector->name,
++		bl->uses_dpcd ? "the panel's eDP DPCD AUX control" :
++				"the GPU's PWM through its firmware",
++		bl->dev->props.brightness, bl->dev->props.max_brightness,
++		bl->dev->ops->get_brightness(bl->dev));
+ 
+ 	return 0;
+ 
+ fail_alloc:
+ 	kfree(bl);
++	if (ret == 0)
++		NV_INFO(drm, "backlight on %s: no control of nouveau's: %s; looked for the "
++			"GPU's PWM through its firmware and the panel's eDP DPCD AUX control\n",
++			connector->name, why ? why : "the driver prefers ACPI video");
+ 	/*
+ 	 * If we get here we have an internal panel, but no nv_backlight,
+ 	 * try registering an ACPI video backlight device instead.

@@ -4,8 +4,11 @@
 //! applies Stela's series from `third_party/patches/<name>/` as commits on
 //! the local branch `stela`. `export` writes a submodule's commits since its
 //! pin back to that series, each file keeping its short name while its
-//! commit's subject stays the same, with the repository's configured identity
-//! as the author of Stela's own patches and every such date in UTC.
+//! commit's subject stays the same. A commit the series already holds keeps
+//! its file byte for byte, whoever wrote it and in whatever form, so `fetch`
+//! then `export` changes nothing; a new or changed commit is written with the
+//! author its file named, else the repository's configured identity, and its
+//! date in UTC.
 use super::support::capture;
 use crate::tools::{self, exec};
 use anyhow::{Context, Result, ensure};
@@ -25,6 +28,31 @@ const STATE: &str = "stela-series";
 
 /// The committer of the series commits `checkout` applies.
 const COMMITTER_EMAIL: &str = "stela@localhost";
+
+/// How `checkout` applies the series: each commit by its patch's author and
+/// date, committed by Stela ([`COMMITTER_EMAIL`]) at that date.
+const AM: [&str; 8] = [
+    "-c",
+    "user.name=Stela",
+    "-c",
+    "user.email=stela@localhost",
+    "am",
+    "-q",
+    "--3way",
+    "--committer-date-is-author-date",
+];
+
+/// How `export` writes a submodule's commits since its pin.
+const FORMAT_PATCH: [&str; 7] = [
+    "format-patch",
+    "-q",
+    "--no-numbered",
+    "--numbered-files",
+    "--zero-commit",
+    // Abbreviated blob names grow with the checkout.
+    "--full-index",
+    "--no-signature",
+];
 
 struct Submodule {
     name: String,
@@ -289,14 +317,7 @@ fn checkout(submodule: &Submodule) -> Result<()> {
     )?;
     let patches = submodule.patches()?;
     if !patches.is_empty() {
-        let applied = exec(
-            submodule
-                .git()
-                .args(["-c", "user.name=Stela", "-c"])
-                .arg(format!("user.email={COMMITTER_EMAIL}"))
-                .args(["am", "-q", "--3way", "--committer-date-is-author-date"])
-                .args(&patches),
-        );
+        let applied = exec(submodule.git().args(AM).args(&patches));
         if applied.is_err() {
             // Leave the checkout at its pin, with no `am` left to block the next.
             exec(submodule.git().args(["am", "--abort"]))?;
@@ -369,9 +390,12 @@ pub fn export() -> Result<()> {
             submodule.pin
         );
         let patches = submodule.patches_directory();
-        let mut names = HashMap::new();
+        let mut held = HashMap::new();
         for patch in submodule.patches()? {
-            names.insert(subject(&patch)?, name(&patch));
+            held.insert(
+                subject(&patch)?,
+                (name(&patch), fs::read_to_string(&patch)?),
+            );
             fs::remove_file(patch)?;
         }
         if submodule.head()? != submodule.pin {
@@ -379,16 +403,7 @@ pub fn export() -> Result<()> {
             exec(
                 submodule
                     .git()
-                    .args([
-                        "format-patch",
-                        "-q",
-                        "--no-numbered",
-                        "--numbered-files",
-                        "--zero-commit",
-                        // Abbreviated blob names grow with the checkout.
-                        "--full-index",
-                        "--no-signature",
-                    ])
+                    .args(FORMAT_PATCH)
                     .arg("-o")
                     .arg(&patches)
                     .arg(format!("{}..HEAD", submodule.pin)),
@@ -399,9 +414,13 @@ pub fn export() -> Result<()> {
                     break;
                 }
                 let subject = subject(&patch)?;
-                let name = names.remove(&subject).unwrap_or_else(|| slug(&subject));
-                let text = publish_header(&fs::read_to_string(&patch)?, &identity)
-                    .with_context(|| patch.display().to_string())?;
+                let (name, text) = exported(
+                    held.remove(&subject),
+                    &subject,
+                    &fs::read_to_string(&patch)?,
+                    &identity,
+                )
+                .with_context(|| patch.display().to_string())?;
                 fs::write(patches.join(format!("{number:04}-{name}.patch")), text)?;
                 fs::remove_file(patch)?;
             }
@@ -413,8 +432,104 @@ pub fn export() -> Result<()> {
     Ok(())
 }
 
+/// The file name and text `export` writes for `patch`, `git format-patch`'s
+/// text of a commit with `subject`, given the series' file of that subject
+/// as it was (`held`: its name and text). A file whose change is the
+/// commit's ([`Change`]) stays as it was, so a contributor's patch keeps its
+/// author, date and form; one whose commit changed keeps its name and the
+/// author it named; a new one gets a name from its subject and the
+/// configured `identity`.
+fn exported(
+    held: Option<(String, String)>,
+    subject: &str,
+    patch: &str,
+    identity: &str,
+) -> Result<(String, String)> {
+    Ok(match held {
+        Some((name, text))
+            if Change::of(patch).is_some_and(|change| Change::of(&text) == Some(change)) =>
+        {
+            (name, text)
+        }
+        Some((name, text)) => {
+            let author = author(&text).unwrap_or_else(|| identity.to_owned());
+            (name, publish_header(patch, &author)?)
+        }
+        None => (slug(subject), publish_header(patch, identity)?),
+    })
+}
+
+/// What a patch file makes when `git am` applies it: the commit's author,
+/// author date as an instant, message and diff. The file's form is left
+/// out: the diffstat, the signature `git format-patch` ends it with, a date's
+/// time zone, and the blob names on `index` lines, which name whole files and
+/// so differ with the tree a patch was written against while its change is
+/// the same.
+#[derive(Debug, PartialEq, Eq)]
+struct Change {
+    author: String,
+    date: i64,
+    message: String,
+    diff: Vec<String>,
+}
+
+impl Change {
+    fn of(patch: &str) -> Option<Self> {
+        let (header, rest) = patch.split_once("\n\n")?;
+        let mut author = None;
+        let mut date = None;
+        let mut subject: Option<String> = None;
+        let mut lines = header.lines().peekable();
+        while let Some(line) = lines.next() {
+            if let Some(value) = line.strip_prefix("From: ") {
+                author = Some(value.to_owned());
+            } else if let Some(value) = line.strip_prefix("Date: ") {
+                date = instant(value);
+            } else if let Some(value) = line.strip_prefix("Subject: ") {
+                let mut text = value.trim_start_matches("[PATCH] ").to_owned();
+                while let Some(more) = lines.next_if(|line| line.starts_with(' ')) {
+                    text.push_str(more);
+                }
+                subject = Some(text);
+            }
+        }
+        // A message of its subject alone leaves no line before the `---`.
+        let rest = format!("\n{rest}");
+        let (body, diff) = rest.split_once("\n---\n").unwrap_or((&rest, ""));
+        let body: Vec<&str> = body.lines().map(str::trim_end).collect();
+        let message = format!("{}\n\n{}", subject?, body.join("\n").trim());
+        let diff = diff
+            .lines()
+            .skip_while(|line| !line.starts_with("diff --git "))
+            .take_while(|line| *line != "-- ")
+            .map(|line| match line.strip_prefix("index ") {
+                Some(index) => format!(
+                    "index {}",
+                    index.split_once(' ').map_or("", |(_, mode)| mode)
+                ),
+                None => line.to_owned(),
+            })
+            .collect();
+        Some(Self {
+            author: author?,
+            date: date?,
+            message,
+            diff,
+        })
+    }
+}
+
+/// The author a patch's header names.
+fn author(patch: &str) -> Option<String> {
+    patch
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| line.strip_prefix("From: "))
+        .map(str::to_owned)
+}
+
 /// The repository's configured `user.name <user.email>`, which `export`
-/// writes as the author of Stela's own patches.
+/// writes as the author of each patch new to the series.
 fn identity() -> Result<String> {
     let field = |key: &str| -> Result<String> {
         let value = capture(git(tools::root()).args(["config", key])).with_context(|| {
@@ -465,6 +580,22 @@ const MONTHS: [&str; 12] = [
 /// An RFC 2822 date as `git format-patch` writes it (`Tue, 4 Nov 2025
 /// 21:16:44 -0500`), converted to the same instant in UTC.
 fn utc_date(date: &str) -> Result<String> {
+    let seconds = instant(date).with_context(|| format!("unreadable patch date {date:?}"))?;
+    let days = seconds.div_euclid(86400);
+    let time = seconds.rem_euclid(86400);
+    let (year, month, day) = civil_from_days(days);
+    Ok(format!(
+        "{}, {day} {} {year} {:02}:{:02}:{:02} +0000",
+        WEEKDAYS[(days + 4).rem_euclid(7) as usize],
+        MONTHS[month as usize - 1],
+        time / 3600,
+        time / 60 % 60,
+        time % 60
+    ))
+}
+
+/// An RFC 2822 date's instant, in seconds since 1970 in UTC.
+fn instant(date: &str) -> Option<i64> {
     let parse = || -> Option<i64> {
         let fields: Vec<&str> = date.split_whitespace().collect();
         let [_, day, month, year, time, zone] = fields[..] else {
@@ -487,18 +618,7 @@ fn utc_date(date: &str) -> Result<String> {
         let days = days_from_civil(year.parse().ok()?, month, day.parse().ok()?);
         Some(days * 86400 + hour * 3600 + minute * 60 + second - offset)
     };
-    let seconds = parse().with_context(|| format!("unreadable patch date {date:?}"))?;
-    let days = seconds.div_euclid(86400);
-    let time = seconds.rem_euclid(86400);
-    let (year, month, day) = civil_from_days(days);
-    Ok(format!(
-        "{}, {day} {} {year} {:02}:{:02}:{:02} +0000",
-        WEEKDAYS[(days + 4).rem_euclid(7) as usize],
-        MONTHS[month as usize - 1],
-        time / 3600,
-        time / 60 % 60,
-        time % 60
-    ))
+    parse()
 }
 
 /// Days since 1970-01-01 of a proleptic Gregorian date.
@@ -665,6 +785,141 @@ mod tests {
         );
         assert!(utc_date("Tue, 4 Nov 2025 21:16:44").is_err());
         Ok(())
+    }
+
+    /// A repository in `directory` whose one commit holds twenty lines of
+    /// `a.txt`, and that commit.
+    fn repository(directory: &Path) -> Result<String> {
+        let lines: String = (1..=20).map(|line| format!("line {line}\n")).collect();
+        fs::write(directory.join("a.txt"), lines)?;
+        exec(git(directory).args(["init", "-q"]))?;
+        exec(git(directory).args(["add", "a.txt"]))?;
+        exec(
+            git(directory)
+                .args(AM[..4].iter())
+                .args(["commit", "-q", "-m", "base"]),
+        )?;
+        Ok(capture(git(directory).args(["rev-parse", "HEAD"]))?
+            .trim()
+            .to_owned())
+    }
+
+    /// A commit's patch as `export` writes it before its header is settled.
+    fn formatted(directory: &Path, pin: &str) -> Result<String> {
+        let output = directory.join("out");
+        exec(
+            git(directory)
+                .args(FORMAT_PATCH)
+                .arg("-o")
+                .arg(&output)
+                .arg(format!("{pin}..HEAD")),
+        )?;
+        let text = fs::read_to_string(output.join("1"))?;
+        fs::remove_dir_all(&output)?;
+        Ok(text)
+    }
+
+    #[test]
+    fn a_contributors_patch_comes_back_from_apply_and_export_unchanged() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let directory = directory.path();
+        let pin = repository(directory)?;
+        // The contributor's patch as committed to the series: their author
+        // and time zone, git's abbreviated blob names and version signature.
+        let text = fs::read_to_string(directory.join("a.txt"))?.replace("line 5\n", "line five\n");
+        fs::write(directory.join("a.txt"), text)?;
+        exec(
+            git(directory)
+                .args(AM[..4].iter())
+                .args([
+                    "commit",
+                    "-q",
+                    "-a",
+                    "-m",
+                    "radv: name line five\n\nWhy it reads so.",
+                ])
+                .env("GIT_AUTHOR_NAME", "A Contributor")
+                .env("GIT_AUTHOR_EMAIL", "contributor@example.org")
+                .env("GIT_AUTHOR_DATE", "Tue, 17 Nov 2026 07:43:35 +0700"),
+        )?;
+        let sent = capture(git(directory).args([
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--zero-commit",
+            "--signature=2.56.1",
+        ]))?;
+        assert!(sent.contains("\n-- \n2.56.1\n"));
+        assert!(!sent.contains("+0000"));
+        // `fetch` applies it on the pin; `export` formats it again.
+        exec(git(directory).args(["reset", "-q", "--hard", &pin]))?;
+        let file = directory.join("0001-name-line-five.patch");
+        fs::write(&file, &sent)?;
+        exec(git(directory).args(AM).arg(&file))?;
+        let again = formatted(directory, &pin)?;
+        assert_ne!(again, sent, "the forms differ");
+        let subject = subject(&file)?;
+        let identity = "Stela Author <author@example.com>";
+        let held = Some(("name-line-five".to_owned(), sent.clone()));
+        assert_eq!(
+            exported(held.clone(), &subject, &again, identity)?,
+            ("name-line-five".to_owned(), sent.clone())
+        );
+        // A changed commit keeps the author its file named, its date in UTC.
+        exec(git(directory).args(AM[..4].iter()).args([
+            "commit",
+            "-q",
+            "--amend",
+            "-m",
+            "radv: name line five\n\nWhy.",
+        ]))?;
+        let (name, changed) = exported(held, &subject, &formatted(directory, &pin)?, identity)?;
+        assert_eq!(name, "name-line-five");
+        assert!(changed.contains("\nFrom: A Contributor <contributor@example.org>\n"));
+        assert!(changed.contains("\nDate: Tue, 17 Nov 2026 00:43:35 +0000\n"));
+        // A new commit gets the configured identity and a name of its own.
+        let (name, new) = exported(None, &subject, &again, identity)?;
+        assert_eq!(name, "name-line-five");
+        assert!(new.contains("\nFrom: Stela Author <author@example.com>\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_change_is_the_same_in_either_form_of_the_series() {
+        // Most of the series has full blob names and no signature, the form
+        // `export` writes; four contributed files have the other.
+        assert!(FORMAT_PATCH.contains(&"--full-index"));
+        assert!(FORMAT_PATCH.contains(&"--no-signature"));
+        let full = "From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\n\
+                    From: A Contributor <contributor@example.org>\n\
+                    Date: Tue, 17 Nov 2026 07:43:35 +0700\n\
+                    Subject: [PATCH] radv: name line\n five\n\n\
+                    Why it reads so.\n---\n a.txt | 2 +-\n 1 file changed\n\n\
+                    diff --git a/a.txt b/a.txt\n\
+                    index 0123456789abcdef0123456789abcdef01234567..89abcdef0123456789abcdef0123456789abcdef 100644\n\
+                    --- a/a.txt\n+++ b/a.txt\n@@ -5 +5 @@\n-line 5\n+line five\n";
+        let short = full
+            .replace(
+                "0123456789abcdef0123456789abcdef01234567..89abcdef0123456789abcdef0123456789abcdef",
+                "0123456789..89abcdef01",
+            )
+            .replace("07:43:35 +0700", "00:43:35 +0000")
+            + "-- \n2.56.1\n\n";
+        assert!(Change::of(full).is_some());
+        assert_eq!(Change::of(full), Change::of(&short));
+        // A message of its subject alone, as most of Stela's are.
+        let bare = |text: &str| text.replace("Why it reads so.\n---\n", "---\n");
+        assert!(Change::of(&bare(full)).is_some());
+        assert_eq!(Change::of(&bare(full)), Change::of(&bare(&short)));
+        assert_ne!(Change::of(&bare(full)), Change::of(full));
+        assert_ne!(
+            Change::of(full),
+            Change::of(&full.replace("+line five", "+line 5 again"))
+        );
+        assert_ne!(
+            Change::of(full),
+            Change::of(&full.replace("A Contributor", "Someone Else"))
+        );
     }
 
     #[test]

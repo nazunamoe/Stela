@@ -953,13 +953,16 @@ impl Address {
 
 /// A function a reset empties, silent for `silence` reads after one. A
 /// Resizable BAR capability at 0x100 goes back to its default size (256 MiB)
-/// at a reset, and keeps that size against writes when `rebar_fixed`.
+/// at a reset, and keeps that size against writes when `rebar_fixed`. An
+/// L1 PM Substates capability there loses its controls at a reset, and an
+/// LTR one after it its latency limits. Every write is logged.
 struct Resettable {
     words: [u32; 1024],
     silence: u32,
     busy: core::cell::Cell<u32>,
     resets: u32,
     rebar_fixed: bool,
+    log: Vec<(u16, u32)>,
 }
 
 impl ConfigSpace for Resettable {
@@ -975,6 +978,7 @@ impl ConfigSpace for Resettable {
 
     fn write32(&mut self, offset: u16, value: u32) -> Result<(), crate::bus::pci::ConfigError> {
         let before = self.words[usize::from(offset / 4)];
+        self.log.push((offset, value));
         if offset == 0x108 && self.rebar_fixed {
             return Ok(());
         }
@@ -996,6 +1000,11 @@ impl ConfigSpace for Resettable {
             if self.words[0x100 / 4] & 0xffff == 0x15 {
                 let control = &mut self.words[0x108 / 4];
                 *control = *control & !(0x3f << 8) | 8 << 8;
+            }
+            if self.words[0x100 / 4] & 0xffff == 0x1e {
+                self.words[0x108 / 4] = 0;
+                self.words[0x10c / 4] = 0;
+                self.words[0x114 / 4] = 0;
             }
             self.busy.set(self.silence);
             self.resets += 1;
@@ -1048,6 +1057,7 @@ fn resettable(capabilities: u32, silence: u32) -> Function<Resettable> {
             busy: core::cell::Cell::new(0),
             resets: 0,
             rebar_fixed: false,
+            log: Vec::new(),
         },
     }
 }
@@ -1107,6 +1117,63 @@ fn a_resizable_bar_that_keeps_its_default_size_after_a_reset_reads_back_at_it() 
     );
     // A function without the capability has none.
     assert_eq!(resettable(1 << 28, 0).resizable_bars(), Ok(vec![]));
+}
+
+/// [`resettable`] with FLR, an L1 PM Substates capability at 0x100 that
+/// firmware set to ASPM L1.1 and L1.2 with its timing, and an LTR one at
+/// 0x110 with its latency limits; Link Control has L0s and L1 on.
+fn with_link_power() -> Function<Resettable> {
+    let mut function = resettable(1 << 28, 0);
+    let words = &mut function.config.words;
+    words[0x100 / 4] = 0x1101_001e;
+    words[0x104 / 4] = 0x0028_281f;
+    words[0x108 / 4] = 0x4060_280c;
+    words[0x10c / 4] = 0x0000_0028;
+    words[0x110 / 4] = 0x0001_0018;
+    words[0x114 / 4] = 0x1003_1003;
+    function
+}
+
+#[test]
+fn a_reset_puts_back_ltr_and_the_l1_substates_as_linux_restores_them() {
+    let mut function = with_link_power();
+    assert_eq!(
+        function.reset_with(|_| Ok(())),
+        Ok(Some(ResetMethod::FunctionLevel))
+    );
+    let config = &function.config;
+    assert_eq!(config.resets, 1);
+    assert_eq!(config.words[0x108 / 4], 0x4060_280c);
+    assert_eq!(config.words[0x10c / 4], 0x28);
+    assert_eq!(config.words[0x114 / 4], 0x1003_1003);
+    assert_eq!(config.words[0x50 / 4], 0x0143);
+    // Linux's order: Link Control's ASPM off, LTR's limits, L1.2 off with
+    // its timing, then L1.2 on, before Device Control 2 enables LTR and Link
+    // Control turns ASPM back on.
+    let reset = config
+        .log
+        .iter()
+        .position(|&(offset, value)| offset == 0x48 && value & 1 << 15 != 0)
+        .expect("the reset");
+    let after: Vec<(u16, u32)> = config.log[reset + 1..].to_vec();
+    let at = |wanted: (u16, u32)| {
+        after
+            .iter()
+            .position(|&write| write == wanted)
+            .unwrap_or_else(|| panic!("write {wanted:x?} in {after:x?}"))
+    };
+    let aspm_off = at((0x50, 0x0140));
+    let ltr = at((0x114, 0x1003_1003));
+    let timing = at((0x108, 0x4060_2808));
+    let control_2 = at((0x10c, 0x28));
+    let enabled = at((0x108, 0x4060_280c));
+    let ltr_on = at((0x68, 0x0400));
+    let aspm_on = after
+        .iter()
+        .rposition(|&write| write == (0x50, 0x0143))
+        .expect("Link Control back");
+    assert!(aspm_off < ltr && ltr < timing && timing < control_2 && control_2 < enabled);
+    assert!(enabled < ltr_on && enabled < aspm_on);
 }
 
 #[test]

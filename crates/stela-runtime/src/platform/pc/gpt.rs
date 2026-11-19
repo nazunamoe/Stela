@@ -217,6 +217,7 @@ pub(crate) mod tests {
         let mut disk = RamDisk::new(serial, 256, 512);
         let table = Table {
             disk_guid: "11111111-2222-3333-4444-555555555555".parse().unwrap(),
+            slots: Default::default(),
             partitions: partitions.to_vec(),
         };
         for write in shared::encode(geometry(disk.identity()), &table).unwrap() {

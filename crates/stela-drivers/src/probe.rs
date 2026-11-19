@@ -2372,7 +2372,14 @@ pub unsafe fn probe_observed(
     // After every USB host left firmware, as Linux's i8042 probe runs after
     // its PCI fixups.
     #[cfg(feature = "native-acpi")]
-    attach_platform(services, smbus_functions, &bridges, handoff, &mut devices);
+    attach_platform(
+        services,
+        smbus_functions,
+        &bridges,
+        firmware,
+        handoff,
+        &mut devices,
+    );
     devices.settle_usb(dma);
     devices
 }
@@ -2964,6 +2971,7 @@ fn attach_platform(
     services: Option<&dyn NativeServices>,
     mut smbus_functions: Vec<Address>,
     bridges: &[native::Bridge],
+    firmware: &dyn crate::firmware::Provider,
     handoff: &Handoff,
     devices: &mut Devices,
 ) {
@@ -3013,7 +3021,11 @@ fn attach_platform(
         // firmware kept is reported on its own, and the controller's
         // self-test finds ports that USB legacy emulation still traps.
         let smbus_hosts = devices.smbus_hosts.clone();
-        platform::attach_i8042(session, handoff.clock, &smbus_hosts, devices);
+        // The chassis type Linux's atkbd reads to skip GETID on laptops.
+        let chassis_type = crate::firmware::smbios::load(firmware)
+            .ok()
+            .and_then(|snapshot| snapshot.identity.chassis_type);
+        platform::attach_i8042(session, handoff.clock, chassis_type, &smbus_hosts, devices);
         i2c::attach(services, session, handoff.clock, devices);
         power::attach_power(session, devices);
         typec::attach(services, session, ec.as_ref(), handoff.clock, devices);

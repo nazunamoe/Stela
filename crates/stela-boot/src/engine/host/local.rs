@@ -279,6 +279,11 @@ pub(crate) unsafe fn configure_xstate(
 /// How many processors have become active.
 static ACTIVE: AtomicU32 = AtomicU32::new(0);
 
+/// The index of a processor that only idles parked: past every running
+/// processor's, and not `u32::MAX`, which the step watchdog's records read
+/// as none.
+pub(crate) const PARKED: u32 = u32::MAX - 1;
+
 /// How many processors have become active: each one's [`processor`] is
 /// below it.
 #[cfg(feature = "nvk")]
@@ -300,6 +305,7 @@ pub(crate) unsafe fn activate(
     local: &mut Local,
     handler: super::super::interrupts::Handler,
     tables: *const super::super::interrupts::Tables,
+    parked: bool,
 ) {
     assert!(
         local.this.is_null(),
@@ -311,14 +317,23 @@ pub(crate) unsafe fn activate(
     );
     local.handler = handler;
     local.entry_tables = tables;
-    local.index = ACTIVE.fetch_add(1, Ordering::Relaxed);
+    // A parked processor takes no dense index, which the running ones'
+    // per-processor records are sized by, and no heap cache: it never
+    // allocates but in the fatal report, which takes the heap's lock.
+    local.index = if parked {
+        PARKED
+    } else {
+        ACTIVE.fetch_add(1, Ordering::Relaxed)
+    };
     local.this = local;
     // SAFETY: the descriptor owner pins this private record for the CPU lifetime.
     unsafe { set_base(local as *mut Local as u64) };
-    // SAFETY: the pinned record at this processor's new GS base, and no
-    // processor allocates before it gets here: the boot processor's first
-    // is this call, and an AP's entry reaches here first.
-    unsafe { crate::ALLOCATOR.tag_cpu(local.heap_core.get()) };
+    if !parked {
+        // SAFETY: the pinned record at this processor's new GS base, and no
+        // processor allocates before it gets here: the boot processor's first
+        // is this call, and an AP's entry reaches here first.
+        unsafe { crate::ALLOCATOR.tag_cpu(local.heap_core.get()) };
+    }
 }
 
 /// # Safety
@@ -363,7 +378,8 @@ pub(crate) fn activated_base() -> u64 {
     current() as u64
 }
 
-/// This processor's index, dense from zero. Once [`activate`] has run on it.
+/// This processor's index, dense from zero, or [`PARKED`]. Once [`activate`]
+/// has run on it.
 /// The BSP installs its record before any AP starts.
 pub(crate) fn processor() -> u32 {
     // SAFETY: the record is pinned for the processor's life, and `index` is set

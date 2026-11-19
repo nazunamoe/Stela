@@ -339,7 +339,12 @@ impl HostNetwork {
                     "adapter {location}: waiting for the link, {seconds} s"
                 ));
             };
-            match stack.automatic_waiting(waiting) {
+            let result = stack.automatic_waiting(waiting);
+            // The DHCP lease, or what the exchange did without one.
+            for note in stack.take_notes() {
+                output::arguments(format_args!("NETWORK adapter {location} {note}\n"));
+            }
+            match result {
                 Ok(config) => {
                     output::arguments(format_args!("NETWORK driver={driver}\n"));
                     output::arguments(format_args!(
@@ -364,6 +369,11 @@ impl HostNetwork {
                         frames.sent.get(),
                         frames.received.get()
                     ));
+                    if let Some(dhcp) = stack.dhcp_summary() {
+                        output::arguments(format_args!(
+                            "NETWORK adapter {location} dhcp: {dhcp}\n"
+                        ));
+                    }
                     // What the adapter's own registers and rings say then,
                     // where its driver keeps them: a dead receive or
                     // transmit path is told apart from a silent network.
@@ -536,6 +546,13 @@ impl HostNetwork {
     /// Waits up to `micros` for the adapter's next frame (`Stack::wait`).
     pub fn wait(&mut self, micros: u64) -> Result<(), NetError> {
         self.stack.wait(micros)
+    }
+
+    /// The stack's DHCP and DNS lines since the last call
+    /// (`Stack::take_notes`): a lease lost and got back, a lookup that
+    /// failed and what its cached address was.
+    pub fn take_notes(&mut self) -> Vec<String> {
+        self.stack.take_notes()
     }
 
     /// Opens one opaque TCP stream for the restore reverse proxy.
@@ -741,6 +758,12 @@ pub struct GuestNetwork {
     facts: stela_runtime::net::facts::Facts,
     /// Reports since the facts line was last looked at.
     facts_reports: u32,
+    /// The guest's own DHCP exchange while unanswered, with what the host
+    /// adapter received meanwhile ([`Self::report`]).
+    dhcp: stela_runtime::net::stack::dhcp::GuestDhcp,
+    /// When the guest network opened (`output::now`), the DHCP window's
+    /// clock.
+    opened: u64,
 }
 
 /// Reports between two host adapter state lines while the guest receives
@@ -851,6 +874,8 @@ impl GuestNetwork {
             carrier_checked: 0,
             facts: Default::default(),
             facts_reports: 0,
+            dhcp: Default::default(),
+            opened: output::now(),
         })
     }
 
@@ -933,6 +958,15 @@ impl GuestNetwork {
             output::arguments(format_args!("GUEST NETWORK facts {line}\n"));
         }
         self.facts_reports = self.facts_reports.wrapping_add(1);
+        // A guest DHCP client that went unanswered: what it sent and what
+        // the host adapter received meanwhile, so a guest-side failure is
+        // told from a host-side one.
+        if let Some(line) = self
+            .dhcp
+            .overdue(output::millis_since(self.opened), self.carrier)
+        {
+            output::arguments(format_args!("GUEST NETWORK dhcp {line}\n"));
+        }
         let counters = self.counters;
         output::arguments(format_args!(
             "GUEST NETWORK frames link={} host_link={} to_host={} to_guest={} drops={} \
@@ -992,6 +1026,7 @@ impl GuestNetwork {
             match received {
                 Ok(Some(frame)) => {
                     self.facts.inbound(&frame);
+                    self.dhcp.inbound(&frame);
                     self.received.push_back(frame);
                 }
                 Ok(None) => break,
@@ -1034,8 +1069,10 @@ impl GuestNetwork {
     /// is dropped, as a NIC without a cable drops it: the guest sees the
     /// link down ([`Self::carrier`]), and that is no refusal.
     pub fn transmit(&mut self, frames: Vec<Vec<u8>>) -> Option<Vec<u8>> {
+        let now = output::millis_since(self.opened);
         for frame in &frames {
             self.facts.outbound(frame);
+            self.dhcp.outbound(frame, now);
         }
         self.unsent.extend(frames);
         let mut reusable = None;

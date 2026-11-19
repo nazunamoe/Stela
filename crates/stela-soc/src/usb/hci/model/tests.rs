@@ -45,47 +45,81 @@ fn supported(opcode: u16) -> bool {
     COMMANDS
         .iter()
         .find(|c| c.opcode == opcode)
-        .is_some_and(|c| bitmap[usize::from(c.octet)] & 1 << c.bit != 0)
+        .and_then(|c| c.support)
+        .is_some_and(|(octet, bit)| bitmap[usize::from(octet)] & 1 << bit != 0)
 }
 
+/// bluetoothd's HCI bring-up on the USB transport, replayed step by step
+/// from its step table (26B123: 0x100b38f70, entries 1 to 31) with the
+/// parameters it sends. Each standard command is gated on its Supported
+/// Commands bit; the Broadcom ones on the chipset the USB transport sets.
+/// A failed reply to any step without its own tolerance ends the bring-up
+/// with "HCI initialization failed" (reason 108).
 #[test]
 fn bluetoothd_bring_up_completes_in_order() {
     let mut model = Model::new(ADDRESS);
-    // The init steps of bluetoothd's HCI bring-up (0x100193274..0x10019191c),
-    // each gated on its Supported Commands bit.
+    // [1] Write BD_ADDR, sent only when the platform stored an address.
+    ok(&mut model, 0xfc01, &[6, 5, 4, 3, 2, 0x42]);
+    assert_eq!(ok(&mut model, 0x1009, &[]), [6, 5, 4, 3, 2, 0x42]);
+    // [4] Reset keeps an address written by the vendor command.
     ok(&mut model, 0x0c03, &[]);
+    assert_eq!(ok(&mut model, 0x1009, &[]), [6, 5, 4, 3, 2, 0x42]);
+    model.power_on();
+    // [5] Read Verbose Config Version Info: chip id, target, build base,
+    // build number (0x1001b6a6c reads six bytes; Linux btbcm.c:333-351
+    // expects seven with the status).
+    let verbose = ok(&mut model, 0xfc79, &[]);
+    assert_eq!(verbose, [CHIP_ID, 0, 0, 0, 0, 0]);
+    // [6] Read Local Version Information.
     let version = ok(&mut model, 0x1001, &[]);
-    assert_eq!(version, [HCI_VERSION, 0, 0, LMP_VERSION, 0xff, 0xff, 0, 0]);
+    assert_eq!(version, [HCI_VERSION, 0, 0, LMP_VERSION, 15, 0, 0x0e, 0x41]);
+    // [7] Supported Commands, [8] BD_ADDR, [9] Features.
     let commands = ok(&mut model, 0x1002, &[]);
     assert_eq!(commands, supported_commands());
     assert_eq!(ok(&mut model, 0x1009, &[]), ADDRESS);
     let features = ok(&mut model, 0x1003, &[]);
     assert_eq!(features, LMP_FEATURES.to_le_bytes());
     assert_ne!(features[4] & 1 << 6, 0, "LE supported (controller)");
+    assert_ne!(features[6] & 1 << 3, 0, "SSP (controller)");
     assert_ne!(features[7] & 1 << 7, 0, "extended features");
-    let page = ok(&mut model, 0x1004, &[1]);
-    assert_eq!(page[..2], [1, MAX_FEATURE_PAGE]);
-    assert_eq!(page[2], 0, "the host enabled nothing yet");
+    // [10] Extended features page 2 (0x100193e8c), whatever the maximum:
+    // its callback (0x100195af8) fails the bring-up on any error status.
+    let page = ok(&mut model, 0x1004, &[2]);
+    assert_eq!(page, [2, MAX_FEATURE_PAGE, 0, 0, 0, 0, 0, 0, 0, 0]);
+    // [11] LE features (0x2003; 0x2087 has no bit).
     assert_eq!(ok(&mut model, 0x2003, &[]), [0; 8]);
+    // [12] Set Event Mask; [13] page 2 is sent only from LMP version 12.
     ok(
         &mut model,
         0x0c01,
         &[0xff, 0xff, 0xfb, 0xff, 0x07, 0xf8, 0xbf, 0x3d],
     );
-    ok(&mut model, 0x0c63, &[0; 8]);
+    const { assert!(LMP_VERSION < 12) };
+    // [14] LE Set Event Mask (LMP 6 or later), [15] SSP mode 1
+    // (0x100ba615c), [16] LE Host Supported 1.
     ok(&mut model, 0x2001, &[0x1f, 0, 0, 0, 0, 0, 0, 0]);
     ok(&mut model, 0x0c56, &[1]);
     ok(&mut model, 0x0c6d, &[1, 0]);
     assert_eq!(ok(&mut model, 0x1004, &[1])[2], 0b11, "SSP and LE host");
+    // [17] LE buffer size (v1), [19] LE states, [20] accept list size.
     assert_eq!(ok(&mut model, 0x2002, &[]), [251, 0, LE_ACL_BUFFERS]);
     assert_eq!(ok(&mut model, 0x201c, &[]), LE_STATES.to_le_bytes());
     assert_eq!(ok(&mut model, 0x200f, &[]), [ACCEPT_LIST_SIZE as u8]);
+    // [21] Read Buffer Size, [25] Host Buffer Size, [26] Flow Control.
     assert_eq!(ok(&mut model, 0x1005, &[]), [0xfd, 0x03, 0, 8, 0, 0, 0]);
     ok(&mut model, 0x0c33, &[0xfd, 0x03, 0, 8, 0, 0, 0]);
     ok(&mut model, 0x0c31, &[1]);
-    ok(&mut model, 0x0c5b, &[0]);
+    // [27] Write Default Erroneous Data Reporting 1 (Broadcom chipsets).
+    ok(&mut model, 0x0c5b, &[1]);
+    // Steps that bluetoothd skips on a clear bit, each tolerating 0x274:
+    // [17] v2 buffer 0x2060, [18] 0x202f, [22][23][29] 0x2074, [24] 0x207d,
+    // [28] 0x20a2; [11] v2 features 0x2087 is chosen by an LE feature bit.
+    for optional in [0x2060, 0x2074, 0x202f, 0x207d, 0x2087, 0x20a2] {
+        assert!(!supported(optional), "{optional:#06x}");
+        assert!(!implements(optional));
+    }
+    // Device configuration after bring-up.
     assert_eq!(ok(&mut model, 0x2007, &[]), [0]);
-    // Device configuration at the login window.
     ok(&mut model, 0x0c24, &[0x0c, 0x01, 0x1c]);
     assert_eq!(ok(&mut model, 0x0c23, &[]), [0x0c, 0x01, 0x1c]);
     let mut name = [0; 248];
@@ -97,19 +131,137 @@ fn bluetoothd_bring_up_completes_in_order() {
     ok(&mut model, 0x0c45, &[2]);
     ok(&mut model, 0x0c52, &[0; 241]);
     assert_eq!(model.air().scan_enable, 3);
-    // Steps bluetoothd takes only when their bits are set: none is.
-    for optional in [0x2060, 0x2074, 0x202f, 0x207d, 0x2087, 0x20a2] {
-        assert!(!supported(optional), "{optional:#06x}");
-        assert!(!implements(optional));
+    // Vendor commands of the stack's later start that the module does not
+    // model answer Unknown HCI Command, each reported once.
+    for opcode in [0xfc27, 0xfd03, 0xfc3b, 0xfe83, 0xfd23, 0xfcf7, 0xfd5c] {
+        let (status, returns) = complete(&run(&mut model, opcode, &[0; 4]), opcode);
+        assert_eq!((status, returns.len()), (UNKNOWN_COMMAND, 0));
     }
+    assert_eq!(model.take_unknown().len(), 7);
+    // Before PoweredOn (VM round 3): LE meta enable features (5 bytes),
+    // the Olympic completed-packets threshold (8), the extended duplicate
+    // filter (3) and the advertising PCF feature select (14). bluetoothd
+    // logs each "completed with status 701" and goes on.
+    for (opcode, length) in [(0xfce9, 5), (0xfce2, 8), (0xfd47, 3), (0xfce9, 14)] {
+        let (status, _) = complete(&run(&mut model, opcode, &vec![0; length]), opcode);
+        assert_eq!(status, UNKNOWN_COMMAND);
+    }
+    assert_eq!(model.take_unknown(), [0xfce9, 0xfce2, 0xfd47]);
+    // The first LE scan: this board's scan capabilities send the main core's
+    // parameters with the multi-core command (LE_StartScan 0x100257c2c): a
+    // public own address, no filter, the 1M PHY, two cores, core 1, then
+    // passive 300 ms / 30 ms and the core value 30. Its completion
+    // (leScanParamsLPCoreCb 0x100258108) fails the scan on any error, and
+    // the failed scan restarts the daemon with reason 701.
+    let main = [0, 0, 1, 2, 1, 0, 0xe0, 0x01, 0x30, 0x00, 0x1e, 0x00];
+    ok(&mut model, 0xfe37, &main);
+    // The scan core's parameters follow when it has a window (0x100258340,
+    // core 2); round 3 had none.
+    let scan_core = [0, 0, 1, 2, 2, 0, 0x50, 0x00, 0x10, 0x00, 0x1e, 0x00];
+    ok(&mut model, 0xfe37, &scan_core);
+    assert_eq!(model.air().scanning, None, "parameters start nothing");
+    // leScanParamsCb (0x10025999c): enable with the duplicate filter, two
+    // cores, the main core's bit.
+    ok(&mut model, 0xfe29, &[0b11, 2, 0, 0, 1, 0, 0, 0, 0]);
+    assert_eq!(model.air().scanning, Some((0, 1)));
+    // Its completion (0x100259d84) wipes the duplicate list of the running
+    // cores when the platform filters duplicates in the controller
+    // (0x100259e04; round 4 did not), then reads the low-power core's
+    // statistics once (0x100259fb4, clear 1). The parser (0x1001b554c)
+    // takes ten counters; the scan is started after it (0x100259fc4).
+    ok(&mut model, 0xfe2a, &[1]);
+    assert_eq!(ok(&mut model, 0xfe3b, &[1]), [0; 40]);
+    assert!(model.advance(u64::MAX).is_empty(), "nothing in range");
+    // LE_StopScan (0x1002585c8): flags 0 on both cores. Its completion
+    // (0x100258680) restarts a scan with the same parameter commands.
+    ok(&mut model, 0xfe29, &[0, 2, 0, 0, 3, 0, 0, 0, 0]);
+    assert_eq!(model.air().scanning, None);
+    assert!(model.take_unknown().is_empty());
+}
+
+/// The multi-core scan commands check what the controller can check: the
+/// parameter length the PHY bits give, the core, the core bits.
+#[test]
+fn the_multi_core_scan_commands_check_their_lengths_and_cores() {
+    let mut model = Model::new(ADDRESS);
+    // Two PHYs (1M and coded) take two seven-byte entries.
+    let mut two = vec![0, 0, 0b101, 1, 2];
+    two.extend_from_slice(&[1, 0x60, 0, 0x30, 0, 0x1e, 0, 1, 0x60, 0, 0x30, 0, 0x1e, 0]);
+    ok(&mut model, 0xfe37, &two);
+    for bad in [
+        &two[..12],
+        &[0, 0, 1, 1, 3, 0, 0x60, 0, 0x30, 0, 0x1e, 0][..],
+    ] {
+        let (status, returns) = complete(&run(&mut model, 0xfe37, bad), 0xfe37);
+        assert_eq!((status, returns.len()), (INVALID_PARAMETERS, 0));
+    }
+    let (status, _) = complete(&run(&mut model, 0xfe29, &[1; 8]), 0xfe29);
+    assert_eq!(status, INVALID_PARAMETERS);
+    let (status, _) = complete(
+        &run(&mut model, 0xfe29, &[1, 1, 0, 0, 0x10, 0, 0, 0, 0]),
+        0xfe29,
+    );
+    assert_eq!(status, INVALID_PARAMETERS);
+    assert_eq!(model.air().scanning, None);
+    // The statistics read keeps its return length on an error, as the
+    // parser asserts its bounds.
+    let (status, returns) = complete(&run(&mut model, 0xfe3b, &[2]), 0xfe3b);
+    assert_eq!((status, returns.len()), (INVALID_PARAMETERS, 40));
+    let (status, _) = complete(&run(&mut model, 0xfe3b, &[0, 0]), 0xfe3b);
+    assert_eq!(status, INVALID_PARAMETERS);
+    let (status, _) = complete(&run(&mut model, 0xfe2a, &[0x10]), 0xfe2a);
+    assert_eq!(status, INVALID_PARAMETERS);
+    for opcode in [0xfe29, 0xfe2a, 0xfe37, 0xfe3b] {
+        assert!(implements(opcode));
+        assert!(!supported(opcode));
+    }
+    assert!(model.take_unknown().is_empty());
+}
+
+#[test]
+fn every_extended_features_page_answers_and_pages_past_the_maximum_are_empty() {
+    let mut model = Model::new(ADDRESS);
+    assert_eq!(
+        ok(&mut model, 0x1004, &[0])[2..],
+        LMP_FEATURES.to_le_bytes()
+    );
+    for page in [MAX_FEATURE_PAGE + 1, 0xff] {
+        let returns = ok(&mut model, 0x1004, &[page]);
+        assert_eq!(returns[..2], [page, MAX_FEATURE_PAGE]);
+        assert_eq!(returns[2..], [0; 8]);
+    }
+}
+
+/// The Broadcom commands Linux sends an Apple module (btbcm.c
+/// `btbcm_setup_apple`, `btbcm_set_bdaddr`) with the lengths it checks.
+#[test]
+fn the_broadcom_commands_answer_with_their_lengths() {
+    let mut model = Model::new(ADDRESS);
+    // btbcm.c:373-391 expects five bytes: status, vendor, product.
+    let product = ok(&mut model, 0xfc5a, &[]);
+    assert_eq!(product, [0xac, 0x05, 0x8f, 0x82]);
+    // btbcm.c:353-371 expects nine bytes: status and eight feature bytes.
+    assert_eq!(ok(&mut model, 0xfc6e, &[]), [0; 8]);
+    assert_eq!(ok(&mut model, 0xfc79, &[]).len(), 6);
+    // A wrong length is invalid, not unknown, and leaves the address alone.
+    let (status, _) = complete(&run(&mut model, 0xfc01, &[1, 2, 3]), 0xfc01);
+    assert_eq!(status, INVALID_PARAMETERS);
+    assert_eq!(ok(&mut model, 0x1009, &[]), ADDRESS);
+    // Vendor commands are not standard commands: no Supported Commands bit.
+    for opcode in [0xfc01, 0xfc5a, 0xfc6e, 0xfc79] {
+        assert!(implements(opcode));
+        assert!(!supported(opcode));
+    }
+    assert!(model.take_unknown().is_empty());
 }
 
 #[test]
 fn the_bitmap_lists_every_implemented_command_and_nothing_else() {
     let bitmap = supported_commands();
     let set: u32 = bitmap.iter().map(|b| b.count_ones()).sum();
-    assert_eq!(set as usize, COMMANDS.len());
-    for command in COMMANDS {
+    let standard = COMMANDS.iter().filter(|c| c.support.is_some()).count();
+    assert_eq!(set as usize, standard);
+    for command in COMMANDS.iter().filter(|c| c.support.is_some()) {
         assert!(supported(command.opcode));
     }
     // Reset is octet 5 bit 7 (Vol 4 Part E 6.27).

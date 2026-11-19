@@ -9,10 +9,10 @@ Subject: [PATCH] radv: normalize sine and cosine and lower doubles in a shader
  1 file changed, 4 insertions(+)
 
 diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
-index e9865d5..e5cd017 100644
+index e6e89e4778e454d59bbf8b6b19715be1314c0616..15237565bd9674c31e568570ce6323fd2b21d284 100644
 --- a/src/amd/vulkan/radv_shader.c
 +++ b/src/amd/vulkan/radv_shader.c
-@@ -495,6 +495,10 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct
+@@ -498,6 +498,10 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct
           .point_coord = true,
        };
        NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &point_coord);
@@ -23,6 +23,3 @@ index e9865d5..e5cd017 100644
  
        assert(exec_list_length(&nir->functions) == 1);
        radv_shader_choose_subgroup_size(compiler_info, nir, &stage->key, 0);
--- 
-2.56.1
-

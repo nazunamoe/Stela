@@ -254,7 +254,7 @@ fn boot_services_sipi_page() -> Option<u64> {
 pub(super) fn map(
     image: &EngineImage,
     memory: &mut EngineMemory,
-    runtime: &Runtime,
+    runtime: &mut Runtime,
     storage: Option<&stela_drivers::Handoff>,
     native_mmio: Option<&mut crate::native_mmio::Prepared>,
     host_firmware: &crate::host_firmware::Resources,

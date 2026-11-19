@@ -513,6 +513,8 @@ fn raw(io: Io, timer: Timer) -> Controller<Io, Timer> {
         profile: Profile::I82579,
         config_read: None,
         ulp_exit_failed: false,
+        ulp_exit: None,
+        lanphypc_done: None,
     }
 }
 #[test]

@@ -873,6 +873,7 @@ mod tests {
         };
         let table = gpt::Table {
             disk_guid: Guid::from_entropy([3; 16]),
+            slots: Default::default(),
             partitions: vec![gpt::Partition {
                 type_guid: Guid::parse(type_guid).unwrap(),
                 unique_guid: unique,

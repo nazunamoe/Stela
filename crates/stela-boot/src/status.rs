@@ -26,6 +26,7 @@ use crate::{
 use alloc::{format, string::String, vec::Vec};
 use core::fmt::{self, Write as _};
 use stela_boot_core::screen::Exclusive;
+use stela_boot_core::step_detail::Thinning;
 
 /// Frames of the running marker: three cells moving across six and back.
 const FRAMES: usize = 14;
@@ -37,9 +38,6 @@ pub const STREAM_LINES: usize = 40;
 /// The width of a step's mark and the gap after it, where its text starts:
 /// info and streamed lines start there too.
 const TEXT_INDENT: &str = "           ";
-/// A running step's detail held this long is logged with its time
-/// ([`State::detail_ends`]).
-const DETAIL_LOG_MILLIS: u64 = 250;
 /// The longest one draw of the running step holds the boot CPU: a scroll
 /// of the lines under it takes tens of milliseconds on a large or slow
 /// framebuffer, which the guest's PE 0 would otherwise wait out at once.
@@ -90,6 +88,8 @@ struct State {
     streamed: bool,
     /// Finished lines, each its mark's letter then its text.
     history: String,
+    /// Which of the running step's details the log keeps.
+    details: Thinning,
 }
 
 /// The boot PE's reports and the host drivers' waits on any processor
@@ -103,6 +103,7 @@ static STATE: Exclusive<State> = Exclusive::new(State {
     stream: Vec::new(),
     streamed: true,
     history: String::new(),
+    details: Thinning::new(),
 });
 
 /// The device clock (`engine::host::device_counter`): a step stamped on one
@@ -184,9 +185,11 @@ impl State {
     }
 
     /// The running step's detail gives way to `next` (empty at the step's
-    /// end): one that held for [`DETAIL_LOG_MILLIS`] or more is logged with
-    /// its time, such as a device a driver took long to start, which the
-    /// step's own time does not single out.
+    /// end): one that held long enough is logged with its time, such as a
+    /// device a driver took long to start, which the step's own time does
+    /// not single out. A detail that counts, replaced each second, is
+    /// logged at its first, once a minute, when it stalls and at the step's
+    /// end, with how many like it were not logged ([`Thinning`]).
     fn detail_ends(&mut self, next: &str) {
         let Some(running) = self.running.as_ref() else {
             return;
@@ -195,8 +198,19 @@ impl State {
             return;
         }
         let millis = self.millis(running.detail_started);
-        if !running.detail.is_empty() && millis >= DETAIL_LOG_MILLIS {
-            output::arguments(format_args!("STEP DETAIL {} ms={millis}\n", running.detail));
+        let ended = self.millis(0);
+        match self
+            .details
+            .ended(&running.detail, millis, ended, next.is_empty())
+        {
+            Some(0) => {
+                output::arguments(format_args!("STEP DETAIL {} ms={millis}\n", running.detail));
+            }
+            Some(unlogged) => output::arguments(format_args!(
+                "STEP DETAIL {} ms={millis} unlogged_like_it={unlogged}\n",
+                running.detail
+            )),
+            None => {}
         }
         if let Some(running) = self.running.as_mut() {
             running.detail_started = now();
@@ -345,6 +359,7 @@ pub fn begin(title: &str) {
             millis / 1000,
             millis % 1000
         ));
+        state.details.begin();
         state.running = Some(Running {
             title: String::from(title),
             detail: String::new(),
@@ -357,6 +372,13 @@ pub fn begin(title: &str) {
         state.draw_running();
     });
     output::flush_log();
+}
+
+/// The running step's detail; empty without one.
+pub fn detail() -> String {
+    with(|state| state.running.as_ref().map(|running| running.detail.clone()))
+        .flatten()
+        .unwrap_or_default()
 }
 
 /// Show how far the running step has come, such as `182 of 484 MB`.

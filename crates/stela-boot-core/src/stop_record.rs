@@ -348,6 +348,11 @@ pub fn carried_notice(reason: Option<&str>, in_log: bool) -> String {
     notice
 }
 
+/// The words that start the stop line of a fault inside a firmware
+/// variable call ([`FirmwareCall::fault_reason`]), which the next start
+/// looks for (`running_record::variable_service`).
+pub const FAULT_WORDS: &str = "x86 exception inside the PC firmware's variable service";
+
 /// The firmware variable call a processor is inside, as Stela makes them
 /// after the firmware's boot services ended: only from a stop or a restart.
 /// Firmware may touch memory its map does not mark as runtime, such as its
@@ -389,8 +394,7 @@ impl FirmwareCall {
             ),
         };
         Some(alloc::format!(
-            "x86 exception inside the PC firmware's variable service, which Stela called \
-             {purpose} ({exception}): {outcome}"
+            "{FAULT_WORDS}, which Stela called {purpose} ({exception}): {outcome}"
         ))
     }
 }

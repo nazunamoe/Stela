@@ -17,7 +17,7 @@ pub mod sfh;
 pub mod touchpad;
 pub mod virtio;
 
-pub use device::{InputDevice, InputError};
+pub use device::{InputDevice, InputError, Ps2Counters};
 pub use held::HeldInputs;
 
 /// What masking an I2C touchpad's interrupt after a failed operation

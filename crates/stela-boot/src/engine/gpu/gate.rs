@@ -409,6 +409,17 @@ static SILENT: SilentLines<4, 320> = SilentLines::new();
 /// is kept for [`watch_losses`].
 pub(in crate::engine) fn driver_line(line: &str) {
     SILENT.observe(line);
+    // What the port above reads when its GPU went silent or came back.
+    if let Some(event) = gpu_loss::link_event(line)
+        && let Some(gpu) = installed()
+        && let Some(bound) = gpu
+            .start
+            .bound
+            .iter()
+            .find(|bound| line.contains(&bound.name))
+    {
+        super::link::log_port_at(&bound.name, event, bound.port.as_ref());
+    }
 }
 
 /// End the boot once no GPU can serve macOS again: every GPU that serves
@@ -495,50 +506,27 @@ fn note(text: &str) {
 /// the carved bytes then and the image offsets of code on the stack.
 const PEAK_SLOTS: usize = 16;
 const PEAK_WORDS: usize = 24;
+/// The stack words searched for them.
+const PEAK_SCANNED: usize = 512;
 static PEAKS: [[AtomicU64; PEAK_WORDS + 1]; PEAK_SLOTS] =
     [const { [const { AtomicU64::new(0) }; PEAK_WORDS + 1] }; PEAK_SLOTS];
 static PEAKS_TAKEN: AtomicU32 = AtomicU32::new(0);
 static PEAKS_SHOWN: AtomicU32 = AtomicU32::new(0);
 
 /// The heap's peak hook: keeps the allocating stack's code offsets. Runs
-/// under the heap's lock, so it only reads the stack and stores words.
+/// under the heap's lock, so it only reads the stack and stores words; the
+/// stack may end within a page of its pointer, as a fresh job's does.
 pub(super) fn peak_passed(carved: usize) {
-    unsafe extern "C" {
-        static __ImageBase: u8;
-    }
     let slot = PEAKS_TAKEN.load(Ordering::Relaxed) as usize;
     if slot >= PEAK_SLOTS {
         return;
     }
-    let base = &raw const __ImageBase as u64;
-    // SAFETY: the mapped PE headers of this image: `e_lfanew`, then the
-    // optional header's SizeOfCode and BaseOfCode.
-    let (code, size) = unsafe {
-        let header = u64::from((base as *const u32).byte_add(0x3c).read_unaligned());
-        let pe = (base + header) as *const u32;
-        (
-            u64::from(pe.byte_add(0x2c).read_unaligned()),
-            u64::from(pe.byte_add(0x1c).read_unaligned()),
-        )
-    };
-    let stack: *const u64;
-    // SAFETY: reads the stack pointer.
-    unsafe {
-        core::arch::asm!("mov {}, rsp", out(reg) stack, options(nomem, nostack, preserves_flags));
-    }
+    let mut offsets = [0; PEAK_WORDS];
+    let kept = crate::engine::large_blocks::stack_code_offsets(PEAK_SCANNED, &mut offsets);
     let words = &PEAKS[slot];
     words[0].store(carved as u64, Ordering::Relaxed);
-    let mut kept = 0;
-    for word in 0..512 {
-        // SAFETY: as for a panic, an allocation runs 512 words from its stack's end.
-        let offset = unsafe { stack.add(word).read() }.wrapping_sub(base);
-        if offset.wrapping_sub(code) < size {
-            kept += 1;
-            words[kept].store(offset, Ordering::Relaxed);
-            if kept == PEAK_WORDS {
-                break;
-            }
-        }
+    for (word, &offset) in words[1..].iter().zip(&offsets[..kept]) {
+        word.store(offset, Ordering::Relaxed);
     }
     PEAKS_TAKEN.store(slot as u32 + 1, Ordering::Release);
 }

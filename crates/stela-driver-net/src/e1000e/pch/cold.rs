@@ -105,7 +105,6 @@ pub enum Error {
     LtrLimit(u16),
     HostIdentityNotObserved,
     SmbusMode,
-    PowerCycleTimeout,
     UlpState,
     /// The Intel ME did not take the PHY out of ULP when asked.
     MeUlpTimeout,
@@ -170,7 +169,6 @@ impl core::fmt::Display for Error {
                 f.write_str("this PC's SMBIOS identity, which it needs, was not read")
             }
             Self::SmbusMode => f.write_str("the PHY stays in SMBus mode"),
-            Self::PowerCycleTimeout => f.write_str("the PHY power cycle (LANPHYPC) did not finish"),
             Self::UlpState => f.write_str("the PHY stays in its ultra-low-power state"),
             Self::MeUlpTimeout => {
                 f.write_str("the Intel ME did not take the PHY out of its low-power state")
@@ -258,6 +256,12 @@ pub struct Controller<R: Registers + nvm::Registers, D: Delay + Clone> {
     config_read: Option<ConfigRead<R>>,
     /// The PHY's ULP exit failed and the start went on without it.
     ulp_exit_failed: bool,
+    /// How the start took the PHY out of ULP (`me` or `lanphypc`), and
+    /// why that failed if it did.
+    ulp_exit: Option<(&'static str, Option<Error>)>,
+    /// Whether the last LANPHYPC toggle saw its power cycle done (LPCD);
+    /// Linux waits 100 ms for it and goes on either way.
+    lanphypc_done: Option<bool>,
 }
 impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
     /// # Safety
@@ -294,6 +298,8 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
             profile: Profile::I82579,
             config_read: None,
             ulp_exit_failed: false,
+            ulp_exit: None,
+            lanphypc_done: None,
         };
         if let Err(error) = this.initialize() {
             this.poisoned = true;
@@ -379,7 +385,7 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
     /// which brings a PHY out of SMBus mode.
     fn toggle_lanphypc(&mut self) -> Result<(), Error> {
         let lpt = self.profile.is_lpt_or_newer();
-        self.phy.transaction(|p| {
+        let done = self.phy.transaction(|p| {
             let value = p.read_mac(FEXTNVM3)?;
             p.write_mac(FEXTNVM3, (value & !CONFIG_COUNTER) | CONFIG_50MS)?;
             let value = (p.read_mac(CTRL)? | LANPHYPC_OVERRIDE) & !LANPHYPC_VALUE;
@@ -388,10 +394,13 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
             p.wait_minimum(10)?;
             p.write_mac(CTRL, value & !LANPHYPC_OVERRIDE)?;
             p.read_mac(STATUS)?;
+            let mut done = None;
             if lpt {
+                done = Some(false);
                 for _ in 0..=20 {
                     p.wait_minimum(5_000)?;
                     if p.read_mac(CTRL_EXT)? & POWER_CYCLE_DONE != 0 {
+                        done = Some(true);
                         break;
                     }
                 }
@@ -399,9 +408,96 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
             } else {
                 p.wait_minimum(50_000)?;
             }
-            Ok(())
+            Ok(done)
         })?;
+        self.lanphypc_done = done.or(self.lanphypc_done);
         Ok(())
+    }
+    /// One line of the MAC's and PHY's state for a link that stays down:
+    /// the PHY's control, status, advertisement, partner and 1000BASE-T
+    /// words; CTRL, STATUS, CTRL_EXT (SMBus forced, power cycle done), FWSM
+    /// (ME firmware valid, ULP configuration under way, PHY reset
+    /// permitted) and PHY_CTRL; on LPT and newer the PHY's ULP and SMBus
+    /// configuration; and how the start took the PHY out of ULP.
+    pub fn state(&mut self) -> alloc::string::String {
+        use alloc::format;
+        let mut line = format!("phy={:?}:{:#010x}", self.identity.kind, self.identity.id);
+        let lpt = self.profile.is_lpt_or_newer();
+        let mut registers = alloc::vec![
+            ("bmcr", Register { page: 0, index: 0 }),
+            ("bmsr", Register { page: 0, index: 1 }),
+            ("bmsr", Register { page: 0, index: 1 }),
+            ("anar", Register { page: 0, index: 4 }),
+            ("anlpar", Register { page: 0, index: 5 }),
+            ("gbcr", Register { page: 0, index: 9 }),
+            ("gbsr", Register { page: 0, index: 10 }),
+        ];
+        if lpt {
+            registers.push((
+                "ulp_config",
+                Register {
+                    page: 779,
+                    index: 16,
+                },
+            ));
+            registers.push(("smb_control", SMB_CONTROL));
+        }
+        let addresses: Vec<Register> = registers.iter().map(|&(_, at)| at).collect();
+        match self.phy.peek(&addresses) {
+            Ok(values) => {
+                // BMSR twice: its link bit latches low, so the second read
+                // is the link now.
+                for (index, ((name, _), value)) in registers.iter().zip(values).enumerate() {
+                    if index == 1 {
+                        continue;
+                    }
+                    match value {
+                        Some(value) => line += &format!(" {name}={value:#06x}"),
+                        None => line += &format!(" {name}=silent"),
+                    }
+                }
+            }
+            Err(error) => line += &format!(" phy_read=failed({error:?})"),
+        }
+        let mac = |c: &mut Self, at| c.read(at).ok();
+        let ctrl = mac(self, CTRL);
+        let status = mac(self, STATUS);
+        let ctrl_ext = mac(self, CTRL_EXT);
+        let fwsm = mac(self, super::FWSM);
+        let phy_ctrl = mac(self, PHY_CTRL);
+        let shown = |value: Option<u32>| match value {
+            Some(value) => format!("{value:#010x}"),
+            None => alloc::string::String::from("failed"),
+        };
+        let bit = |value: Option<u32>, mask: u32| match value {
+            Some(value) => format!("{}", u8::from(value & mask != 0)),
+            None => alloc::string::String::from("?"),
+        };
+        line += &format!(
+            " ctrl={} status={} ctrl_ext={} (force_smbus={} lpcd={}) fwsm={} (me_valid={} \
+             ulp_config_busy={} reset_permitted={}) phy_ctrl={}",
+            shown(ctrl),
+            shown(status),
+            shown(ctrl_ext),
+            bit(ctrl_ext, FORCE_SMBUS),
+            bit(ctrl_ext, POWER_CYCLE_DONE),
+            shown(fwsm),
+            bit(fwsm, super::FW_VALID),
+            bit(fwsm, ULP_CONFIG_DONE),
+            bit(fwsm, super::RESET_PERMITTED),
+            shown(phy_ctrl),
+        );
+        line += &match &self.ulp_exit {
+            None => alloc::string::String::from(" ulp_exit=none"),
+            Some((how, None)) => format!(" ulp_exit={how}:ok"),
+            Some((how, Some(error))) => format!(" ulp_exit={how}:failed({error})"),
+        };
+        line += match self.lanphypc_done {
+            None => " lanphypc=not-run",
+            Some(true) => " lanphypc=done",
+            Some(false) => " lanphypc=no-lpcd",
+        };
+        line
     }
     /// `e1000_phy_is_accessible_pchlan`: whether the PHY answers, retried in
     /// MDIO slow mode on an 82579. On LPT and newer, an answering PHY of an

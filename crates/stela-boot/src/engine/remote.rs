@@ -65,7 +65,13 @@ impl RangeSource for Http {
     }
 
     fn wait(&mut self, micros: u64) -> Result<(), NetError> {
-        self.network.0.borrow_mut().wait(micros)
+        let mut network = self.network.0.borrow_mut();
+        let result = network.wait(micros);
+        // The stack keeps a bounded number of these, so the lines stay few.
+        for note in network.take_notes() {
+            output::arguments(format_args!("REMOTE IMAGE network {note}\n"));
+        }
+        result
     }
 
     fn millis(&mut self) -> u64 {

@@ -355,6 +355,10 @@ pub(super) fn update_stela(
         store.publish()?;
     }
     super::fdr::prepare(&record, false)?;
+    let log = efi::keep_boot_log(environment.host, &esp, image.len() as u64);
+    if let Some(log) = log.said() {
+        writeln!(text, "  boot log       {log}")?;
+    }
     efi::add_mount(&esp, &image, None, None)?;
     activate(&mut record, to)?;
     // An older USB, with a per-PC firmware set or none, gets the complete

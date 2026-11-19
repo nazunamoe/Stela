@@ -23,6 +23,23 @@ pub enum InputDevice {
     Ish(Box<ish::IshInput>),
 }
 
+/// What [`InputDevice::ps2_counters`] reports of an i8042.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Ps2Counters {
+    /// Bytes read from the keyboard port, then the mouse port.
+    pub read: [u64; 2],
+    pub dropped: u64,
+    pub status: Option<u8>,
+    pub config: Option<u8>,
+    /// The configuration byte the firmware left.
+    pub firmware_config: Option<u8>,
+    /// Whether keyboard bytes arrive translated to set 1, as the firmware
+    /// left the controller; `None` before the first start.
+    pub translated: Option<bool>,
+    /// How the start found the keyboard; `None` without a keyboard start.
+    pub keyboard_presence: Option<super::ps2::KeyboardPresence>,
+}
+
 /// An I²C-HID device on whichever bus and interrupt pin probe found it.
 pub type I2cHid = hid_i2c::HidInput<Box<dyn Bus>, Box<dyn hid_i2c::Interrupt>, Clock>;
 
@@ -119,6 +136,30 @@ impl InputDevice {
             Self::I2cHid(device) => device.set_leds(u16::from(leds)).map_err(InputError::I2cHid),
             Self::Ish(device) => device.set_leds(u16::from(leds)).map_err(InputError::Ish),
         }
+    }
+
+    /// For the i8042: the bytes read from the keyboard and the mouse port,
+    /// the bytes dropped (a mouse byte with its parity or timeout bit, a
+    /// byte that broke a sequence or packet, a byte before the start), and
+    /// the controller's last status and configuration byte. `None` for any
+    /// other device.
+    pub fn ps2_counters(&self) -> Option<Ps2Counters> {
+        let Self::Ps2(controller) = self else {
+            return None;
+        };
+        let controller = controller.try_borrow().ok()?;
+        let (status, config) = controller.controller_state();
+        Some(Ps2Counters {
+            read: controller.bytes_read(),
+            dropped: controller
+                .framing_errors()
+                .saturating_add(controller.discarded_before_start()),
+            status,
+            config,
+            firmware_config: controller.firmware_config(),
+            translated: controller.translated(),
+            keyboard_presence: controller.keyboard_presence(),
+        })
     }
 
     /// The last HID report the device sent, as it arrived, for diagnostics;

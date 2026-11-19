@@ -57,6 +57,17 @@ struct Reported {
     cost: u64,
     /// Its polls since the last [`TIMES_SECONDS`] report.
     times: Times,
+    /// For an i8042: its bytes read and dropped at the last report, and
+    /// the standing status and configuration byte last logged.
+    ps2: Option<Ps2Seen>,
+}
+
+/// What [`Reported`] keeps of an i8042 between lines.
+#[derive(Clone, Copy, Default)]
+struct Ps2Seen {
+    read: [u64; 2],
+    dropped: u64,
+    logged: Option<(u8, Option<u8>)>,
 }
 
 /// One device's polls between reports, in 24 MHz counter ticks: how many,
@@ -70,6 +81,8 @@ struct Times {
     polled: u64,
     longest_poll: u64,
     skipped: u64,
+    /// The inputs its polls gave the guest.
+    delivered: u64,
 }
 
 /// How often the input devices' poll times are reported.
@@ -290,9 +303,11 @@ impl HostInput {
             times.longest_poll = times.longest_poll.max(took);
             reported.cost = reported.cost - reported.cost / 8 + took / 8;
             reported.looked = now;
+            reported.times.delivered += pending.len().saturating_sub(before) as u64;
             if pending.len() != before {
                 reported.active = now;
             }
+            controller_change(&*device, reported);
             if let Err(error) = polled {
                 let error = alloc::format!("{error}");
                 if !core::mem::replace(&mut reported.failed, true) {
@@ -316,8 +331,11 @@ impl HostInput {
     }
 
     /// `INPUT TIMES name:polls/waited_us/longest_wait_us/polled_us/
-    /// longest_poll_us/skipped …`: each device's polls since the last
-    /// report, the host-drivers lock waits before them, and their own time.
+    /// longest_poll_us/skipped/delivered[/read=K+M/dropped=D] …`: each
+    /// device's polls since the last report, the host-drivers lock waits
+    /// before them, their own time, the inputs they gave the guest, and for
+    /// an i8042 the bytes read from its keyboard and mouse ports and the
+    /// bytes dropped since the last report.
     fn report_times(&mut self) {
         let micros = |ticks: u64| ticks / (super::host::COUNTER_HZ / 1_000_000);
         let mut line = alloc::string::String::from("INPUT TIMES");
@@ -326,7 +344,7 @@ impl HostInput {
             let _ = core::fmt::Write::write_fmt(
                 &mut line,
                 format_args!(
-                    " {}:{}/{}/{}/{}/{}/{}",
+                    " {}:{}/{}/{}/{}/{}/{}/{}",
                     device.name().replace(' ', "_"),
                     t.polls,
                     micros(t.waited),
@@ -334,8 +352,23 @@ impl HostInput {
                     micros(t.polled),
                     micros(t.longest_poll),
                     t.skipped,
+                    t.delivered,
                 ),
             );
+            if let Some(counters) = device.ps2_counters() {
+                let seen = reported.ps2.get_or_insert_with(Ps2Seen::default);
+                let _ = core::fmt::Write::write_fmt(
+                    &mut line,
+                    format_args!(
+                        "/read={}+{}/dropped={}",
+                        counters.read[0].saturating_sub(seen.read[0]),
+                        counters.read[1].saturating_sub(seen.read[1]),
+                        counters.dropped.saturating_sub(seen.dropped),
+                    ),
+                );
+                seen.read = counters.read;
+                seen.dropped = counters.dropped;
+            }
         }
         output::arguments(format_args!("{line}\n"));
     }
@@ -378,4 +411,41 @@ fn stop_cause(
 ) -> alloc::string::String {
     held.or(last_failure)
         .unwrap_or_else(|| alloc::string::String::from("the device recorded no cause"))
+}
+
+/// `INPUT <name> controller: status .., configuration ..` for an i8042 at
+/// its first poll and whenever its standing status bits or its
+/// configuration byte change, so a log says whether its keyboard port was
+/// on, translated and interrupting while it was polled, which set its
+/// keys are decoded as, and which check found the keyboard.
+fn controller_change(device: &InputDevice, reported: &mut Reported) {
+    let Some(counters) = device.ps2_counters() else {
+        return;
+    };
+    let Some(status) = counters.status else {
+        return;
+    };
+    let now = (
+        stela_drivers::input::ps2::standing_status(status),
+        counters.config,
+    );
+    let seen = reported.ps2.get_or_insert_with(Ps2Seen::default);
+    if seen.logged == Some(now) {
+        return;
+    }
+    seen.logged = Some(now);
+    let firmware = counters
+        .firmware_config
+        .map_or_else(alloc::string::String::new, |config| {
+            alloc::format!(
+                "; the firmware left configuration {config:02x}, read with both ports disabled"
+            )
+        });
+    output::arguments(format_args!(
+        "INPUT {} controller: {}{firmware}; {}; {}\n",
+        device.name(),
+        stela_drivers::input::ps2::describe_controller(Some(status), counters.config),
+        stela_drivers::input::ps2::describe_keyboard_path(counters.translated),
+        stela_drivers::input::ps2::describe_presence(counters.keyboard_presence)
+    ));
 }

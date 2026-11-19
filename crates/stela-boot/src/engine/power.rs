@@ -295,15 +295,7 @@ impl HostPowerControl {
         if let Some(reason) = super::bundle_repair::restart_refusal() {
             output::fatal(reason);
         }
-        match crate::stop_record::return_at_restart() {
-            Some(entry) => output::arguments(format_args!(
-                "POWER the firmware starts its entry Boot{entry:04X} again after the restart\n"
-            )),
-            None => output::arguments(format_args!(
-                "POWER the firmware chooses what starts after the restart: it named no entry \
-                 for this start, or would not take one for the next\n"
-            )),
-        }
+        output::arguments(format_args!("{}", crate::stop_record::return_at_restart()));
         output::arguments(format_args!("STELA RESTART code={RESTART_CODE:#x}\n"));
         output::close_logs();
         self.disks.shutdown(false);

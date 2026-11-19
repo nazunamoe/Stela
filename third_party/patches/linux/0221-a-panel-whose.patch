@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 16:13:06 +0000
+Subject: [PATCH] fix(nouveau): a panel whose backlight interface found no
+ unique name says so in its backlight line, and one where neither control was
+ found says that, where both said the driver prefers ACPI video
+
+---
+ drivers/gpu/drm/nouveau/nouveau_backlight.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nouveau_backlight.c b/drivers/gpu/drm/nouveau/nouveau_backlight.c
+index d02d67099c89366cb51c51c1be2b7cefd1bb6f26..b9b8ef89b6ff4b84f4490c4c5ccbf361d27235ca 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_backlight.c
++++ b/drivers/gpu/drm/nouveau/nouveau_backlight.c
+@@ -367,11 +367,13 @@ nouveau_backlight_init(struct drm_connector *connector)
+ 
+ 	if (!nouveau_acpi_video_backlight_use_native()) {
+ 		NV_INFO(drm, "Skipping nv_backlight registration\n");
++		why = "the driver prefers ACPI video";
+ 		goto fail_alloc;
+ 	}
+ 
+ 	if (!nouveau_get_backlight_name(backlight_name, bl)) {
+ 		NV_ERROR(drm, "Failed to retrieve a unique name for the backlight interface\n");
++		why = "no unique name for its backlight interface";
+ 		goto fail_alloc;
+ 	}
+ 
+@@ -411,7 +413,7 @@ fail_alloc:
+ 	if (ret == 0)
+ 		NV_INFO(drm, "backlight on %s: no control of nouveau's: %s; looked for the "
+ 			"GPU's PWM through its firmware and the panel's eDP DPCD AUX control\n",
+-			connector->name, why ? why : "the driver prefers ACPI video");
++			connector->name, why ? why : "neither was found");
+ 	/*
+ 	 * If we get here we have an internal panel, but no nv_backlight,
+ 	 * try registering an ACPI video backlight device instead.

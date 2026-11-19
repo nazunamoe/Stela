@@ -247,6 +247,8 @@ pub(crate) fn page_fault(
                 }
             }
         }
+        #[cfg(feature = "nvk")]
+        super::super::gpu::client::note_stack_guard(address);
         super::super::interrupts::fatal(frame);
     }
     state.follow_native();

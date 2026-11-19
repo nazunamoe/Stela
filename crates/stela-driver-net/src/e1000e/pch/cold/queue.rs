@@ -833,6 +833,22 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone + 'static> Link for Etherne
     fn mac(&self) -> Mac {
         self.station
     }
+    /// The MAC's and PHY's state ([`Controller::state`]), the link status
+    /// last seen and the failure that stopped the adapter, if any.
+    fn diagnostic(&mut self) -> Option<alloc::string::String> {
+        let state = match self.change {
+            Some(_) => alloc::string::String::from("phy=held-by-link-change"),
+            None => self.controller.state(),
+        };
+        Some(format!(
+            "{state} link_seen={} failure={:?}",
+            self.link
+                .map_or(alloc::string::String::from("none"), |status| format!(
+                    "{status:#010x}"
+                )),
+            self.failure
+        ))
+    }
     fn carrier(&mut self) -> bool {
         match self.update_link() {
             Ok(up) => up,

@@ -48,6 +48,10 @@ const TEST_MOUSE: u8 = 0xa9;
 const DISABLE_MOUSE: u8 = 0xa7;
 const ENABLE_MOUSE: u8 = 0xa8;
 const SEND_MOUSE: u8 = 0xd4;
+/// The next data byte comes back as if the auxiliary port sent it.
+const AUX_LOOP: u8 = 0xd3;
+/// The byte Linux's i8042_check_aux loops back.
+const LOOP_BYTE: u8 = 0x5a;
 const ACK: u8 = 0xfa;
 const RESEND: u8 = 0xfe;
 const RESET: u8 = 0xff;
@@ -64,6 +68,99 @@ const SET_RESOLUTION: u8 = 0xe8;
 const GET_INFO: u8 = 0xe9;
 const QUEUE_LIMIT: usize = 64;
 const MAX_ATTEMPTS: usize = 2;
+
+/// Status bits that stand rather than follow each byte: the system flag
+/// and the keyboard's inhibit switch (set when not inhibited).
+const STANDING_STATUS: u8 = 0x14;
+
+/// The bits of the status register that stand, for telling a change from
+/// the flow of bytes; all ones, a controller that does not answer, kept.
+pub fn standing_status(status: u8) -> u8 {
+    if status == u8::MAX {
+        status
+    } else {
+        status & STANDING_STATUS
+    }
+}
+
+/// `status XX (...), configuration XX (...)`: the controller's status
+/// register and configuration byte in words, for the boot log.
+pub fn describe_controller(status: Option<u8>, config: Option<u8>) -> alloc::string::String {
+    use alloc::format;
+    let on = |set: bool| if set { "on" } else { "off" };
+    let status = match status {
+        None => alloc::string::String::from("status not read yet"),
+        Some(u8::MAX) => alloc::string::String::from("status ff (no controller answers)"),
+        Some(status) => format!(
+            "status {status:02x} (system flag {}, keyboard {}, last byte's timeout {} and parity \
+             error {})",
+            on(status & 0x04 != 0),
+            if status & 0x10 != 0 {
+                "not inhibited"
+            } else {
+                "inhibited"
+            },
+            on(status & 0x40 != 0),
+            on(status & 0x80 != 0),
+        ),
+    };
+    let config = match config {
+        None => alloc::string::String::from("configuration not read"),
+        Some(config) => format!(
+            "configuration {config:02x} (keyboard port {}, mouse port {}, translation {}, \
+             keyboard interrupt {}, mouse interrupt {})",
+            on(config & KEYBOARD_DISABLED == 0),
+            on(config & MOUSE_DISABLED == 0),
+            on(config & TRANSLATION != 0),
+            on(config & 1 != 0),
+            on(config & 2 != 0),
+        ),
+    };
+    format!("{status}, {config}")
+}
+
+/// Which way keyboard bytes reach the decoder, for the boot log: translated
+/// to set 1 as the firmware left the controller, or untranslated set 2.
+pub fn describe_keyboard_path(translated: Option<bool>) -> &'static str {
+    match translated {
+        Some(true) => "translation kept as the firmware left it, keys decoded as set 1",
+        Some(false) => "untranslated as the firmware left it, keys decoded as set 2",
+        None => "keyboard path not chosen yet",
+    }
+}
+
+/// The SMBIOS chassis types Linux's `atkbd_is_portable_device` lists:
+/// portable, laptop, notebook, sub-notebook, convertible and detachable.
+const PORTABLE_CHASSIS: [u8; 6] = [8, 9, 10, 14, 31, 32];
+
+/// How a start decided a keyboard is behind the keyboard port, as Linux's
+/// `atkbd_probe` decides it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyboardPresence {
+    /// It answered GETID with a keyboard's two ID bytes.
+    Id,
+    /// GETID failed, and it acknowledged Set LEDs.
+    Leds,
+    /// No GETID was sent: the port is translated and the firmware reports
+    /// a portable chassis of this SMBIOS type, where Linux sends none.
+    Assumed { chassis_type: u8 },
+}
+
+/// The keyboard presence check a start took, for the boot log.
+pub fn describe_presence(presence: Option<KeyboardPresence>) -> alloc::string::String {
+    use alloc::{format, string::String};
+    match presence {
+        Some(KeyboardPresence::Id) => String::from("keyboard found by its GETID answer"),
+        Some(KeyboardPresence::Leds) => {
+            String::from("keyboard found by Set LEDs after GETID failed")
+        }
+        Some(KeyboardPresence::Assumed { chassis_type }) => format!(
+            "keyboard taken as present without GETID, a translated port in portable chassis \
+             type {chassis_type}"
+        ),
+        None => String::from("no keyboard presence check"),
+    }
+}
 
 /// Ordered, exclusively owned byte operations on the i8042 register pair.
 pub trait Registers {
@@ -134,6 +231,10 @@ pub struct Config {
     /// Query F0 00 after acknowledged Set 2 selection. Some laptop embedded
     /// keyboards ignore this optional query; native startup leaves it off.
     pub query_scan_set: bool,
+    /// The SMBIOS chassis type the firmware reports, as Linux's DMI
+    /// chassis type reads it. A translated keyboard in a portable chassis
+    /// is not sent GETID, as Linux's `atkbd_skip_getid` decides.
+    pub chassis_type: Option<u8>,
     pub io_timeout_us: u64,
     pub command_timeout_us: u64,
     pub reset_timeout_us: u64,
@@ -149,6 +250,7 @@ impl Default for Config {
             wheel: true,
             reset_on_start: true,
             query_scan_set: true,
+            chassis_type: None,
             io_timeout_us: 500_000,
             command_timeout_us: 200_000,
             reset_timeout_us: 1_000_000,
@@ -389,6 +491,15 @@ pub struct Controller<R = PortIo, T = Clock> {
     /// Mouse bytes dropped for their parity or timeout bit, and bytes that
     /// broke a keyboard sequence or mouse packet and were dropped.
     framing_errors: u64,
+    /// Bytes read from the data port, by the port the status named:
+    /// keyboard, then mouse.
+    bytes_read: [u64; 2],
+    /// The last status read, `None` before the first.
+    last_status: Option<u8>,
+    /// The configuration byte the firmware left, as the first start read it.
+    firmware_config: Option<u8>,
+    /// How the last start found the keyboard, `None` before it did.
+    keyboard_presence: Option<KeyboardPresence>,
 }
 
 /// The psmouse protocol probe the first initialization runs on the mouse port.
@@ -441,6 +552,10 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             last_command: None,
             refused: Vec::new(),
             framing_errors: 0,
+            bytes_read: [0; 2],
+            last_status: None,
+            firmware_config: None,
+            keyboard_presence: None,
         })
     }
     /// Select the mouse port's protocol as Linux `psmouse_extensions` does
@@ -514,6 +629,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
     }
     fn status(&mut self) -> Result<u8, ErrorKind> {
         let status = self.registers.status();
+        self.last_status = Some(status);
         if status == u8::MAX {
             Err(ErrorKind::NoController)
         } else {
@@ -572,6 +688,8 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 return Err(ErrorKind::QueueFull);
             }
             let data = self.registers.read_data();
+            let counted = &mut self.bytes_read[usize::from(port == Port::Mouse)];
+            *counted = counted.saturating_add(1);
             if dropped {
                 framed = status;
                 self.observed_response = Some(ObservedResponse { port, data });
@@ -630,6 +748,26 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             self.timer.start(),
             self.config.io_timeout_us,
         )
+    }
+    /// The configuration byte once two reads in a row agree, as Linux's
+    /// i8042_controller_init reads it, at most ten reads 50 us apart.
+    fn stable_config(&mut self) -> Result<u8, ErrorKind> {
+        let mut last = self.controller_response(READ_CONFIG)?;
+        for _ in 1..10 {
+            let start = self.timer.start();
+            while !self.expired(start, 50) {
+                self.timer.relax();
+            }
+            let config = self.controller_response(READ_CONFIG)?;
+            if config == last {
+                return Ok(config);
+            }
+            last = config;
+        }
+        Err(ErrorKind::ControllerReply {
+            command: READ_CONFIG,
+            received: last,
+        })
     }
     fn set_config(&mut self, value: u8) -> Result<(), ErrorKind> {
         self.command(WRITE_CONFIG)?;
@@ -831,6 +969,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         Ok(())
     }
     fn initialize_inner(&mut self) -> Result<(), ErrorKind> {
+        self.keyboard_presence = None;
         self.command(DISABLE_KEYBOARD)?;
         self.command(DISABLE_MOUSE)?;
         // Discard only pre-handoff bytes while both ports are disabled. A
@@ -845,22 +984,30 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             }
             self.timer.relax();
         }
-        let config = self.controller_response(READ_CONFIG)?;
+        let config = self.stable_config()?;
         self.controller_config = Some(config);
-        self.set_config((config & !(IRQ_BITS | TRANSLATION)) | KEYBOARD_DISABLED | MOUSE_DISABLED)?;
+        let firmware = *self.firmware_config.get_or_insert(config);
+        // Translation stays as the firmware left it, as Linux's
+        // i8042_controller_init leaves it by default: clearing it "can
+        // confuse notebook BIOSes". The keyboard's bytes are decoded as the
+        // set the controller then hands over.
+        let config = (config & !TRANSLATION) | (firmware & TRANSLATION);
+        self.keyboard.set_translated(config & TRANSLATION != 0);
+        self.set_config((config & !IRQ_BITS) | KEYBOARD_DISABLED | MOUSE_DISABLED)?;
         if self.config.reset_on_start {
             self.expect_controller(SELF_TEST, 0x55)?;
             // Self-test can reset CTR on real controllers; reapply/read it back.
-            self.set_config(
-                (config & !(IRQ_BITS | TRANSLATION)) | KEYBOARD_DISABLED | MOUSE_DISABLED,
-            )?;
+            self.set_config((config & !IRQ_BITS) | KEYBOARD_DISABLED | MOUSE_DISABLED)?;
         }
-        // Linux tests neither port at a native start; its auxiliary port
-        // check accepts 0, FA and FF from the controller's port test.
+        // Linux tests neither port at a native start. Its auxiliary port
+        // check loops a byte back through the controller first and runs the
+        // port test only when that fails, "because it's common for chipsets
+        // to return error on perfectly functioning AUX ports"; the test's 0,
+        // FA and FF are then taken.
         if self.config.keyboard && self.config.reset_on_start {
             self.expect_controller(TEST_KEYBOARD, 0)?;
         }
-        if self.config.mouse {
+        if self.config.mouse && !self.aux_loop()? {
             let received = self.controller_response(TEST_MOUSE)?;
             if !matches!(received, 0 | ACK | 0xff) {
                 return Err(ErrorKind::ControllerReply {
@@ -869,7 +1016,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 });
             }
         }
-        let enabled = (config & !(IRQ_BITS | TRANSLATION | KEYBOARD_DISABLED | MOUSE_DISABLED))
+        let enabled = (config & !(IRQ_BITS | KEYBOARD_DISABLED | MOUSE_DISABLED))
             | if self.config.keyboard {
                 0
             } else {
@@ -902,13 +1049,33 @@ impl<R: Registers, T: Timer> Controller<R, T> {
         }
         Ok(())
     }
+    /// Linux's AUX_LOOP in i8042_check_aux: whether the byte written for the
+    /// auxiliary port's output comes back as that port's. The first byte
+    /// either port gives is the answer, as Linux reads it.
+    fn aux_loop(&mut self) -> Result<bool, ErrorKind> {
+        self.command(AUX_LOOP)?;
+        self.write_data(LOOP_BYTE)?;
+        let start = self.timer.start();
+        loop {
+            if let Some(byte) = self.read_byte()? {
+                return Ok(byte.port == Port::Mouse && byte.data == LOOP_BYTE);
+            }
+            if self.expired(start, self.config.io_timeout_us) {
+                return Ok(false);
+            }
+            self.timer.relax();
+        }
+    }
     /// Bring up the keyboard as Linux `atkbd_connect` does on x86: no reset
-    /// unless asked, GETID or else Set LEDs to prove a keyboard is there,
-    /// and the rest (reporting disable, Set 2 selection, LEDs) tried and
-    /// gone on without when the keyboard does not acknowledge them. Linux
-    /// sends no scan-set command at all for Set 2; the selection here is
-    /// tried because translation is off, and a keyboard that refuses it is
-    /// taken to report Set 2, the set firmware and Linux both leave it in.
+    /// unless asked; GETID, or Set LEDs when GETID fails, to prove a
+    /// keyboard is there, and neither on a translated port in a portable
+    /// chassis, as `atkbd_skip_getid` decides; and the rest (reporting
+    /// disable, Set 2 selection, LEDs, typematic) tried and gone on without
+    /// when the keyboard does not acknowledge them. Behind a translating
+    /// controller no scan-set command is sent, as Linux's `atkbd_select_set`
+    /// sends none there. Untranslated, Set 2 selection is tried, and a
+    /// keyboard that refuses it is taken to report Set 2, the set firmware
+    /// and Linux both leave it in.
     fn start_keyboard(&mut self) -> Result<(), ErrorKind> {
         self.command(ENABLE_KEYBOARD)?;
         // Firmware may have left this keyboard reporting an unknown scan
@@ -918,14 +1085,25 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             self.reset_device(Port::Keyboard)?;
             self.device_command(Port::Keyboard, DISABLE_REPORTING, &[])?;
         }
-        let leds_set = if self.keyboard_id()? {
-            false
-        } else {
-            self.device_command(Port::Keyboard, SET_LEDS, &[0])?;
-            true
+        let translated = self.controller_config.unwrap_or(0) & TRANSLATION != 0;
+        let portable = self
+            .config
+            .chassis_type
+            .filter(|chassis_type| translated && PORTABLE_CHASSIS.contains(chassis_type));
+        let presence = match portable {
+            Some(chassis_type) => KeyboardPresence::Assumed { chassis_type },
+            None if self.keyboard_id()? => KeyboardPresence::Id,
+            None => {
+                self.device_command(Port::Keyboard, SET_LEDS, &[0])?;
+                KeyboardPresence::Leds
+            }
         };
-        self.optional_keyboard(SET_SCAN, &[2])?;
-        if self.config.query_scan_set {
+        self.keyboard_presence = Some(presence);
+        let leds_set = presence == KeyboardPresence::Leds;
+        if !translated {
+            self.optional_keyboard(SET_SCAN, &[2])?;
+        }
+        if self.config.query_scan_set && !translated {
             self.device_command(Port::Keyboard, SET_SCAN, &[0])?;
             let scan = self.response(
                 Port::Keyboard,
@@ -936,8 +1114,11 @@ impl<R: Registers, T: Timer> Controller<R, T> {
                 return Err(ErrorKind::UnsupportedScanSet(scan));
             }
         }
-        if !leds_set {
-            self.optional_keyboard(SET_LEDS, &[0])?;
+        // Linux's atkbd_reset_state: LEDs off, then typematic rate and delay
+        // at their fastest, unless the LEDs were refused.
+        let leds = leds_set || self.optional_keyboard(SET_LEDS, &[0])?;
+        if leds {
+            self.optional_keyboard(SET_RATE, &[0])?;
         }
         Ok(())
     }
@@ -960,9 +1141,11 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             Err(kind) => Err(kind),
         }
     }
-    /// Linux `atkbd_probe`'s GETID: whether the keyboard acknowledged it and
-    /// sent an ID. A keyboard ID's first byte is one `ps2_is_keyboard_id`
-    /// lists and a second byte follows it, which a keyboard may leave out.
+    /// Linux `atkbd_probe`'s GETID: whether it succeeded with a keyboard's
+    /// ID. GETID fails, for the Set LEDs check, when it is not acknowledged
+    /// or an ID byte does not come. A first byte that `ps2_is_keyboard_id`
+    /// does not list ends GETID with a device that is no keyboard, which
+    /// Linux's atkbd does not take.
     fn keyboard_id(&mut self) -> Result<bool, ErrorKind> {
         match self.device_command(Port::Keyboard, GET_ID, &[]) {
             Ok(()) => {}
@@ -975,13 +1158,21 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             Err(ErrorKind::Timeout(Phase::Response)) => return Ok(false),
             Err(kind) => return Err(kind),
         };
-        if matches!(first, 0xab | 0xac | 0x2b | 0x5d | 0x60 | 0x47) {
-            match self.response(Port::Keyboard, self.timer.start(), timeout) {
-                Ok(_) | Err(ErrorKind::Timeout(Phase::Response)) => {}
-                Err(kind) => return Err(kind),
-            }
+        if !matches!(first, 0xab | 0xac | 0x2b | 0x5d | 0x60 | 0x47) {
+            return Err(ErrorKind::DeviceReply {
+                port: Port::Keyboard,
+                received: first,
+            });
         }
-        Ok(true)
+        match self.response(Port::Keyboard, self.timer.start(), timeout) {
+            Ok(_) => Ok(true),
+            Err(ErrorKind::Timeout(Phase::Response)) => Ok(false),
+            Err(kind) => Err(kind),
+        }
+    }
+    /// How the last start found the keyboard.
+    pub fn keyboard_presence(&self) -> Option<KeyboardPresence> {
+        self.keyboard_presence
     }
     /// Keyboard commands the keyboard did not acknowledge at its start, which
     /// the start went on without, as Linux's atkbd goes on without them.
@@ -993,6 +1184,29 @@ impl<R: Registers, T: Timer> Controller<R, T> {
     /// resynchronize.
     pub fn framing_errors(&self) -> u64 {
         self.framing_errors
+    }
+    /// Bytes read from the data port since the controller was taken, by
+    /// the port its status named: keyboard, then mouse, dropped ones
+    /// included.
+    pub fn bytes_read(&self) -> [u64; 2] {
+        self.bytes_read
+    }
+    /// The last status register read, and the configuration byte the
+    /// controller last held as this driver read or wrote it; `None` before
+    /// either.
+    pub fn controller_state(&self) -> (Option<u8>, Option<u8>) {
+        (self.last_status, self.controller_config)
+    }
+    /// The configuration byte the firmware left, as the first start read it
+    /// once it had disabled both ports.
+    pub fn firmware_config(&self) -> Option<u8> {
+        self.firmware_config
+    }
+    /// Whether the keyboard's bytes arrive translated to set 1, as the
+    /// firmware left the controller; `None` before the first start read
+    /// its configuration.
+    pub fn translated(&self) -> Option<bool> {
+        self.firmware_config.map(|config| config & TRANSLATION != 0)
     }
     /// Set up the mouse's selected protocol, its reporting still disabled.
     fn set_up_mouse(&mut self) -> Result<(), ErrorKind> {
@@ -1147,7 +1361,7 @@ impl<R: Registers, T: Timer> Controller<R, T> {
             Some(value) => value,
             None => self.controller_response(READ_CONFIG)?,
         };
-        self.set_config((config & !(IRQ_BITS | TRANSLATION)) | KEYBOARD_DISABLED | MOUSE_DISABLED)
+        self.set_config((config & !IRQ_BITS) | KEYBOARD_DISABLED | MOUSE_DISABLED)
     }
     /// Contain a failure while running: a failure of one port's device
     /// disables that port alone while the other is configured; anything

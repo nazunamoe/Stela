@@ -2,7 +2,7 @@
 //! a Vec/Arc in the loader heap, this fixed wire representation survives engine
 //! relocation. Only immutable bytes in reserved LOADER_DATA pages cross it.
 use crate::Result;
-use crate::{firmware, handoff::Region, layout, output, paging::PAGE};
+use crate::{file_kind, firmware, handoff::Region, layout, output, paging::PAGE};
 use alloc::{format, string::ToString, sync::Arc};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 pub use stela_boot_core::host_resources::Resources;
@@ -87,20 +87,23 @@ pub unsafe fn after_ebs(resources: &Resources) -> Result<Option<Arc<Catalog>>> {
 /// a second case alias is refused even on firmware with a case-sensitive driver.
 fn open(root: &mut Directory, relative: &str) -> Result<Option<RegularFile>> {
     let path = CString16::try_from("\\").map_err(|_| refuse!("invalid firmware root"))?;
-    let mut directory = root
+    let directory = root
         .open(&path, FileMode::Read, FileAttribute::empty())
-        .map_err(|_| refuse!("cannot open host firmware root"))?
-        .into_directory()
-        .ok_or(refuse!("host firmware root is not a directory"))?;
+        .map_err(|error| refuse!("cannot open host firmware root", status = ?error.status()))?;
+    let mut directory = file_kind::directory(directory)
+        .map_err(|answers| refuse!("host firmware root is not a directory", %answers))?;
     let mut parts = relative.split('/').peekable();
     while let Some(part) = parts.next() {
         let mut found = None;
         let mut buffer = InfoBuffer([0; 1024]);
         let mut end = false;
         for index in 0..=MAX_DIRECTORY_ENTRIES {
-            let Some(info) = directory
-                .read_entry(&mut buffer.0)
-                .map_err(|_| refuse!("cannot enumerate bounded host firmware path"))?
+            let Some(info) = directory.read_entry(&mut buffer.0).map_err(|error| {
+                refuse!(
+                    "cannot enumerate bounded host firmware path",
+                    status = ?error.status()
+                )
+            })?
             else {
                 end = true;
                 break;
@@ -128,14 +131,12 @@ fn open(root: &mut Directory, relative: &str) -> Result<Option<RegularFile>> {
             .open(&name, FileMode::Read, FileAttribute::empty())
             .map_err(|_| refuse!("cannot open present host firmware path"))?;
         if parts.peek().is_none() {
-            return handle
-                .into_regular_file()
+            return file_kind::regular(handle)
                 .map(Some)
-                .ok_or(refuse!("host firmware file is a directory"));
+                .map_err(|answers| refuse!("host firmware file is a directory", %answers));
         }
-        directory = handle
-            .into_directory()
-            .ok_or(refuse!("host firmware parent is not a directory"))?;
+        directory = file_kind::directory(handle)
+            .map_err(|answers| refuse!("host firmware parent is not a directory", %answers))?;
     }
     Err(refuse!("empty host firmware path"))
 }

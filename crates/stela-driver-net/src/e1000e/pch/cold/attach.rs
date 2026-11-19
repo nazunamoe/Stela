@@ -223,6 +223,7 @@ type Timer = Rc<dyn crate::bus::pci::power::Timer>;
 pub struct Pch {
     link: Ethernet<PciIo<pci::EcamConfig>, Timer>,
     pub location: String,
+    device: u16,
 }
 
 impl Pch {
@@ -285,7 +286,11 @@ impl Pch {
         // SAFETY: memory decoding and bus mastering are on, and `dma` is the
         // caller's identity-mapped DMA memory.
         let link = unsafe { Ethernet::new(controller, dma) }?;
-        Ok(Self { link, location })
+        Ok(Self {
+            link,
+            location,
+            device,
+        })
     }
 
     /// Stop both queues and hand the PHY back, as `e1000e_down` does.
@@ -321,6 +326,10 @@ impl Link for Pch {
     }
     fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
         self.link.receive_reusing(frame)
+    }
+    fn diagnostic(&mut self) -> Option<String> {
+        let state = self.link.diagnostic()?;
+        Some(format!("device=8086:{:04x} {state}", self.device))
     }
 }
 

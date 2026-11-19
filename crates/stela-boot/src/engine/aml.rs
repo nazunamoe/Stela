@@ -164,6 +164,10 @@ struct Provider {
     /// AML may write PCI configuration through the native owner while it
     /// powers ports on before the census ([`HostAcpi::firmware`]).
     config_writes: Cell<bool>,
+    /// The FADT's `SMI_CMD` port, whose writes call the firmware's system
+    /// management code, and the writes made to it.
+    smi_command: Option<u16>,
+    smi_writes: Cell<stela_boot_core::smi::CommandWrites>,
 }
 
 impl Provider {
@@ -751,9 +755,26 @@ unsafe extern "C" fn write_port(context: *mut c_void, port: u64, value: u32, wid
         return AE_BAD_PARAMETER;
     }
     // SAFETY: ACPICA passes the session's provider.
-    if !unsafe { provider(context) }.permits_port(port, width) {
+    let provider = unsafe { provider(context) };
+    if !provider.permits_port(port, width) {
         return AE_SUPPORT;
     }
+    // A write to `SMI_CMD` enters the firmware's system management code,
+    // which no watchdog of Stela's can end: the screen names the method
+    // until it returns, and the log how long it took and where the other
+    // processors were.
+    let smi = (provider.smi_command == Some(port)).then(|| {
+        // SAFETY: inside ACPICA, on its only processor, between its calls.
+        let by = unsafe { stela_drivers::platform::acpi::running() }.map_or_else(
+            || alloc::string::String::from("ACPICA itself"),
+            |at| alloc::string::String::from(at.method.as_str()),
+        );
+        let detail = crate::status::detail();
+        crate::status::progress(&alloc::format!(
+            "{detail}: {by} calls the firmware's system management code"
+        ));
+        (by, detail, host::rdtsc())
+    });
     // SAFETY: as in `read_port`.
     unsafe {
         match width {
@@ -762,6 +783,22 @@ unsafe extern "C" fn write_port(context: *mut c_void, port: u64, value: u32, wid
             32 => out32(port, value),
             _ => unreachable!("port width was checked"),
         }
+    }
+    if let Some((by, detail, started)) = smi {
+        let micros = host::rdtsc().wrapping_sub(started) / (provider.tsc_hz / 1_000_000).max(1);
+        let mut writes = provider.smi_writes.get();
+        let line = writes.record(
+            port,
+            value,
+            &by,
+            micros,
+            crate::native_smp::executor::others(),
+        );
+        provider.smi_writes.set(writes);
+        if let Some(line) = line {
+            output::arguments(format_args!("{line}"));
+        }
+        crate::status::progress(&detail);
     }
     AE_OK
 }
@@ -1184,6 +1221,8 @@ impl HostAcpi {
             polling: Cell::new(false),
             needs_rearm: Cell::new(false),
             config_writes: Cell::new(false),
+            smi_command: pci.and_then(|pci| stela_boot_core::smi::command_port(pci.fadt())),
+            smi_writes: Cell::new(Default::default()),
         });
         let provider = Box::into_raw(provider);
         let services = Services {

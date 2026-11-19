@@ -348,6 +348,7 @@ pub(crate) mod tests {
         };
         let table = gpt::Table {
             disk_guid: gpt::Guid::from_entropy([7; 16]),
+            slots: Default::default(),
             partitions: alloc::vec![gpt::Partition {
                 type_guid: gpt::Guid::parse(type_guid).unwrap(),
                 unique_guid: unique,

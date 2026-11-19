@@ -107,6 +107,7 @@ fn an_existing_esp_is_kept_and_foreign_partitions_are_refused() {
     };
     let table = Table {
         disk_guid: Guid([7; 16]),
+        slots: Default::default(),
         partitions: vec![esp.clone()],
     };
     let planned = plan(DISK, Some(&table), request(), counter()).unwrap();
@@ -271,6 +272,7 @@ fn an_interrupted_rewrite_keeps_the_existing_esp_and_its_bytes() {
     };
     let old = Table {
         disk_guid: Guid([7; 16]),
+        slots: Default::default(),
         partitions: vec![esp.clone()],
     };
     let mut base = Sparse::new(DISK);
@@ -448,5 +450,69 @@ fn encoding_refuses_what_it_cannot_write_and_terminates_names() {
     assert_eq!(
         encode(DISK, &crowded),
         Err(PayloadError::Disk("too many partitions"))
+    );
+}
+
+fn data_partition(tag: u8, first: u64) -> Partition {
+    Partition {
+        type_guid: "0FC63DAF-8483-4772-8E79-3D69D8477DE4".parse().unwrap(),
+        unique_guid: Guid([tag; 16]),
+        first_lba: first,
+        last_lba: first + 2047,
+        attributes: 0,
+        name: "data".into(),
+    }
+}
+
+#[test]
+fn every_partition_stays_in_its_entry_across_a_rewrite() {
+    // Entries 0 and 2 used, 1 left empty, and not in disk order: as a disk
+    // that had a partition deleted, or one added in front of the others.
+    let (a, b) = (data_partition(1, 1 << 20), data_partition(2, 2048));
+    let table = Table {
+        disk_guid: Guid([7; 16]),
+        partitions: vec![a.clone(), b.clone()],
+        slots: vec![0, 2],
+    };
+    let mut read = read_back(DISK, &encode(DISK, &table).unwrap());
+    assert_eq!(read, table);
+    // A partition added takes the empty entry; one removed frees its own
+    // and moves no other.
+    let c = data_partition(3, 4096);
+    read.add(c.clone());
+    let read = read_back(DISK, &encode(DISK, &read).unwrap());
+    assert_eq!(read.partitions, [a.clone(), c.clone(), b.clone()]);
+    assert_eq!(read.slots, [0, 1, 2]);
+    let mut removed = read.clone();
+    assert_eq!(removed.remove(0), a);
+    let removed = read_back(DISK, &encode(DISK, &removed).unwrap());
+    assert_eq!(removed.partitions, [c, b]);
+    assert_eq!(removed.slots, [1, 2]);
+    // A table made in memory takes the entries in order.
+    let fresh = Table {
+        disk_guid: Guid([7; 16]),
+        partitions: vec![a.clone()],
+        slots: Vec::new(),
+    };
+    assert_eq!(read_back(DISK, &encode(DISK, &fresh).unwrap()).slots, [0]);
+}
+
+#[test]
+fn entries_the_table_cannot_hold_are_refused_not_moved() {
+    let a = data_partition(1, 2048);
+    let table = |slots: Vec<u32>| Table {
+        disk_guid: Guid([7; 16]),
+        partitions: vec![a.clone(); slots.len()],
+        slots,
+    };
+    assert_eq!(
+        encode(DISK, &table(vec![ENTRY_COUNT])),
+        Err(PayloadError::Disk(
+            "a partition is in an entry past the 128 this table holds"
+        ))
+    );
+    assert_eq!(
+        encode(DISK, &table(vec![3, 3])),
+        Err(PayloadError::Disk("two partitions in one entry"))
     );
 }

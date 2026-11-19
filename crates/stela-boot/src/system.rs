@@ -20,6 +20,7 @@ use crate::{
 use alloc::{format, string::String, vec::Vec};
 use core::{arch::asm, ops::Range, ptr::NonNull};
 use stela_boot_core::firmware_map::{self, RuntimeMapping};
+use stela_boot_core::firmware_runtime;
 use stela_boot_core::options::{DEFAULT_WIFI_KEY, System};
 use stela_contracts::refuse;
 use stela_engine::machine::mmu::placement::Placement;
@@ -440,9 +441,14 @@ struct Inputs {
 /// The firmware's runtime regions, and its `ResetSystem` service: zero when
 /// the system table has none.
 struct Runtime {
-    /// (start, end, mapping) of each runtime region.
-    regions: Vec<(u64, u64, RuntimeMapping)>,
+    /// (start, pages, type, attributes) of each runtime region.
+    descriptors: Vec<(u64, u64, u32, u64)>,
     reset: u64,
+    /// Each region and how the loader's root reaches it ([`Self::map`]),
+    /// for the boot log and the engine's fault lines.
+    regions: firmware_runtime::Regions,
+    /// The RAM the identity map holds, as [`Self::map`] was given it.
+    ram: Vec<(u64, u64)>,
 }
 
 impl Runtime {
@@ -451,13 +457,16 @@ impl Runtime {
     fn capture() -> Result<Self> {
         let map =
             boot::memory_map(MemoryType::LOADER_DATA).map_err(|_| refuse!("no memory map"))?;
-        let regions = map
+        let descriptors = map
             .entries()
             .filter(|entry| entry.att.bits() & firmware_map::MEMORY_RUNTIME != 0)
             .map(|entry| {
-                let start = entry.phys_start;
-                let mapping = firmware_map::runtime_mapping(entry.ty.0, entry.att.bits());
-                (start, start + entry.page_count * PAGE, mapping)
+                (
+                    entry.phys_start,
+                    entry.page_count,
+                    entry.ty.0,
+                    entry.att.bits(),
+                )
             })
             .collect();
         let reset = uefi::table::system_table_raw().map_or(0, |table| {
@@ -470,48 +479,94 @@ impl Runtime {
                 unsafe { (*runtime).reset_system as usize as u64 }
             }
         });
-        Ok(Self { regions, reset })
+        Ok(Self {
+            descriptors,
+            reset,
+            regions: firmware_runtime::Regions::default(),
+            ram: Vec::new(),
+        })
     }
 
     /// Runtime code, which the identity map makes writable and executable,
     /// as Linux maps it without a memory attributes table.
     fn code(&self) -> impl Iterator<Item = (u64, u64, u64)> + '_ {
-        self.regions
+        self.descriptors
             .iter()
-            .filter(|&&(_, _, mapping)| mapping == RuntimeMapping::Code)
-            .map(|&(start, end, _)| (start, end, PRESENT | WRITABLE))
+            .filter(|&&(_, _, kind, attributes)| {
+                firmware_map::runtime_mapping(kind, attributes) == RuntimeMapping::Code
+            })
+            .map(|&(start, pages, _, _)| (start, start + pages * PAGE, PRESENT | WRITABLE))
     }
 
-    /// Map the runtime regions outside RAM by identity: MMIO and regions
-    /// the firmware does not mark write-back capable uncached, the rest
-    /// write-back, code RWX and the rest RW+NX. A
-    /// region overlapping RAM, which the identity map holds, or the storage
-    /// registers, mapped already, is left as it is.
+    /// Map the runtime regions outside RAM by identity, page by page: MMIO
+    /// and regions the firmware does not mark write-back capable uncached,
+    /// the rest write-back, code RWX and the rest RW+NX. Pages in RAM,
+    /// which the identity map holds, and over the storage registers, mapped
+    /// already, are left as they are; a region only partly in RAM has its
+    /// other pages mapped. Each region is one line in the log.
     fn map(
-        &self,
+        &mut self,
         frames: &mut dyn Frames,
         root: u64,
         ram: &[(usize, usize)],
         devices: &[Range<u64>],
     ) -> Result<()> {
-        for &(start, end, mapping) in &self.regions {
-            let overlaps = ram.iter().any(|r| (r.0 as u64) < end && start < r.1 as u64)
-                || devices
-                    .iter()
-                    .any(|r| r.start & !(PAGE - 1) < end && start < r.end.next_multiple_of(PAGE));
-            if overlaps {
-                continue;
-            }
-            let attributes = match mapping {
+        let ram: Vec<(u64, u64)> = ram
+            .iter()
+            .map(|&(start, end)| (start as u64, end as u64))
+            .collect();
+        let devices: Vec<(u64, u64)> = devices
+            .iter()
+            .map(|range| (range.start, range.end))
+            .collect();
+        for &(start, pages, kind, attributes) in &self.descriptors {
+            let region = firmware_runtime::plan(start, pages, kind, attributes, &ram, &devices);
+            let attributes = match firmware_map::runtime_mapping(kind, attributes) {
                 RuntimeMapping::Uncached => NX | UNCACHED,
                 RuntimeMapping::Code => 0,
                 RuntimeMapping::WriteBack => NX,
             };
-            for page in (start..end).step_by(PAGE as usize) {
+            for page in firmware_runtime::pages_to_map(start, pages, &ram, &devices) {
                 tables::map_page(frames, root, page, page, PRESENT | WRITABLE | attributes)?;
             }
+            output::arguments(format_args!("{}", region.line()));
+            self.regions.push(region);
         }
+        if self.regions.dropped > 0 {
+            output::arguments(format_args!(
+                "FIRMWARE RUNTIME REGION {} more are mapped and not kept for a fault's line\n",
+                self.regions.dropped
+            ));
+        }
+        self.ram = ram;
         Ok(())
+    }
+
+    /// The runtime regions of the firmware's final map, `entries` (start,
+    /// pages, type, attributes), that the loader's root does not reach:
+    /// added at its exit, after the tables were built. Each is logged and
+    /// kept for the fault lines; whether there was one.
+    fn added_at_exit(&mut self, entries: impl Iterator<Item = (u64, u64, u32, u64)>) -> bool {
+        // Every region the map declared before the tables were built is
+        // mapped, also those past the ones kept for the fault lines.
+        let declared: Vec<(u64, u64)> = self
+            .descriptors
+            .iter()
+            .map(|&(start, pages, _, _)| (start, pages))
+            .collect();
+        let mut added = false;
+        for (start, pages, kind, attributes) in entries {
+            if attributes & firmware_map::MEMORY_RUNTIME == 0
+                || firmware_runtime::reached(start, pages, &declared, &self.ram)
+            {
+                continue;
+            }
+            let region = firmware_runtime::Region::at_exit(start, pages, kind, attributes);
+            output::arguments(format_args!("{}", region.line()));
+            self.regions.push(region);
+            added = true;
+        }
+        added
     }
 }
 
@@ -789,11 +844,11 @@ fn load(
         alloc::format!("the firmware's PCI and ACPI settings were not copied: {error}")
     });
 
-    let runtime = Runtime::capture()?;
+    let mut runtime = Runtime::capture()?;
     let storage = memory::map(
         &image,
         &mut memory,
-        &runtime,
+        &mut runtime,
         storage.as_ref(),
         native_mmio.as_mut().ok(),
         &host_firmware,
@@ -876,6 +931,7 @@ fn load(
     }
     // From here a boot that ends without a stop leaves no line of its own:
     // the firmware keeps that it got this far, for the next start to say.
+    crate::stop_record::before_exit();
     crate::stop_record::mark_running(log.as_ref().map(|guid| guid.0));
     crate::status::begin("Taking control of the other processors");
     // Named before the buffer's allocation, the last one: the firmware's
@@ -1001,6 +1057,24 @@ fn load(
              something else before the firmware exited"
         ));
     }
+    // A runtime region the firmware's map lists only at its exit is not in
+    // the loader's root, which was built before it: its services may use
+    // it, so none is called after the exit (Linux would fault there and
+    // turn them off: `efi_crash_gracefully_on_page_fault`).
+    if runtime.added_at_exit(exit.map().entries().map(|entry| {
+        (
+            entry.phys_start,
+            entry.page_count,
+            entry.ty.0,
+            entry.att.bits(),
+        )
+    })) {
+        crate::stop_record::refuse_after_exit();
+        output::arguments(format_args!(
+            "FIRMWARE VARIABLE SERVICE not called after the exit in this boot: the firmware's \
+             map at its exit lists runtime regions Stela's tables do not map, named above\n"
+        ));
+    }
     // The lines since the firmware's log closed, which no log stored, for
     // the engine's record: the USB's log takes them when it resumes.
     let loader_lines = {
@@ -1073,6 +1147,7 @@ fn load(
             device_skips,
             device_needs,
             stop_record: crate::stop_record::services(),
+            runtime_regions: runtime.regions,
             serial_present: crate::serial::present(),
         });
     }

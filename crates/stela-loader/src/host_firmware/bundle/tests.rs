@@ -609,6 +609,51 @@ fn a_visible_gpu_or_no_empty_port_reads_no_late_files() {
 }
 
 #[test]
+fn the_nvidia_notice_claims_no_more_than_the_census_shows() {
+    let below = |bus: u8| Pci {
+        bus,
+        ..pci(0x8086, 0x2725, 0x02)
+    };
+    let intel = pci(0x8086, 0x46a6, 0x03);
+    let pascal = pci(0x10de, 0x1b80, 0x03);
+    // A supported NVIDIA GPU answers: nothing to say, empty ports or not.
+    assert_eq!(
+        nvidia_notice(&[pci(0x10de, 0x2c02, 0x03), port(2)]),
+        NvidiaNotice::Driven
+    );
+    assert_eq!(
+        nvidia_notice(&[pascal, pci(0x10de, 0x2c02, 0x03)]),
+        NvidiaNotice::Driven
+    );
+    // Every port has something below it: what the census shows is final.
+    assert_eq!(
+        nvidia_notice(&[intel, port(2), below(2)]),
+        NvidiaNotice::Absent
+    );
+    assert_eq!(nvidia_notice(&[]), NvidiaNotice::Absent);
+    assert_eq!(
+        nvidia_notice(&[pascal, port(2), below(2)]),
+        NvidiaNotice::NotDriven
+    );
+    // A hybrid laptop whose GPU is in D3cold: its port shows nothing below
+    // it, and only the engine's power-on can tell.
+    assert_eq!(nvidia_notice(&[intel, port(1)]), NvidiaNotice::NotYet);
+    // A second, supported GPU may still answer behind an empty port.
+    assert_eq!(nvidia_notice(&[pascal, port(2)]), NvidiaNotice::NotYet);
+    // A port without a bus number of its own forwards nothing yet.
+    let unnumbered = Pci {
+        bridge: Some((0, 0)),
+        ..port(0)
+    };
+    assert_eq!(nvidia_notice(&[intel, unnumbered]), NvidiaNotice::Absent);
+    // A function of another class or vendor is no NVIDIA display controller.
+    assert_eq!(
+        nvidia_notice(&[pci(0x10de, 0x2c02, 0x04), pci(0x1002, 0x7550, 0x03)]),
+        NvidiaNotice::Absent
+    );
+}
+
+#[test]
 fn late_files_are_read_whole_by_family_within_the_handoffs_room() {
     let functions = [pci(0x8086, 0x46a6, 0x03), port(1)];
     let usb = select(&[]);

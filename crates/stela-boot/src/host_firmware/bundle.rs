@@ -12,6 +12,7 @@
 use super::{open, read_file};
 use crate::{firmware, handoff::Region, output, paging::PAGE, pci_io};
 use alloc::{format, string::String, vec::Vec};
+use stela_boot_core::host_resources::first_bundle;
 use stela_loader::host_firmware::{
     MAX_IMAGE_BYTES, MAX_MANIFEST_BYTES,
     bundle::{self, Bundle, Held, Object, Pci, Room},
@@ -41,37 +42,42 @@ impl Bundled {
 }
 
 /// The bundle on the boot volume `root`, else on the first other volume
-/// that has one, its files within `room`.
+/// that has one, its files within `room`. A volume whose bundle cannot be
+/// read is named and passed over: the USB's data volume, which holds the
+/// bundle, may come after another volume whose file system Stela cannot
+/// walk.
 pub fn read(root: &mut Directory, room: Room) -> Option<Bundled> {
-    if let Some(found) = load(root, "boot volume", room) {
-        return report(found);
+    let boot = core::iter::once_with(|| {
+        let place = String::from("boot volume");
+        let found = load(root, &place, room);
+        (place, found)
+    });
+    let others = boot::find_handles::<SimpleFileSystem>()
+        .ok()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(index, handle)| {
+            // The boot volume itself is held already and refuses this open.
+            let mut volume = boot::open_protocol_exclusive::<SimpleFileSystem>(handle).ok()?;
+            let mut root = volume.open_volume().ok()?;
+            let place = format!("volume {index}");
+            let found = load(&mut root, &place, room);
+            Some((place, found))
+        });
+    let (found, unreadable) = first_bundle(boot.chain(others), |place, why| {
+        output::arguments(format_args!(
+            "HOST FIRMWARE BUNDLE unreadable on {place}, the search goes on: {why}\n"
+        ));
+    });
+    if found.is_none() && unreadable > 0 {
+        output::arguments(format_args!(
+            "HOST FIRMWARE BUNDLE unreadable, the boot goes on without it: no volume holds a \
+             readable one, and {unreadable} could not be searched or held one Stela cannot \
+             read, as named above\n"
+        ));
     }
-    let handles = boot::find_handles::<SimpleFileSystem>().ok()?;
-    for (index, handle) in handles.into_iter().enumerate() {
-        // The boot volume itself is held already and refuses this open.
-        let Ok(mut volume) = boot::open_protocol_exclusive::<SimpleFileSystem>(handle) else {
-            continue;
-        };
-        let Ok(mut root) = volume.open_volume() else {
-            continue;
-        };
-        if let Some(found) = load(&mut root, &format!("volume {index}"), room) {
-            return report(found);
-        }
-    }
-    None
-}
-
-fn report(found: Result<Bundled, String>) -> Option<Bundled> {
-    match found {
-        Ok(bundled) => Some(bundled),
-        Err(why) => {
-            output::arguments(format_args!(
-                "HOST FIRMWARE BUNDLE unreadable, the boot goes on without it: {why}\n"
-            ));
-            None
-        }
-    }
+    found
 }
 
 /// The PCI functions the firmware's drivers found, `None` without its

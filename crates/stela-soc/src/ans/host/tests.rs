@@ -49,9 +49,21 @@ fn batches_take_the_first_runs_a_batch_at_a_time() {
         discards.add(start, start + 2);
     }
     let lbas = |extents: Vec<Extent>| extents.iter().map(|e| e.lba).collect::<Vec<_>>();
-    assert_eq!(lbas(discards.batch(2)), [0, 10]);
-    assert_eq!(lbas(discards.batch(2)), [20]);
-    assert!(discards.batch(2).is_empty());
+    assert_eq!(lbas(discards.batch(2, 0, u64::MAX, &[])), [0, 10]);
+    assert_eq!(lbas(discards.batch(2, 0, u64::MAX, &[])), [20]);
+    assert!(discards.batch(2, 0, u64::MAX, &[]).is_empty());
+}
+
+#[test]
+fn a_run_a_running_write_overlaps_waits_for_it() {
+    let mut discards = Discards::default();
+    for start in [0, 10, 20] {
+        discards.add(start, start + 2);
+    }
+    let lbas = |extents: Vec<Extent>| extents.iter().map(|e| e.lba).collect::<Vec<_>>();
+    assert_eq!(lbas(discards.batch(8, 0, u64::MAX, &[(11, 12)])), [0, 20]);
+    assert_eq!(runs(&discards), [(10, 12)]);
+    assert_eq!(lbas(discards.batch(8, 0, u64::MAX, &[])), [10]);
 }
 
 /// What the test sees of a queued disk: the commands started, whose tags
@@ -239,6 +251,30 @@ fn discards_wait_for_a_pause_in_guest_transfers() {
         log.started().last(),
         Some(Command::Discard { .. })
     ));
+}
+
+/// A write still on the disk, then a deallocation of its block and a flush:
+/// the discard goes only once the write completed, so the block ends
+/// deallocated, where the discard could pass the write and leave its bytes.
+#[test]
+fn an_urgent_discard_waits_for_a_running_write_to_its_blocks() {
+    let (mut disk, log) = queued(256, true);
+    assert!(disk.submit(1, write(2), 0).is_none());
+    disk.discard(0, 8);
+    assert!(disk.submit(2, Request::Flush, 10).is_none());
+    assert!(disk.poll(10).is_empty());
+    assert_eq!(log.started().len(), 1, "no discard beside the write");
+    release(&log, 0);
+    assert_eq!(disk.poll(20).len(), 1);
+    assert_eq!(
+        log.started().last(),
+        Some(&Command::Discard {
+            extents: vec![Extent { lba: 0, blocks: 8 }],
+        })
+    );
+    release(&log, 1);
+    assert!(disk.poll(30).is_empty());
+    assert_eq!(log.started().last(), Some(&Command::Flush));
 }
 
 #[test]
@@ -491,4 +527,277 @@ fn a_write_waits_only_for_the_urgent_batch_it_overlaps() {
         after.as_slice(),
         [Command::Flush, Command::Write { lba: 5, .. }]
     ));
+}
+
+/// A batch takes at most its range limit a range and its budget in all; a
+/// run cut short keeps its rest waiting for the next.
+#[test]
+fn a_batch_cuts_runs_at_the_range_limit_and_the_budget() {
+    let mut discards = Discards::default();
+    discards.add(0, 100);
+    discards.add(200, 210);
+    let batch = discards.batch(4, 30, 70, &[]);
+    assert_eq!(
+        batch,
+        [
+            Extent { lba: 0, blocks: 30 },
+            Extent {
+                lba: 30,
+                blocks: 30
+            },
+            Extent {
+                lba: 60,
+                blocks: 10
+            },
+        ]
+    );
+    assert_eq!(runs(&discards), [(70, 100), (200, 210)]);
+}
+
+/// Blocks the disk heard of are not sent again until a write takes them
+/// back: an APFS format and its mounts deallocate the whole container more
+/// than once.
+#[test]
+fn blocks_the_disk_heard_of_are_not_sent_again_until_written() {
+    let mut discards = Discards::default();
+    discards.add(0, 100);
+    assert_eq!(discards.batch(1, 0, u64::MAX, &[]).len(), 1);
+    discards.add(0, 120);
+    assert_eq!(runs(&discards), [(100, 120)]);
+    assert!(!discards.written(40, 50));
+    discards.add(0, 120);
+    assert_eq!(runs(&discards), [(40, 50), (100, 120)]);
+}
+
+/// A disk with a slot per command, which has room while fewer than `depth`
+/// commands run: what an AHCI port with NCQ reports.
+struct Slots {
+    disk: RamDisk,
+    log: Log,
+    depth: usize,
+}
+
+impl Slots {
+    fn running(&self) -> usize {
+        let log = self.log.0.borrow();
+        log.0.len().saturating_sub(log.1.len())
+    }
+}
+
+impl BlockDevice for Slots {
+    fn identity(&self) -> &Identity {
+        self.disk.identity()
+    }
+
+    fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.disk.read(lba, buffer)
+    }
+
+    fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
+        self.disk.write(lba, data)
+    }
+
+    fn depth(&self) -> usize {
+        self.depth
+    }
+
+    fn room(&self) -> bool {
+        self.running() < self.depth
+    }
+
+    fn start(&mut self, command: Command) -> Result<u32, BlockError> {
+        let mut log = self.log.0.borrow_mut();
+        log.0.push(command);
+        Ok(log.0.len() as u32 - 1)
+    }
+
+    fn finish(&mut self, tag: u32) -> Option<Finished> {
+        self.log.0.borrow().1.contains(&tag).then_some(Ok(None))
+    }
+}
+
+/// A 1 TB SATA disk taking TRIMs of up to 64 ranges of 65535 sectors, 32
+/// commands at once.
+fn sata() -> (HostDisk, Log) {
+    let mut disk = RamDisk::new("", 8, 512);
+    disk.identity.blocks = 1_953_525_168;
+    disk.identity.features.discard = Some(DiscardLimits::single(64 * 0xffff));
+    disk.identity.features.write_cache = true;
+    let log = Log::default();
+    let device = Slots {
+        disk,
+        log: log.clone(),
+        depth: 32,
+    };
+    (HostDisk::new(Box::new(device)), log)
+}
+
+fn discard_bytes(command: &Command) -> u64 {
+    match command {
+        Command::Discard { extents } => extents.iter().map(|extent| extent.blocks * 512).sum(),
+        _ => 0,
+    }
+}
+
+/// #207: the guest deallocates the whole disk. The disk hears of it one
+/// bounded command at a time, never a queue of them, so a read that comes
+/// meanwhile starts at once, where 477 TRIMs of 2 GiB filled every slot and
+/// a read waited 44 s for one.
+#[test]
+fn a_whole_disk_deallocation_never_fills_the_disk_ahead_of_a_read() {
+    let (mut disk, log) = sata();
+    disk.discard(0, 1_953_525_168);
+    assert!(disk.poll(0).is_empty());
+    let started = log.started();
+    assert_eq!(started.len(), 1, "one command at a time");
+    assert_eq!(discard_bytes(&started[0]), DISCARD_FIRST);
+    let read = Request::Read { lba: 4, bytes: 512 };
+    assert!(disk.submit(1, read, 10).is_none());
+    assert!(matches!(
+        log.started().last(),
+        Some(Command::Read { lba: 4, .. })
+    ));
+    // The TRIM completes; nothing more starts while the read runs.
+    release(&log, 0);
+    assert!(disk.poll(20).is_empty());
+    assert_eq!(log.started().len(), 2);
+    release(&log, 1);
+    assert_eq!(disk.poll(30).len(), 1);
+    assert_eq!(log.started().len(), 2);
+}
+
+/// Each command measured alone sizes the next to take about
+/// [`DISCARD_TARGET`]: a slow one shrinks it, a quick one doubles it at
+/// most.
+#[test]
+fn the_next_discard_command_is_sized_by_the_last_ones_time() {
+    let (mut disk, log) = sata();
+    disk.discard(0, 1_953_525_168);
+    assert!(disk.poll(0).is_empty());
+    // 64 MiB in 80 ms: the next covers 16 MiB.
+    release(&log, 0);
+    assert!(disk.poll(4 * DISCARD_TARGET).is_empty());
+    assert_eq!(discard_bytes(&log.started()[1]), DISCARD_FIRST / 4);
+    // 16 MiB in 1 ms: the next doubles, no more.
+    release(&log, 1);
+    assert!(disk.poll(4 * DISCARD_TARGET + 24_000).is_empty());
+    assert_eq!(discard_bytes(&log.started()[2]), DISCARD_FIRST / 2);
+    assert!(
+        disk.diagnostic(0)
+            .contains("last=16384KiB/1000us shed=none")
+    );
+}
+
+/// A disk slow at discards however small hears no more: the waiting ones
+/// are given up, later ones dropped, and the ANS line names the command.
+#[test]
+fn a_disk_slow_at_discards_hears_no_more() {
+    let (mut disk, log) = sata();
+    disk.discard(0, 1_953_525_168);
+    let mut now = 0;
+    assert!(disk.poll(now).is_empty());
+    for tag in 0..DISCARD_STRIKES {
+        now += 2 * DISCARD_SLOW;
+        release(&log, tag);
+        assert!(disk.poll(now).is_empty());
+    }
+    assert_eq!(log.started().len(), DISCARD_STRIKES as usize);
+    assert!(!disk.discarding());
+    disk.discard(0, 8);
+    assert!(!disk.discarding());
+    let line = disk.diagnostic(now);
+    assert!(line.contains("shed=1024KiB/400000us"), "{line}");
+    assert!(line.contains("abandoned=1"), "{line}");
+}
+
+/// A flush that waits for discards on a disk slow at them waits
+/// [`DISCARD_HOLD`] at most: then it goes, and the discards not yet sent go
+/// on in the background, as the guest was told its deallocated blocks stay
+/// zeros past a restart, where they were given up and the blocks kept
+/// their old bytes on the disk.
+#[test]
+fn a_flush_waits_for_discards_a_bounded_time_and_gives_none_up() {
+    let (mut disk, log) = queued(1, true);
+    for run in 0..(DISCARD_COMMANDS as u64 * 2) {
+        disk.discard(run * 2, 1);
+    }
+    assert!(disk.submit(1, Request::Flush, 0).is_none());
+    assert!(disk.poll(0).is_empty());
+    assert_eq!(discard_tags(&log).len(), DISCARD_COMMANDS);
+    assert!(disk.poll(DISCARD_HOLD - 1).is_empty());
+    assert!(!log.started().contains(&Command::Flush));
+    assert!(disk.poll(DISCARD_HOLD).is_empty());
+    assert_eq!(
+        log.started().last(),
+        Some(&Command::Flush),
+        "the flush went"
+    );
+    let flush = log.started().len() as u32 - 1;
+    for tag in discard_tags(&log) {
+        release(&log, tag);
+    }
+    release(&log, flush);
+    assert_eq!(disk.poll(DISCARD_HOLD + 1).len(), 1);
+    let mut now = DISCARD_HOLD + 1;
+    while disk.discarding() {
+        now += DISCARD_QUIET;
+        assert!(disk.poll(now).is_empty());
+        for tag in discard_tags(&log) {
+            release(&log, tag);
+        }
+        assert!(log.started().len() < 4 * DISCARD_COMMANDS, "bounded");
+    }
+    assert_eq!(discard_tags(&log).len(), 2 * DISCARD_COMMANDS);
+    assert!(disk.diagnostic(now).contains("abandoned=0"));
+    // With none left, a flush waits for the next discards again.
+    disk.discard(100, 1);
+    assert!(disk.submit(2, Request::Flush, now).is_none());
+    assert_eq!(disk.discards.held.len(), 1);
+}
+
+/// A disk whose deallocated blocks the guest was told stay zeros hears
+/// every discard however slow it is at them, where the third slow command
+/// gave up the rest and dropped every later one.
+#[test]
+fn a_disk_that_keeps_deallocated_blocks_zeros_hears_every_discard() {
+    let (mut disk, log) = queued(1, true);
+    for run in 0..8 {
+        disk.discard(run * 2, 1);
+    }
+    let mut now = 0;
+    assert!(disk.poll(now).is_empty());
+    for _ in 0..=DISCARD_STRIKES {
+        let tag = *discard_tags(&log).last().unwrap();
+        now += 2 * DISCARD_SLOW;
+        release(&log, tag);
+        assert!(disk.poll(now).is_empty());
+    }
+    assert_eq!(discard_tags(&log).len(), DISCARD_STRIKES as usize + 2);
+    disk.discard(40, 1);
+    assert!(disk.discarding());
+    let line = disk.diagnostic(now);
+    assert!(
+        line.contains("abandoned=0") && line.contains("shed=none"),
+        "{line}"
+    );
+}
+
+/// Discards a flush waits for go in commands of at least 1 GiB, several
+/// together, and none of them sizes the background's next command.
+#[test]
+fn urgent_discards_go_in_large_commands_that_measure_nothing() {
+    let (mut disk, log) = sata();
+    disk.hurry_discards(true);
+    disk.discard(0, 1_953_525_168);
+    assert!(disk.poll(0).is_empty());
+    let started = log.started();
+    assert_eq!(started.len(), DISCARD_COMMANDS);
+    assert!(
+        started
+            .iter()
+            .all(|command| discard_bytes(command) == DISCARD_URGENT)
+    );
+    release(&log, 0);
+    assert!(disk.poll(100 * DISCARD_TARGET).is_empty());
+    assert!(disk.diagnostic(0).contains("piece=65536KiB last=none"));
 }

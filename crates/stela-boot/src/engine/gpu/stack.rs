@@ -5,6 +5,7 @@ use super::PAGE;
 use crate::{native_memory::SOURCE, native_mmio::Window};
 use core::{arch::naked_asm, ffi::c_void, mem::ManuallyDrop};
 use stela_boot_core::page_window::Cache;
+use stela_boot_core::stack_guards::{GuardHit, StackGuards};
 use stela_drivers::bus::dma::memory::{CacheAttribute, PageSource, PinnedPages};
 
 pub(super) struct Stack {
@@ -16,6 +17,16 @@ pub(super) struct Stack {
 
 /// The absent pages beneath and above a stack.
 const GUARD_PAGES: usize = 2;
+
+/// The live stacks, for the #PF handler: their guard pages lie in the window
+/// among clients' mappings, and a fault there is this code's, not a client's.
+/// The service's three stacks for each GPU and Mesa's threads fit.
+static GUARDS: StackGuards<64> = StackGuards::new();
+
+/// The stack `address` is a guard page of, if any.
+pub(in crate::engine) fn guard_hit(address: u64) -> Option<GuardHit> {
+    GUARDS.hit(address)
+}
 
 impl Stack {
     pub(super) fn map(window: &'static Window, bytes: usize) -> Option<Self> {
@@ -34,6 +45,7 @@ impl Stack {
                 return None;
             }
         }
+        GUARDS.add(stack.bottom()..stack.top());
         Some(stack)
     }
 
@@ -53,6 +65,7 @@ impl Stack {
 impl Drop for Stack {
     fn drop(&mut self) {
         let pages = self.pages() as usize + GUARD_PAGES;
+        GUARDS.remove(self.bottom());
         super::unmapped(super::Unmapped::Stacks);
         // A processor that kept the translation keeps the memory too.
         if self.window.remove(self.guard, pages) {

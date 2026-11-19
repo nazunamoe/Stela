@@ -9,11 +9,11 @@ Subject: [PATCH] radv: lower the point coordinate to its input in a shader
  1 file changed, 8 insertions(+)
 
 diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
-index 312b7c0..e9865d5 100644
+index 7a9109383e39c4e42ab686491a9d6f0b5a26f905..e6e89e4778e454d59bbf8b6b19715be1314c0616 100644
 --- a/src/amd/vulkan/radv_shader.c
 +++ b/src/amd/vulkan/radv_shader.c
-@@ -488,6 +488,14 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct
-       nir = nir_shader_clone(NULL, stage->internal_nir);
+@@ -491,6 +491,14 @@ radv_shader_spirv_to_nir(const struct radv_compiler_info *compiler_info, struct
+       nir->options = &compiler_info->nir_options[nir->info.stage];
        nir_validate_shader(nir, "in internal shader");
  
 +      /* A shader built as NIR reads the point coordinate as a system value,
@@ -27,6 +27,3 @@ index 312b7c0..e9865d5 100644
        assert(exec_list_length(&nir->functions) == 1);
        radv_shader_choose_subgroup_size(compiler_info, nir, &stage->key, 0);
     } else {
--- 
-2.56.1
-

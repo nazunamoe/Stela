@@ -92,6 +92,10 @@ pub struct SystemIdentity<'a> {
     pub board_vendor: Observation<'a>,
     /// That baseboard's product, Linux's DMI_BOARD_NAME.
     pub board_name: Observation<'a>,
+    /// The first type-3 enclosure's chassis type, bit 7 (chassis lock)
+    /// cleared, as Linux's `dmi_save_type` saves DMI_CHASSIS_TYPE. `None`
+    /// without one, or when the structure is too short to hold it.
+    pub chassis_type: Option<u8>,
 }
 impl Default for SystemIdentity<'_> {
     fn default() -> Self {
@@ -101,6 +105,7 @@ impl Default for SystemIdentity<'_> {
             product_version: Observation::NotObserved,
             board_vendor: Observation::NotObserved,
             board_name: Observation::NotObserved,
+            chassis_type: None,
         }
     }
 }
@@ -234,6 +239,7 @@ pub fn identity(entry: Entry, table: &[u8]) -> Result<SystemIdentity<'_>, Error>
     let mut count = 0usize;
     let mut found = None;
     let mut board = None;
+    let mut chassis_type = None;
     let mut ended = false;
     let mut handles = [0u8; 8192];
     while at < table.len() {
@@ -284,6 +290,7 @@ pub fn identity(entry: Entry, table: &[u8]) -> Result<SystemIdentity<'_>, Error>
                 product_version: field(table[at + 6], strings)?,
                 board_vendor: Observation::NotObserved,
                 board_name: Observation::NotObserved,
+                chassis_type: None,
             });
         }
         if head[0] == 2 && board.is_none() {
@@ -297,6 +304,11 @@ pub fn identity(entry: Entry, table: &[u8]) -> Result<SystemIdentity<'_>, Error>
                 }
             };
             board = Some((saved(4)?, saved(5)?));
+        }
+        // dmi_save_type: the first enclosure's type byte, when it is
+        // within the structure.
+        if head[0] == 3 && chassis_type.is_none() && length > 5 {
+            chassis_type = Some(table[at + 5] & 0x7f);
         }
         at = next;
         if head[0] == 127 {
@@ -320,6 +332,7 @@ pub fn identity(entry: Entry, table: &[u8]) -> Result<SystemIdentity<'_>, Error>
             SystemIdentity {
                 board_vendor,
                 board_name,
+                chassis_type,
                 ..identity
             }
         })
@@ -485,6 +498,7 @@ mod tests {
                     product_version: Observation::Absent,
                     board_vendor: Observation::NotObserved,
                     board_name: Observation::NotObserved,
+                    chassis_type: None,
                 }
             );
             assert_eq!(
@@ -515,6 +529,22 @@ mod tests {
         let short = identity(entry, &short).unwrap();
         assert_eq!(short.board_vendor, Observation::NotObserved);
         assert_eq!(short.board_name, Observation::NotObserved);
+    }
+    #[test]
+    fn the_first_enclosure_long_enough_gives_the_chassis_type_without_its_lock_bit() {
+        let (raw, table) = fixture(Format::Smbios3);
+        let end = table.len() - 6;
+        let mut entry = entry(&raw, Format::Smbios3).unwrap();
+        assert_eq!(identity(entry, &table).unwrap().chassis_type, None);
+        let mut enclosures = table[..end].to_vec();
+        // Too short to hold the type, then a locked notebook, then a desktop.
+        enclosures.extend_from_slice(&[3, 5, 4, 0, 0, 0, 0]);
+        enclosures.extend_from_slice(&[3, 9, 5, 0, 0, 0x8a, 0, 0, 0, 0, 0]);
+        enclosures.extend_from_slice(&[3, 9, 6, 0, 0, 3, 0, 0, 0, 0, 0]);
+        enclosures.extend_from_slice(&table[end..]);
+        entry.table_bytes = enclosures.len();
+        let found = identity(entry, &enclosures).unwrap();
+        assert_eq!(found.chassis_type, Some(10));
     }
     #[test]
     fn checked_entry_lengths_checksums_versions_and_native_bounds_refuse() {

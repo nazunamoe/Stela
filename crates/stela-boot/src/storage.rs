@@ -14,6 +14,7 @@ mod minimum;
 use crate::Result;
 use stela_boot_core::storage as options;
 use stela_contracts::refuse;
+use stela_loader::host_firmware::bundle::{NvidiaNotice, Pci, empty_ports, nvidia_notice};
 #[cfg(feature = "diagnostics")]
 mod reset_check;
 pub use options::split;
@@ -282,6 +283,16 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
         .filter(|identity| identity.vendor == NVIDIA && identity.class[0] == 0x03)
         .map(|identity| identity.device)
         .collect();
+    let census: Vec<Pci> = functions
+        .iter()
+        .filter_map(|function| {
+            Pci::from_header(
+                function.address.segment,
+                function.address.bus,
+                &function.header,
+            )
+        })
+        .collect();
     // An image that links another vendor's Vulkan driver drives that
     // vendor's display controllers itself: one of them is the GPU macOS
     // starts with, so the NVIDIA-only notice does not apply.
@@ -296,31 +307,42 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
                 .find(|stack| stack.vendor == vendor && stack.draws())
         });
     let notice = if driven.is_some() {
-        0
+        NvidiaNotice::Driven
     } else {
-        gpu_notice(&nvidia)
+        nvidia_notice(&census)
     };
     if let Some(stack) = driven {
         output::arguments(format_args!(
             "HOST GPU: a {:?} display controller, which this image drives with {}\n",
             stack.vendor, stack.kernel.driver
         ));
-    } else if nvidia.is_empty() {
-        output::arguments(format_args!(
-            "UNSUPPORTED host GPU: no NVIDIA display controller among {} PCI functions\n",
-            functions.len()
-        ));
-    } else if notice != 0 {
-        output::arguments(format_args!(
-            "UNSUPPORTED host GPU: no NVIDIA display controller here is of a chip Stela drives: {nvidia:04x?}\n"
-        ));
+    } else {
+        match notice {
+            NvidiaNotice::Driven => {}
+            NvidiaNotice::Absent => output::arguments(format_args!(
+                "UNSUPPORTED host GPU: no NVIDIA display controller among {} PCI functions\n",
+                functions.len()
+            )),
+            NvidiaNotice::NotDriven => output::arguments(format_args!(
+                "UNSUPPORTED host GPU: no NVIDIA display controller here is of a chip Stela drives: {nvidia:04x?}\n"
+            )),
+            NvidiaNotice::NotYet => output::arguments(format_args!(
+                "HOST GPU: no NVIDIA display controller of a chip Stela drives among {} PCI \
+                 functions yet (NVIDIA devices {nvidia:04x?}); {} PCI ports show nothing below \
+                 them, and each whose power ACPI reports off is powered on after the firmware's \
+                 exit\n",
+                functions.len(),
+                empty_ports(&census).count()
+            )),
+        }
     }
-    GPU_NOTICE.store(notice, core::sync::atomic::Ordering::Relaxed);
+    GPU_NOTICE.store(notice as u8, core::sync::atomic::Ordering::Relaxed);
 }
 
 const NVIDIA: u16 = 0x10de;
-/// Which notice the census chose: 0 none, 1 no NVIDIA card, 2 none Stela drives.
-static GPU_NOTICE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// The [`NvidiaNotice`] the census chose, as its discriminant.
+static GPU_NOTICE: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(NvidiaNotice::Driven as u8);
 
 /// Said once before an install or a start on a PC with no NVIDIA graphics
 /// card: the install itself draws through no GPU and would finish, and the
@@ -334,28 +356,25 @@ pub const NO_DRIVEN_NVIDIA_GPU_NOTICE: &str = "The NVIDIA graphics card here is 
     drives: macOS can be installed, but it starts only with a GeForce GTX 16 or RTX 20, 30, 40 \
     or 50 series card.";
 
-/// The notice ([`GPU_NOTICE`]) for a PC whose NVIDIA display controllers have
-/// these PCI device IDs: none when one of them is of a chip Stela's catalog
-/// names.
-fn gpu_notice(nvidia: &[u16]) -> u8 {
-    use stela_loader::host_firmware::recipes::nvidia_chip;
-    if nvidia.is_empty() {
-        1
-    } else if nvidia.iter().all(|device| nvidia_chip(*device).is_none()) {
-        2
-    } else {
-        0
-    }
-}
+/// Said in the same place when no NVIDIA card Stela drives answers yet but
+/// a PCI port shows nothing below it: a card the firmware left powered off
+/// there, as on some laptops, answers only after Stela powers the port on.
+pub const NO_NVIDIA_GPU_YET_NOTICE: &str = "No NVIDIA graphics card Stela drives found yet: \
+    a card the PC keeps powered off, as some laptops do, is found only after Stela has started. \
+    macOS can be installed, but it starts only with a GeForce GTX 16 or RTX 20, 30, 40 or 50 \
+    series card.";
 
 /// What to say before an install or a start when the census ([`discover`])
 /// found no NVIDIA display controller Stela drives.
 pub fn gpu_notice_found() -> Option<&'static str> {
-    match GPU_NOTICE.load(core::sync::atomic::Ordering::Relaxed) {
-        0 => None,
-        1 => Some(NO_NVIDIA_GPU_NOTICE),
-        _ => Some(NO_DRIVEN_NVIDIA_GPU_NOTICE),
-    }
+    let notice = GPU_NOTICE.load(core::sync::atomic::Ordering::Relaxed);
+    [
+        (NvidiaNotice::Absent, NO_NVIDIA_GPU_NOTICE),
+        (NvidiaNotice::NotDriven, NO_DRIVEN_NVIDIA_GPU_NOTICE),
+        (NvidiaNotice::NotYet, NO_NVIDIA_GPU_YET_NOTICE),
+    ]
+    .into_iter()
+    .find_map(|(chosen, text)| (chosen as u8 == notice).then_some(text))
 }
 
 /// What the storage drivers need after ExitBootServices: the ECAM windows,

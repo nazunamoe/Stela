@@ -68,6 +68,7 @@ fn image(tag: u8) -> Result<Vec<u8>> {
     };
     let table = gpt::Table {
         disk_guid: guid(tag, 0),
+        slots: Default::default(),
         partitions,
     };
     for write in gpt::encode(disk, &table).map_err(|error| anyhow::anyhow!("{error}"))? {

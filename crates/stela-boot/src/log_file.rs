@@ -15,7 +15,7 @@ use stela_contracts::refuse;
 use stela_drivers::block::{BlockDevice, BlockError, Features, Identity, Shared, Transport};
 use stela_loader::mount_interface::BOOT_LOG_FILE;
 use stela_runtime::pc::{
-    boot_log::{self, LOG_BYTES, Writer},
+    boot_log::{self, Writer, file_region},
     device_starts::{self, Skips},
     fat32::Fat32,
     gpt::Guid,
@@ -55,7 +55,7 @@ pub fn open() -> Option<Guid> {
             .unwrap_or_default();
             crate::stop_record::keep_last_run(running, newest);
         }
-        let writer = Writer::open(&mut *device)
+        let writer = Writer::open_noted(&mut *device, &boot_note())
             .map_err(|error| refuse!("firmware boot log: {error}", %error))?;
         report(&writer, "firmware");
         crate::stop_record::set_boot(writer.boots());
@@ -76,6 +76,34 @@ pub fn open() -> Option<Guid> {
         }
         opened => finish(opened).flatten(),
     }
+}
+
+/// What the boot's marker line says after its number: the version, and
+/// the firmware's clock as it reads it, a local time on most PCs (its zone
+/// in minutes where the firmware names one).
+fn boot_note() -> String {
+    let clock = match uefi::runtime::get_time() {
+        Ok(time) => {
+            let mut clock = format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+                time.year(),
+                time.month(),
+                time.day(),
+                time.hour(),
+                time.minute(),
+                time.second()
+            );
+            if let Some(zone) = time.time_zone() {
+                clock.push_str(&format!(" zone_minutes={zone}"));
+            }
+            clock
+        }
+        Err(error) => format!("unread ({:?})", error.status()),
+    };
+    format!(
+        "version={} firmware_clock={clock}",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// The PCI functions an earlier boot did not finish starting, or skipped
@@ -157,10 +185,35 @@ fn report(writer: &Writer, through: &str) {
             writer.ring_bytes() >> 10
         ));
     }
+    match (writer.grown(), writer.kept_earlier()) {
+        (Some(smaller), Some(earlier)) => output::arguments(format_args!(
+            "BOOT LOG FILE grew from the {} KiB log an older loader started at its start to the \
+             whole file, after the {earlier} boots of the log before it that the header's copy \
+             names: both logs' boots stay, without the lines the older loader wrote over\n",
+            smaller >> 10
+        )),
+        (Some(smaller), None) => output::arguments(format_args!(
+            "BOOT LOG FILE grew from the {} KiB log an older loader started at its start to the \
+             whole file: that log's boots stay, the lines before it are gone\n",
+            smaller >> 10
+        )),
+        (None, _) => {}
+    }
+    if writer.restored() {
+        output::arguments(format_args!(
+            "BOOT LOG FILE header did not decode; its copy did and names the log\n"
+        ));
+    }
+    let layout = writer.layout();
     output::arguments(format_args!(
-        "BOOT LOG FILE {BOOT_LOG_FILE} through the {through} boot={} head={:#x}\n",
+        "BOOT LOG FILE {BOOT_LOG_FILE} through the {through} boot={} head={:#x} ring={} KiB \
+         records={} of {} KiB first and {} KiB last lines\n",
         writer.boots(),
-        writer.head()
+        writer.head(),
+        layout.ring_bytes >> 10,
+        layout.records,
+        layout.first_bytes >> 10,
+        layout.last_bytes >> 10,
     ));
 }
 
@@ -196,21 +249,22 @@ fn firmware_file() -> Result<(FileDevice, Option<Guid>)> {
     let mut file = root
         .open(&path, FileMode::ReadWrite, FileAttribute::empty())
         .ok()
-        .and_then(|file| file.into_regular_file())
+        .and_then(|file| crate::file_kind::regular(file).ok())
         .ok_or(refuse!("Stela's volume has no \\EFI\\stela\\boot.log"))?;
     let size = file
         .get_boxed_info::<FileInfo>()
         .map_err(|_| refuse!("the log file's size cannot be read"))?
         .file_size();
-    if size < LOG_BYTES {
-        return Err(refuse!("\\EFI\\stela\\boot.log is shorter than the log"));
-    }
+    let region = file_region(size).ok_or(refuse!(
+        "\\EFI\\stela\\boot.log is shorter than the log",
+        size
+    ))?;
     let identity = Identity {
         transport: Transport::Firmware,
         location: String::from(BOOT_LOG_FILE),
         model: String::new(),
         serial: String::new(),
-        blocks: LOG_BYTES / u64::from(BLOCK),
+        blocks: region / u64::from(BLOCK),
         block_size: BLOCK,
         read_only: false,
         // The firmware's file system may hold writes until a flush.
@@ -232,7 +286,11 @@ fn engine_file(partition: Box<dyn BlockDevice>) -> Result<()> {
     let file = volume
         .file(&BOOT_LOG_FILE.replace('\\', "/"))
         .map_err(|error| refuse!("boot log file: {error}", %error))?;
-    let runs = boot_log::file_runs(&file, block, LOG_BYTES)
+    let region = file_region(file.bytes).ok_or(refuse!(
+        "boot log file is shorter than the log",
+        bytes = file.bytes
+    ))?;
+    let runs = boot_log::file_runs(&file, block, region)
         .map_err(|error| refuse!("boot log file runs: {error}", %error))?;
     let partition = volume.into_inner().into_inner();
     let mut device: Box<dyn BlockDevice> = Box::new(

@@ -156,6 +156,7 @@ pub fn plan(decision: &Decision<'_>, entropy: &mut dyn FnMut() -> Guid) -> Resul
         Some(table) => table.clone(),
         None => Table {
             disk_guid: entropy(),
+            slots: Default::default(),
             partitions: Vec::new(),
         },
     };
@@ -182,6 +183,7 @@ pub fn plan(decision: &Decision<'_>, entropy: &mut dyn FnMut() -> Guid) -> Resul
     };
     if erased {
         new.partitions.clear();
+        new.slots.clear();
     } else {
         let mut deleted = deleted.to_vec();
         deleted.sort_unstable();
@@ -190,7 +192,7 @@ pub fn plan(decision: &Decision<'_>, entropy: &mut dyn FnMut() -> Guid) -> Resul
             if index >= new.partitions.len() {
                 return Err(PlanError::NoPartition(index));
             }
-            new.partitions.remove(index);
+            new.remove(index);
         }
     }
     let changed = erased || !deleted.is_empty() || matches!(place, Place::Free { .. });
@@ -203,7 +205,9 @@ pub fn plan(decision: &Decision<'_>, entropy: &mut dyn FnMut() -> Guid) -> Resul
         {
             return Err(PlanError::Overlap);
         }
-        new.partitions.push(Partition {
+        // In the first unused entry, the others left in theirs: the
+        // partitions' numbers stay what the systems on the disk know them by.
+        new.add(Partition {
             type_guid: Role::AppleRegion.type_guid(),
             unique_guid: guid,
             first_lba,
@@ -211,7 +215,6 @@ pub fn plan(decision: &Decision<'_>, entropy: &mut dyn FnMut() -> Guid) -> Resul
             attributes: 0,
             name: name.into(),
         });
-        new.partitions.sort_by_key(|partition| partition.first_lba);
     }
     let split = machine_state::split(blocks * block).map_err(|_| PlanError::TooSmall)?;
     let table = if changed {
@@ -639,6 +642,7 @@ mod tests {
     fn layout(block: u64) -> Table {
         Table {
             disk_guid: guid(DISK),
+            slots: Default::default(),
             partitions: vec![
                 partition(
                     guid(LINUX),
@@ -762,14 +766,62 @@ mod tests {
             assert_eq!(lbas[1..], [last, 2, 1, 0], "{block}");
             let new = planned_table(&made);
             assert_eq!(new.disk_guid, guid(DISK));
+            // The new partition takes the first unused entry, the fourth,
+            // though it lies before the third on the disk: the partitions
+            // there keep their entries, and so their numbers.
             assert_eq!(new.partitions.len(), 4);
-            assert_eq!(new.partitions[2].unique_guid, guid(NEW));
-            assert_eq!(new.partitions[2].name, NAME);
-            assert_eq!(new.partitions[2].role(), Some(Role::AppleRegion));
-            for kept in &table.partitions {
-                assert!(new.partitions.contains(kept));
-            }
+            assert_eq!(new.slots, [0, 1, 2, 3]);
+            assert_eq!(new.partitions[..3], table.partitions[..]);
+            assert_eq!(new.partitions[3].unique_guid, guid(NEW));
+            assert_eq!(new.partitions[3].name, NAME);
+            assert_eq!(new.partitions[3].role(), Some(Role::AppleRegion));
         }
+    }
+
+    #[test]
+    fn no_partition_that_stays_changes_its_entry() {
+        // Entries 0 and 3 used, 1 and 2 empty, and the first entry later on
+        // the disk than the second: as Windows, gdisk or Linux leave a disk
+        // after a partition is deleted or one added in front.
+        let [low, high, stela] = layout(512).partitions.try_into().unwrap();
+        let table = Table {
+            disk_guid: guid(DISK),
+            partitions: vec![stela.clone(), low.clone()],
+            slots: vec![0, 3],
+        };
+        let mut gapped = disk(512, Some(&table));
+        assert_eq!(gpt::read(&mut gapped).unwrap(), table);
+        let new = planned_table(
+            &plan(
+                &decision(&gapped, Some(&table), free(4, 18, 512)),
+                &mut entropy(true),
+            )
+            .unwrap(),
+        );
+        assert_eq!(new.partitions[0], stela);
+        assert_eq!(new.partitions[1].unique_guid, guid(NEW));
+        assert_eq!(new.partitions[2], low);
+        assert_eq!(new.slots, [0, 1, 3]);
+        // Deleting one frees only its own entry.
+        let table = Table {
+            partitions: vec![stela.clone(), high.clone(), low.clone()],
+            slots: vec![0, 2, 3],
+            ..table
+        };
+        let three = disk(512, Some(&table));
+        let new = planned_table(
+            &plan(
+                &Decision {
+                    deleted: &[1],
+                    ..decision(&three, Some(&table), free(4, 18, 512))
+                },
+                &mut entropy(true),
+            )
+            .unwrap(),
+        );
+        assert_eq!(new.partitions[0], stela);
+        assert_eq!(new.partitions[2], low);
+        assert_eq!(new.slots, [0, 1, 3]);
     }
 
     #[test]

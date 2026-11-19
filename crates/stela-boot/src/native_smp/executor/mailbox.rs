@@ -252,6 +252,18 @@ impl Processor {
     }
 }
 impl Processor {
+    /// Measure this AP's core class (`speed::measure`), and wait for it.
+    pub(crate) fn measure(
+        &self,
+        class: stela_boot_core::host_performance::Class,
+        sender: &Apic,
+        tsc_hz: u64,
+    ) {
+        if let Ok(pending) = self.send(Measure(class), sender, tsc_hz) {
+            pending.finish();
+        }
+    }
+
     /// Hand this AP work that runs for the rest of the boot on its own Host.
     /// Its mailbox stays busy, and nothing collects the job: the work owns
     /// everything it reaches.
@@ -370,6 +382,14 @@ fn shootdown_interrupts_off() -> bool {
     // SAFETY: observe the current caller's interrupt mask.
     unsafe { asm!("pushfq", "pop {}", out(reg) flags) };
     flags & (1 << 9) == 0
+}
+
+struct Measure(stela_boot_core::host_performance::Class);
+impl Command for Measure {
+    type Output = ();
+    fn execute(self, _: &mut host::HostOwner, _: &mut Option<WorkerOwner>) {
+        crate::engine::speed::measure(self.0);
+    }
 }
 
 struct Spawned(Box<dyn FnOnce(&mut host::HostOwner) + Send>);

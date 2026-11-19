@@ -22,7 +22,12 @@ void __real_call_rcu(struct rcu_head *, rcu_callback_t);
 static _Thread_local bool capture_allocation, forbid_free, forbid_enqueue;
 static _Thread_local void *captured_base;
 static _Thread_local const struct rcu_head *expected_callback;
-static _Thread_local unsigned int captured_frees, queued;
+static _Thread_local unsigned int captured_frees;
+/* Only the source test reads the enqueue count; the standalone suite would
+ * only write it, which Clang 23's -Wunused-but-set-global rejects. */
+#ifdef STELA_LINUX_DEFERRED_FREE_SOURCE_TEST
+static _Thread_local unsigned int queued;
+#endif
 static _Thread_local unsigned long required_cookie;
 
 void *__wrap_stela_linux_heap_alloc(size_t size, size_t align)
@@ -55,7 +60,9 @@ void __wrap_stela_linux_heap_free(void *object, size_t size, size_t align)
 void __wrap_call_rcu(struct rcu_head *head, rcu_callback_t callback)
 {
 	assert(!forbid_enqueue);
+#ifdef STELA_LINUX_DEFERRED_FREE_SOURCE_TEST
 	queued++;
+#endif
 	__real_call_rcu(head, callback);
 }
 

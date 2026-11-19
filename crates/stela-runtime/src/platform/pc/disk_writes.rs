@@ -321,6 +321,7 @@ mod tests {
     fn table(block: u64) -> Table {
         Table {
             disk_guid: guid("DDDDDDDD-0000-0000-0000-000000000001"),
+            slots: Default::default(),
             partitions: vec![Partition {
                 type_guid: Role::AppleRegion.type_guid(),
                 unique_guid: guid(HELD),

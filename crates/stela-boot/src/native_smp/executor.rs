@@ -64,6 +64,11 @@ pub(crate) enum StartupFailure {
         slot: usize,
         reason: Refusal,
     },
+    /// A processor that neither parked before the firmware's AML nor took
+    /// INIT, twice, may still read the startup page (`park::release_page`).
+    PageHeld {
+        apic: u32,
+    },
 }
 
 /// This object and its descriptors remain pinned for the whole boot, even
@@ -84,6 +89,8 @@ struct Argument {
     doorbells: UnsafeCell<Option<&'static core::sync::atomic::AtomicU64>>,
     refusal: UnsafeCell<Option<Refusal>>,
     status: AtomicU8,
+    /// Its core class's index (`speed::class`), published before READY.
+    class: AtomicU8,
     tsc: tsc_sync::Sync,
     mailbox: mailbox::Mailbox,
 }
@@ -295,7 +302,17 @@ unsafe extern "sysv64" fn enter(argument: u64) -> ! {
         // SAFETY: CPL0 on this ready AP with interrupts masked and its own
         // descriptors installed, before it runs a PE; nothing else writes
         // its P-state registers.
-        unsafe { stela_boot_core::host_performance::request_full_performance() };
+        unsafe {
+            stela_boot_core::host_performance::request_full_performance(
+                &mut host::pmu::PerformanceRegisters,
+            )
+        };
+        // Its class, which the first ready AP of measures once every AP
+        // started (`measure_classes`).
+        argument.class.store(
+            crate::engine::speed::class().index() as u8,
+            Ordering::Relaxed,
+        );
         Ok(owner)
     })()
     .and_then(|owner| {
@@ -422,6 +439,71 @@ pub(crate) unsafe fn quiesce_firmware_aps(
     Ok(delivered)
 }
 
+/// The PEs' processors started (`start` returned).
+static STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Where the processors other than this boot processor are, for a line
+/// about a call into the firmware's system management code.
+pub(crate) fn others() -> stela_boot_core::smi::Others {
+    stela_boot_core::smi::Others {
+        parked: park::OTHERS_PARKED.load(Ordering::Relaxed),
+        waiting: park::OTHERS_WAITING.load(Ordering::Relaxed),
+        started: STARTED.load(Ordering::Relaxed),
+    }
+}
+
+/// Park every enabled processor but the boot processor in an idle loop of
+/// its own before the firmware's AML runs, so that each answers the
+/// firmware's SMIs (`park::park_before_firmware`). A boot processor whose
+/// memory types cannot be read or do not make the startup page and heap
+/// write-back parks none, and says so.
+///
+/// # Safety
+/// On the boot processor in the engine's root, its host installed, with
+/// interrupts masked, before any processor starts from the startup page
+/// and before the firmware's AML runs.
+pub(crate) unsafe fn park_before_firmware(
+    handoff: &'static Handoff,
+    capture: &firmware::Capture,
+    progress: fn(),
+) {
+    let sender = Apic::new(
+        handoff.apic_base,
+        layout::physical(handoff.apic_base & apic::BASE_ADDRESS),
+    );
+    // SAFETY: CPL0, the boot processor; PAT exists under the native floor.
+    let memory = unsafe { firmware::observe() }
+        .map_err(|_| "the boot processor's controls could not be read")
+        .and_then(|source| {
+            let image = super::memory_types::Image::from_snapshot(&source)
+                .map_err(|_| "the boot processor's memory types are not ones Stela copies")?;
+            if image.amd.is_some() {
+                for (physical, bytes) in [
+                    (handoff.heap.physical, handoff.heap.bytes),
+                    (handoff.native_resources.sipi, PAGE),
+                ]
+                .into_iter()
+                .filter(|&(physical, bytes)| physical != 0 && bytes != 0)
+                {
+                    image
+                        .writeback_ram(physical, bytes)
+                        .map_err(|_| "the heap or startup page is not write-back")?;
+                }
+            }
+            Ok((image, source.pat))
+        });
+    match memory {
+        // SAFETY: the caller's; the memory types are the boot processor's.
+        Ok((image, pat)) => unsafe {
+            park::park_before_firmware(handoff, capture, &sender, &image, pat, progress)
+        },
+        Err(why) => crate::output::arguments(format_args!(
+            "NATIVE PARKED BEFORE FIRMWARE none: {why}; the other processors stay in \
+             wait-for-SIPI, where they take no SMI, while the firmware's AML runs\n"
+        )),
+    }
+}
+
 /// Start the selected physical APs using Stela-owned resources after EBS.
 ///
 /// # Safety
@@ -454,6 +536,9 @@ pub(crate) unsafe fn start(
         handoff.apic_base,
         layout::physical(handoff.apic_base & apic::BASE_ADDRESS),
     );
+    // SAFETY: CPL0 on the BSP, which alone sends, with interrupts masked and
+    // no processor started from the page yet.
+    let page = unsafe { park::release_page(&sender, handoff.tsc_hz) };
     let mut processors = Vec::with_capacity(cores - 1);
     let mut started: Vec<Starting> = Vec::with_capacity(cores - 1);
     // SAFETY: CPL0, BSP; PAT exists under the validated native floor.
@@ -530,6 +615,11 @@ pub(crate) unsafe fn start(
     // An AP that does not start ends the startup of the ones after it, and
     // the guest runs on the cores before it (`Executors::failure`).
     let mut failed: Vec<(usize, StartupFailure)> = Vec::new();
+    if let stela_boot_core::parking::Page::Held(holder) = page
+        && cores > 1
+    {
+        failed.push((1, StartupFailure::PageHeld { apic: holder.apic }));
+    }
     for slot in 1..cores {
         if !failed.is_empty() {
             break;
@@ -590,6 +680,7 @@ pub(crate) unsafe fn start(
                 doorbells: UnsafeCell::new(None),
                 refusal: UnsafeCell::new(None),
                 status: AtomicU8::new(STARTING),
+                class: AtomicU8::new(0),
                 tsc: tsc_sync::Sync::new(
                     handoff.tsc_hz,
                     stela_boot_core::tsc::sync::round_millis(
@@ -716,6 +807,11 @@ pub(crate) unsafe fn start(
         core::hint::spin_loop();
     }
     crate::output::flush_log();
+    for processor in &processors {
+        // SAFETY: it took INIT and SIPI since it parked, and is ready on its
+        // own stack and descriptors.
+        unsafe { park::reclaim(capture.selected[processor.slot] as usize) };
+    }
     processors.sort_unstable_by_key(|processor| processor.slot);
     failed.sort_unstable_by_key(|(slot, _)| *slot);
     let failure = failed.into_iter().next();
@@ -724,6 +820,7 @@ pub(crate) unsafe fn start(
         // their mailbox loop, answering shootdowns, and run no PE.
         processors.retain(|processor| processor.slot < *first);
     }
+    measure_classes(&processors, &sender, handoff.tsc_hz);
     // SAFETY: every started AP is ready, or failed and then nothing starts
     // from the page again; the memory types are the BSP's, checked above.
     unsafe {
@@ -736,10 +833,27 @@ pub(crate) unsafe fn start(
             failure.is_some(),
         )
     };
+    STARTED.store(true, Ordering::Relaxed);
     Ok(Executors {
         processors,
         failure: failure.map(|(_, error)| error),
     })
+}
+
+/// The first PE's AP of each core class no processor measured measures it
+/// (`HOST SPEED`), one at a time, each within the calibration's own bound.
+/// Every AP is ready or left out by now, so this takes no AP's startup
+/// second, and only the boot processor waits on it.
+fn measure_classes(processors: &[Processor], sender: &Apic, tsc_hz: u64) {
+    for processor in processors {
+        let index = processor.argument.class.load(Ordering::Relaxed);
+        let Some(&class) = stela_boot_core::host_performance::Class::ALL.get(index as usize) else {
+            continue;
+        };
+        if crate::engine::speed::claim(class) {
+            processor.measure(class, sender, tsc_hz);
+        }
+    }
 }
 
 /// A started AP that is not ready yet.

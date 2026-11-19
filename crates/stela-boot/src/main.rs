@@ -30,6 +30,7 @@ mod console;
 mod cpu;
 mod engine;
 mod entropy;
+mod file_kind;
 mod firmware;
 mod handoff;
 use stela_boot_core::heap;

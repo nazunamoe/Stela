@@ -424,10 +424,57 @@ pub fn report(error: manifest::Error, log: fn(fmt::Arguments<'_>)) -> &'static s
     "invalid host firmware resources"
 }
 
+/// The first volume's bundle that reads, in the volumes' order: each
+/// volume answers `None` without a bundle, else its bundle or why it cannot
+/// be read. A volume that cannot be read goes to `passed` and the search
+/// goes on, since the volume that holds the bundle may come after it. The
+/// second value counts the volumes passed over.
+pub fn first_bundle<P, T, E>(
+    volumes: impl IntoIterator<Item = (P, Option<core::result::Result<T, E>>)>,
+    mut passed: impl FnMut(P, E),
+) -> (Option<T>, usize) {
+    let mut unreadable = 0;
+    for (place, found) in volumes {
+        match found {
+            None => {}
+            Some(Ok(bundle)) => return (Some(bundle), unreadable),
+            Some(Err(why)) => {
+                unreadable += 1;
+                passed(place, why);
+            }
+        }
+    }
+    (None, unreadable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use stela_drivers::net::wifi::intel::platform::Variable;
+
+    #[test]
+    fn the_bundle_search_passes_over_an_unreadable_volume() {
+        let mut passed = Vec::new();
+        let volumes = [
+            ("boot volume", None),
+            (
+                "volume 1",
+                Some(Err("host firmware root is not a directory")),
+            ),
+            ("volume 2", None),
+            ("volume 3", Some(Ok(3))),
+            ("volume 4", Some(Ok(4))),
+        ];
+        let found = first_bundle(volumes, |place, why| passed.push((place, why)));
+        assert_eq!(found, (Some(3), 1));
+        assert_eq!(
+            passed,
+            [("volume 1", "host firmware root is not a directory")]
+        );
+        let none: [(&str, Option<core::result::Result<u8, &str>>); 2] =
+            [("boot volume", None), ("volume 1", Some(Err("bad")))];
+        assert_eq!(first_bundle(none, |_, _| {}), (None, 1));
+    }
 
     #[test]
     fn the_bundle_record_is_read_through_the_map_or_is_absent() {

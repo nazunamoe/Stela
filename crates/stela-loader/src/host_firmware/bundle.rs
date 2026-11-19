@@ -398,6 +398,44 @@ pub fn empty_ports(functions: &[Pci]) -> impl Iterator<Item = &Pci> {
     })
 }
 
+/// What the firmware's PCI census can say before an install or a start
+/// about the NVIDIA GPU macOS needs to start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NvidiaNotice {
+    /// A display controller of a chip Stela's catalog names answers.
+    Driven,
+    /// No NVIDIA display controller answers, and no PCI port shows nothing
+    /// below it, so none can answer later.
+    Absent,
+    /// NVIDIA display controllers answer, none of a chip Stela drives, and
+    /// no PCI port shows nothing below it.
+    NotDriven,
+    /// No NVIDIA display controller Stela drives answers yet, and some PCI
+    /// ports show nothing below them ([`empty_ports`]): a GPU the firmware
+    /// left without power there answers only after Stela's engine powers
+    /// the port, which the census cannot foresee, since only ACPI says
+    /// whether a port's power is off.
+    NotYet,
+}
+
+/// The [`NvidiaNotice`] for a PC whose firmware showed `functions`.
+pub fn nvidia_notice(functions: &[Pci]) -> NvidiaNotice {
+    let mut nvidia = functions
+        .iter()
+        .filter(|function| function.vendor == 0x10de && function.class == 0x03)
+        .peekable();
+    let seen = nvidia.peek().is_some();
+    if nvidia.any(|function| recipes::nvidia_chip(function.device).is_some()) {
+        NvidiaNotice::Driven
+    } else if empty_ports(functions).next().is_some() {
+        NvidiaNotice::NotYet
+    } else if seen {
+        NvidiaNotice::NotDriven
+    } else {
+        NvidiaNotice::Absent
+    }
+}
+
 /// A GPU driver's files, all of them, for a GPU that may answer only after
 /// the firmware's exit: no PCI function the firmware showed names the chip,
 /// so every chip's files are read.

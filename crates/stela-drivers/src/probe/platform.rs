@@ -95,6 +95,7 @@ pub(crate) fn firmware_id(ids: &[String]) -> Option<String> {
 pub(super) fn attach_i8042(
     session: &crate::platform::acpi::Session,
     clock: crate::Clock,
+    chassis_type: Option<u8>,
     smbus_hosts: &[super::smbus::Host],
     devices: &mut super::Devices,
 ) {
@@ -158,9 +159,11 @@ pub(super) fn attach_i8042(
                     .map_err(|error| PlatformError::AcpiMethod("FADT lookup", error))?
                     .as_deref(),
             );
-        let Some(config) = i8042(direct || !keyboards.is_empty(), !mice.is_empty(), &io)? else {
+        let Some(mut config) = i8042(direct || !keyboards.is_empty(), !mice.is_empty(), &io)?
+        else {
             return Ok(None);
         };
+        config.chassis_type = chassis_type;
         let firmware_id = match mice.first() {
             Some(mouse) => firmware_id(&pnp_ids(*mouse)?),
             None => None,

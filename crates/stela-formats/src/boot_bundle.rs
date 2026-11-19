@@ -81,6 +81,18 @@ pub struct Framebuffer {
     pub bits_per_pixel: u64,
 }
 
+impl Framebuffer {
+    /// The UI scale macOS is given for this screen in `/chosen
+    /// display-scale`: iBoot's rule, `boot_args.Video.v_depth` bits 16..23
+    /// plus one. Stela's depth carries no scale bits, so it is 1, the scale
+    /// iBoot gives a display that is not a Retina panel. macOS reads it only
+    /// for a built-in (primary) display; the installer's Apple logo on an
+    /// external one follows WindowServer's own starting mode.
+    pub fn display_scale(&self) -> u32 {
+        (self.bits_per_pixel >> 16 & 0xff) as u32 + 1
+    }
+}
+
 /// What the running machine provides for the patch slots.
 #[derive(Debug, Clone)]
 pub struct Machine {
@@ -391,9 +403,7 @@ impl<'a> Verified<'a> {
                         "/chosen display-rotation" => {
                             u32_value((screen.bits_per_pixel >> 8 & 0xff) * 90)
                         }
-                        "/chosen display-scale" => {
-                            u32_value((screen.bits_per_pixel >> 16 & 0xff) + 1)
-                        }
+                        "/chosen display-scale" => u32_value(u64::from(screen.display_scale())),
                         "/chosen display-boot-rotation" => {
                             u32_value((screen.bits_per_pixel >> 24 & 0xff) * 90)
                         }

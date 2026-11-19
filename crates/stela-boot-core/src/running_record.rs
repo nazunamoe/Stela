@@ -33,7 +33,22 @@
 //! | 16 | 8 | the boot's number in the USB's log |
 //! | 24 | 16 | the GUID of the log's partition |
 //! | 40 | 4 | seconds since the PC started, at the write |
-//! | 44 | 4 | reserved, zero |
+//! | 44 | 4 | flags: [`VARIABLE_FAULT`], [`VARIABLE_TRIAL`]; bits 16-31 the faulting version's [`build_tag`] |
+//!
+//! A boot on a PC whose runtime variable service faulted after the
+//! firmware's exit sets [`VARIABLE_FAULT`] with the faulting version's tag
+//! ([`variable_service`]): each fault can leave the firmware's variable
+//! store half written, so on that PC that version calls the service only
+//! while boot services run (`VariableService::Avoided`). Another version,
+//! whose mapping of the firmware's runtime regions may differ, tries it
+//! after the exit again (`VariableService::Tried`, [`VARIABLE_TRIAL`]): once
+//! a try's call after the exit answers, as the try's log says, the flag is
+//! cleared; a try that faults keeps the flag, now with its own version's tag;
+//! a try that made no such call is tried again. So a PC that only an
+//! earlier version's mapping faulted returns to normal after one restart,
+//! and one whose firmware faults again keeps the service before the exit
+//! for that version, and faults at most once in each later version. Older
+//! versions, which want the word zero, read such a record as none.
 use alloc::{format, string::String};
 use stela_contracts::crc::crc32_ieee;
 
@@ -70,6 +85,38 @@ pub struct Running {
     pub log: [u8; 16],
     /// Seconds since the PC started when it was written.
     pub seconds: u32,
+    /// [`VARIABLE_FAULT`] and [`VARIABLE_TRIAL`] with a [`build_tag`]
+    /// above them, or none.
+    pub flags: u32,
+}
+
+/// The firmware's runtime variable service faulted on this PC after the
+/// firmware's exit, in the boot the record names or an earlier one, under
+/// the version whose [`build_tag`] the flags' high half holds.
+pub const VARIABLE_FAULT: u32 = 1;
+/// The boot the record names called the service after the exit again,
+/// though it had faulted under another version (`VariableService::Tried`).
+pub const VARIABLE_TRIAL: u32 = 2;
+/// The flags' bits for the faulting version's tag.
+const TAG_SHIFT: u32 = 16;
+
+/// A version's tag in the record: 16 bits of its string's CRC-32, never 0,
+/// which stands for a version the log did not name.
+pub fn build_tag(version: &str) -> u32 {
+    (crc32_ieee(version.as_bytes()) & 0xffff).max(1)
+}
+
+/// How a boot calls the firmware's runtime variable service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VariableService {
+    /// It never faulted on this PC: after the exit as a boot needs it.
+    Trusted,
+    /// It faulted on this PC under this version: only while boot services
+    /// run.
+    Avoided,
+    /// It faulted on this PC under another version: after the exit as a
+    /// boot needs it, to see whether this version's calls answer.
+    Tried,
 }
 
 impl Running {
@@ -80,6 +127,7 @@ impl Running {
         bytes[16..24].copy_from_slice(&self.boot.to_le_bytes());
         bytes[24..40].copy_from_slice(&self.log);
         bytes[40..44].copy_from_slice(&self.seconds.to_le_bytes());
+        bytes[44..48].copy_from_slice(&self.flags.to_le_bytes());
         let checksum = crc32_ieee(&bytes[16..]);
         bytes[12..16].copy_from_slice(&checksum.to_le_bytes());
         bytes
@@ -93,7 +141,7 @@ impl Running {
             || &bytes[..8] != MAGIC
             || word(8) != VERSION
             || word(12) != crc32_ieee(&bytes[16..])
-            || word(44) != 0
+            || word(44) & !(VARIABLE_FAULT | VARIABLE_TRIAL | u32::MAX << TAG_SHIFT) != 0
         {
             return None;
         }
@@ -101,6 +149,7 @@ impl Running {
             boot: u64::from_le_bytes(bytes[16..24].try_into().expect("8 bytes")),
             log: bytes[24..40].try_into().expect("16 bytes"),
             seconds: word(40),
+            flags: word(44),
         })
     }
 }
@@ -138,6 +187,79 @@ pub fn enough(newest: &[u8]) -> bool {
         || text.contains(BOOT_MARKER)
         || ENDS.iter().any(|end| text.contains(end))
 }
+
+/// How boot `this_boot` of the log on partition `this_log`, of `version`,
+/// calls the firmware's variable service, and the flags its record keeps,
+/// from the record `running` the boot before wrote and `newest`, the log's
+/// newest lines from before this boot's own:
+///
+/// - The boot `running` names is the one before this one in this log and
+///   its lines show a fault inside the service: flagged with the tag of the
+///   version its marker names.
+/// - That boot tried the service after the exit ([`VARIABLE_TRIAL`]) and
+///   its lines show one of its calls there answered: no longer flagged.
+/// - Otherwise the record's flag holds, on any USB, after any boot.
+///
+/// A flag of this version's tag avoids the service after the exit; one of
+/// another's tries it.
+pub fn variable_service(
+    running: &Running,
+    this_boot: u64,
+    this_log: &[u8; 16],
+    newest: &[u8],
+    version: &str,
+) -> (VariableService, u32) {
+    let mut faulted = (running.flags & VARIABLE_FAULT != 0).then_some(running.flags >> TAG_SHIFT);
+    if running.log == *this_log && running.boot.checked_add(1) == Some(this_boot) {
+        let text = String::from_utf8_lossy(newest);
+        let lines = text.rfind(BOOT_MARKER).map_or(&text[..], |at| &text[at..]);
+        let said = |words: &[&str]| {
+            lines.lines().any(|line| {
+                let line = stamped(line).1;
+                words.iter().any(|words| line.starts_with(words))
+            })
+        };
+        let fault = lines.lines().any(|line| {
+            stamped(line)
+                .1
+                .strip_prefix("STELA FATAL ")
+                .is_some_and(|reason| reason.starts_with(crate::stop_record::FAULT_WORDS))
+        });
+        if fault {
+            // `=== STELA BOOT 12 === version=0.5.1 ...`
+            let tag = lines
+                .strip_prefix(BOOT_MARKER)
+                .and_then(|marker| marker.lines().next())
+                .and_then(|marker| {
+                    marker
+                        .split(' ')
+                        .find_map(|word| word.strip_prefix("version="))
+                })
+                .map_or(0, build_tag);
+            faulted = Some(tag);
+        } else if running.flags & VARIABLE_TRIAL != 0 && said(&ANSWERED) {
+            faulted = None;
+        }
+    }
+    match faulted {
+        None => (VariableService::Trusted, 0),
+        Some(tag) if tag == build_tag(version) => {
+            (VariableService::Avoided, VARIABLE_FAULT | tag << TAG_SHIFT)
+        }
+        Some(tag) => (
+            VariableService::Tried,
+            VARIABLE_FAULT | VARIABLE_TRIAL | tag << TAG_SHIFT,
+        ),
+    }
+}
+
+/// The lines a call of the variable service after the firmware's exit
+/// writes when it answered, as it did or refused (`stop_record`'s
+/// `return_at_restart`).
+const ANSWERED: [&str; 2] = [
+    "POWER the firmware starts its entry Boot",
+    "POWER the firmware chooses what starts after the restart: it refused BootNext",
+];
 
 /// The step watchdog of the boot that ended, as its lines say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,7 +457,130 @@ mod tests {
             boot,
             log: LOG,
             seconds: 41,
+            flags: 0,
         }
+    }
+
+    const FAULTED: &str = "=== STELA BOOT 12 === version=0.5.1 firmware_clock=unread\n\
+        [ 2317.000] STEP Restarting the PC t=2317.000\n\
+        [ 2317.523] STELA FATAL x86 exception inside the PC firmware's variable service, \
+        which Stela called to start Stela again after the restart macOS asked for \
+        (vector=14 error=0x0 rip=0x777274ed cr2=0xffd0c04c): the PC does not restart by \
+        itself\n";
+
+    #[test]
+    fn a_fault_in_the_variable_service_is_found_and_kept_for_the_pc() {
+        let old = build_tag("0.5.1") << TAG_SHIFT;
+        let service = |running: &Running, log: &[u8; 16], newest: &str, version: &str| {
+            variable_service(running, 13, log, newest.as_bytes(), version)
+        };
+        // Under this version: avoided after the exit.
+        assert_eq!(
+            service(&running(12), &LOG, FAULTED, "0.5.1"),
+            (VariableService::Avoided, VARIABLE_FAULT | old)
+        );
+        // Another USB's log, an older boot, or another stop: not this PC's.
+        for (record, log, newest) in [
+            (running(12), [1; 16], FAULTED),
+            (running(11), LOG, FAULTED),
+            (running(12), LOG, HUNG_AT_EXIT),
+        ] {
+            assert_eq!(
+                service(&record, &log, newest, "0.5.1"),
+                (VariableService::Trusted, 0)
+            );
+        }
+        // A fault in an earlier boot of the boot before this one is not it.
+        let earlier = alloc::format!("{FAULTED}=== STELA BOOT 12 ===\nSTELA RESTART code=0x15\n");
+        assert_eq!(
+            service(&running(12), &LOG, &earlier, "0.5.1").0,
+            VariableService::Trusted
+        );
+        // The record's flag holds on any USB, after any boot.
+        let flagged = Running {
+            flags: VARIABLE_FAULT | old,
+            ..running(3)
+        };
+        assert_eq!(
+            variable_service(&flagged, 40, &[1; 16], b"", "0.5.1"),
+            (VariableService::Avoided, VARIABLE_FAULT | old)
+        );
+        assert_eq!(Running::decode(&flagged.encode()), Some(flagged));
+        let mut unknown = flagged.encode();
+        unknown[44] = 4;
+        let checksum = crc32_ieee(&unknown[16..]);
+        unknown[12..16].copy_from_slice(&checksum.to_le_bytes());
+        assert_eq!(Running::decode(&unknown), None);
+        // A log that names no version: another's.
+        let unnamed = FAULTED.replacen(" version=0.5.1 firmware_clock=unread", "", 1);
+        assert_eq!(
+            service(&running(12), &LOG, &unnamed, "0.5.1"),
+            (VariableService::Tried, VARIABLE_FAULT | VARIABLE_TRIAL)
+        );
+    }
+
+    /// A PC whose service faulted under an earlier version's mapping returns
+    /// to normal once a try after the exit answers, where it stayed flagged
+    /// for good; one whose service faults again in the try keeps the flag.
+    #[test]
+    fn a_fault_under_another_version_is_tried_once_and_cleared_when_it_answers() {
+        let old = build_tag("0.5.1") << TAG_SHIFT;
+        // The boot after the fault, of a newer version, tries the service.
+        let (service, flags) =
+            variable_service(&running(12), 13, &LOG, FAULTED.as_bytes(), "0.5.2");
+        assert_eq!(
+            (service, flags),
+            (
+                VariableService::Tried,
+                VARIABLE_FAULT | VARIABLE_TRIAL | old
+            )
+        );
+        let tried = Running {
+            flags,
+            ..running(13)
+        };
+        // Its restart's BootNext answered: the next boot trusts the service.
+        let answered = "=== STELA BOOT 13 === version=0.5.2\n\
+            [  900.100] POWER the firmware starts its entry Boot0003 again after the restart\n\
+            [  900.200] STELA RESTART code=0x15\n";
+        assert_eq!(
+            variable_service(&tried, 14, &LOG, answered.as_bytes(), "0.5.2"),
+            (VariableService::Trusted, 0)
+        );
+        let refused = answered.replace(
+            "starts its entry Boot0003 again after the restart",
+            "chooses what starts after the restart: it refused BootNext for its entry Boot0003 \
+             (status 0x8000000000000007)",
+        );
+        assert_eq!(
+            variable_service(&tried, 14, &LOG, refused.as_bytes(), "0.5.2").0,
+            VariableService::Trusted
+        );
+        // It powered off without a call after the exit: tried again.
+        let powered_off = "=== STELA BOOT 13 === version=0.5.2\n[  900.100] POWER powering off\n";
+        assert_eq!(
+            variable_service(&tried, 14, &LOG, powered_off.as_bytes(), "0.5.2"),
+            (VariableService::Tried, flags)
+        );
+        // A boot that was no try clears nothing by such a line.
+        let avoided = Running {
+            flags: VARIABLE_FAULT | build_tag("0.5.2") << TAG_SHIFT,
+            ..running(13)
+        };
+        assert_eq!(
+            variable_service(&avoided, 14, &LOG, answered.as_bytes(), "0.5.2").0,
+            VariableService::Avoided
+        );
+        // The try faulted too: this version avoids it from now on.
+        let again = FAULTED.replace("BOOT 12 === version=0.5.1", "BOOT 13 === version=0.5.2");
+        assert_eq!(
+            variable_service(&tried, 14, &LOG, again.as_bytes(), "0.5.2"),
+            (
+                VariableService::Avoided,
+                VARIABLE_FAULT | build_tag("0.5.2") << TAG_SHIFT
+            )
+        );
+        assert_ne!(build_tag("0.5.1"), build_tag("0.5.2"));
     }
 
     #[test]
@@ -415,12 +660,14 @@ mod tests {
              head=0x8000\n\
              [   33.500] STEP o Taking control of the other processors ms=2496\n\
              [   33.600] STEP Starting the GPU t=33.600\n\
-             [   35.000] STEP DETAIL loading its firmware ms=1400\n\
+             [   34.000] STEP DETAIL loading its firmware 1 ms=400\n\
+             [   35.000] STEP DETAIL loading its firmware 3 ms=1400 unlogged_like_it=1\n\
              [   95.250] LINUX <6> nouveau 0000:01:00.0: still waiting\n"
         );
         let found = unfinished(&running(12), 13, &LOG, None, log.as_bytes()).unwrap();
         assert_eq!(found.stage, "Starting the GPU");
-        assert_eq!(found.detail, "loading its firmware");
+        // A thinned detail's count of those left out is not part of it.
+        assert_eq!(found.detail, "loading its firmware 3");
         assert_eq!(
             (found.seconds, found.unkept, found.after),
             (Some(61), false, false)
@@ -429,7 +676,7 @@ mod tests {
         assert_eq!(
             found.line(),
             "PREVIOUS BOOT ended without a stop (boot 12): last stage \"Starting the GPU\", \
-             past \"loading its firmware\", watchdog=on, 61 s in the stage by the log's last \
+             past \"loading its firmware 3\", watchdog=on, 61 s in the stage by the log's last \
              line\n"
         );
         assert!(

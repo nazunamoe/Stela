@@ -796,13 +796,38 @@ impl Source {
                 maximum: root.maximum,
                 translation: root.translation,
             });
-        let physical = aperture::bar_physical(windows, u32::from(segment), address, bytes)
-            .ok_or(Error::OutsideResource)?;
+        let Some(physical) =
+            aperture::bar_physical(windows.clone(), u32::from(segment), address, bytes)
+        else {
+            // Which of the two refusals, with the windows the ACPI host
+            // bridges declare, as Linux's "no compatible bridge window".
+            let mut listed = alloc::string::String::new();
+            for window in windows
+                .filter(|window| window.segment == u32::from(segment))
+                .take(8)
+            {
+                listed.push_str(&alloc::format!(
+                    " {:#x}-{:#x}",
+                    window.minimum,
+                    window.maximum
+                ));
+            }
+            crate::output::arguments(format_args!(
+                "HOST PCI BAR at {address:#x} ({bytes:#x} bytes) on segment {segment} lies in \
+                 no memory window its ACPI host bridges declare (windows:{listed}); Stela \
+                 assigns no BARs, so it stays unmapped\n"
+            ));
+            return Err(Error::OutsideResource);
+        };
         let span = PhysicalSpan::new(physical, bytes)?;
         if !span.start().is_multiple_of(PAGE) || !span.bytes().is_multiple_of(PAGE) {
             return Err(Error::InvalidRange);
         }
         if !wire.excludes_memory(span.start(), span.end()) {
+            crate::output::arguments(format_args!(
+                "HOST PCI BAR at {address:#x} ({bytes:#x} bytes) on segment {segment} overlaps \
+                 memory the firmware's map does not leave to devices, so it stays unmapped\n"
+            ));
             return Err(Error::OutsideResource);
         }
         self.reserve(

@@ -18,6 +18,7 @@ pub(super) fn lock_timeout_arguments(tsc_hz: u64) -> String {
         MODELED_CORE_HZ, lock_scale, lock_scale_arguments, measure_core_hz,
     };
     let core_hz = measure_core_hz(tsc_hz);
+    super::speed::set_single_core_hz(core_hz);
     let scale = lock_scale(core_hz);
     output::arguments(format_args!(
         "GUEST TIMEOUTS lock_scale={scale} core_hz={core_hz} tsc_hz={tsc_hz} \
@@ -49,16 +50,14 @@ fn from_disk(
     // (osfmk/kern/startup.h), converted to ticks only when overridden.
     // System sleep is not modeled, so `noidle` stops the idle timer that
     // would ask for it.
-    // The guest's Bluetooth is a host controller bridged over USB, when the
-    // host lends one: bluetoothd and BlueTool then take USB, transport 0
-    // (26A434 bluetoothd's transport switch at x86_64 0x1001f84e7). Without
-    // one there is no chip on any transport, and bluetoothd does what it does
-    // on a Mac whose radio fails to boot: it logs "Bluetooth error -
-    // restarting" (reason 1214, chip boot failure) and restarts its stack
-    // every 40 s or so, whether it looks on its default UART (3) or the
-    // board's PCIe (7). Overriding it to USB then would be worse: its HCI
-    // initialization fails (`OI_HCIAPI_Init_Vars`) and it aborts with
-    // "Bluetooth fatal error" (reason 0x5c), each time with a crash report.
+    // The guest's Bluetooth controller is a USB function on the native hub
+    // (`stela_soc::usb::hci`), so the tree says the board's Bluetooth is on
+    // USB: `/arm-io/bluetooth` `transport-encoding` 0, where J473's says 7
+    // (PCIe). bluetoothd (26B123 0x10016e124) and BlueTool (0x100028f3c)
+    // read that property and take the `bt-transport-override` boot-arg only
+    // as an override of it, which then stays unset. On transport 0 BlueTool
+    // boots the chip by matching the USB module by name and version, and
+    // bluetoothd takes the chipset of Apple's internal module.
     let mut defaults = boot_bundle::Options {
         ecid: options.ecid,
         boot_command: options.boot_command,
@@ -69,7 +68,13 @@ fn from_disk(
         ..boot_bundle::Options::default()
     };
     if bluetooth {
-        defaults.boot_args.push_str(" bt-transport-override=0");
+        defaults
+            .overlay
+            .push(stela_formats::boot_bundle::schema::OverlayProperty {
+                path: "/arm-io/bluetooth".into(),
+                property: "transport-encoding".into(),
+                value: 0u32.to_le_bytes().to_vec(),
+            });
     }
     defaults.boot_args.push_str(&lock_timeout_arguments(tsc_hz));
     // The automatic Metal plugin repair NVRAM asked for is the manual
@@ -222,6 +227,7 @@ fn start(handoff: u64) -> Started {
     // From here a stop the USB's log cannot keep leaves its record in the
     // firmware; an earlier one has only the screen.
     crate::stop_record::arm(handoff.stop_record, Some(handoff.root));
+    crate::stop_record::set_regions(&handoff.runtime_regions);
     layout::set(handoff.placement);
     // Before this image's first line: the loader's lines that no log stored.
     let lines = handoff
@@ -240,7 +246,11 @@ fn start(handoff: u64) -> Started {
     // off and its descriptors installed; nothing else writes its P-state
     // registers. After the stop record is armed, so that a fault here
     // leaves its report. The APs ask for theirs when they are ready.
-    unsafe { stela_boot_core::host_performance::request_full_performance() };
+    unsafe {
+        stela_boot_core::host_performance::request_full_performance(
+            &mut host::pmu::PerformanceRegisters,
+        )
+    };
     // Use the physmap directly: its CPU and physical bases have the
     // same alignment phase. A separately placed heap alias cannot in general
     // satisfy higher-order CPU/physical page alignment simultaneously.
@@ -251,6 +261,15 @@ fn start(handoff: u64) -> Started {
     crate::ALLOCATOR.reserve_tail(handoff.heap.bytes as usize / HEAP_RESERVE_SHARE);
     output::keep_stop_reserve();
     super::large_blocks::install();
+    // Before any user of the rate: this image's copy has not been found.
+    crate::firmware::adopt_tsc(
+        handoff.tsc_hz,
+        handoff.tsc_source,
+        handoff.tsc_tolerance_ppm,
+    );
+    // Before any AP: the boot processor's class, its caches, clock and
+    // memory, with its heap's buffer (`HOST SPEED`).
+    super::speed::calibrate_once();
     // SAFETY: this loader-owned private seed is held in the shared physmap,
     // exclusively consumed here before any native service is published.
     if let Err(error) = unsafe { crate::random::initialize(handoff.random_seed) } {
@@ -276,12 +295,6 @@ fn start(handoff: u64) -> Started {
     // physmap; metadata and Arc are created in this active engine allocator.
     let host_firmware = unsafe { crate::host_firmware::after_ebs(&handoff.host_firmware) }
         .unwrap_or_else(|error| output::fatal(error));
-    // Before any user of the rate: this image's copy has not been found.
-    crate::firmware::adopt_tsc(
-        handoff.tsc_hz,
-        handoff.tsc_source,
-        handoff.tsc_tolerance_ppm,
-    );
     crate::status::set_clock(handoff.tsc_hz);
     // Before any AP agrees with the BSP through a software offset: from
     // then on the drivers' times and deadlines read the BSP's counter on
@@ -418,7 +431,7 @@ fn open_host(
         mmio: native_mmio,
         remappers,
         work: kernel_work,
-    } = start_platform(handoff, &mut host_owner, options);
+    } = start_platform(handoff, &mut host_owner, options, native_processors);
     // The signing service is asked only during an install, so a boot that
     // installs nothing leaves the adapter to the guest. An install without a
     // medium partition also streams its remote image.
@@ -930,8 +943,9 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         full_profile.processors.len().max(1),
     ));
     output::arguments(format_args!(
-        "{}",
-        stela_boot_core::host_performance::summary()
+        "{}{}",
+        stela_boot_core::host_performance::summary(),
+        super::speed::lines()
     ));
     if loaded_tree.is_some() {
         crate::status::begin("Setting up the Mac's hardware");
@@ -1096,7 +1110,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
             rtc_anchor: host_nor.as_ref().and_then(nor::HostNor::loaded_anchor),
             usb_disks,
             guest_mac: guest_network.as_ref().map(network::GuestNetwork::mac),
-            guest_bluetooth: host_bluetooth.is_some(),
+            guest_bluetooth: host_bluetooth.as_ref().map(bluetooth::HostBluetooth::kind),
         },
         board.as_ref(),
         &core_locks,
@@ -1529,7 +1543,14 @@ fn open_gpus(
             .ok()
             .and_then(|entropy| stela_linux::random::Seeded::from_entropy(&*entropy).ok());
         let (claimed, refused) = random.as_ref().map_or_else(Default::default, |_| {
-            gpu::claim_all(&services, &adapters, &isa_bridges, gop, firmware.as_ref())
+            gpu::claim_all(
+                &services,
+                &adapters,
+                &isa_bridges,
+                gop,
+                firmware.as_ref(),
+                &|address| gpu::link::port_above(mmio, address),
+            )
         });
         (claimed, refused, random)
     });
@@ -1638,7 +1659,7 @@ struct Placement<'a> {
     rtc_anchor: Option<stela_soc::machine::RtcAnchor>,
     usb_disks: Vec<alloc::boxed::Box<dyn stela_drivers::block::BlockDevice>>,
     guest_mac: Option<stela_drivers::net::Mac>,
-    guest_bluetooth: bool,
+    guest_bluetooth: Option<stela_soc::machine::UsbBluetooth>,
 }
 
 /// The placed devices, the USB port a restore drives, and whether guest
@@ -2568,10 +2589,82 @@ fn takeover_part(detail: &str, stage: &'static &'static str) {
     super::step_watchdog::progress();
 }
 
+/// The `HOST POWER LIMITS` line (`stela_boot_core::host_power_limits`):
+/// on Intel the package's power limits in their model-specific registers,
+/// read through probes, and in the host bridge's memory-mapped copy, read
+/// through the mapping AML's SystemMemory fields use, before the PCI census
+/// as `pci_power` reads configuration. Nothing is written.
+fn report_power_limits(
+    acpi: Option<&'static super::aml::HostAcpi>,
+    mmio: Option<&'static crate::native_mmio::Source>,
+    root: u64,
+) {
+    use stela_boot_core::host_power_limits::{
+        IntelPackage, MMIO_POWER_LIMIT, amd_line, intel_line, mchbar,
+    };
+    let identity = core::arch::x86_64::__cpuid(0);
+    let intel =
+        (identity.ebx, identity.edx, identity.ecx) == (0x756e_6547, 0x4965_6e69, 0x6c65_746e);
+    if !intel {
+        if [identity.ebx, identity.edx, identity.ecx] == stela_boot_core::msr::AMD_VENDOR {
+            output::arguments(format_args!("{}", amd_line()));
+        }
+        return;
+    }
+    let limit = host::pmu::read(0x610);
+    // The memory-mapped copy, where the host bridge decodes MCHBAR and the
+    // package has the register copy at all.
+    let mmio_limit = (|| {
+        let (acpi, mmio) = (acpi?, mmio?);
+        limit?;
+        let bridge = stela_drivers::bus::pci::Address {
+            segment: 0,
+            bus: 0,
+            device: 0,
+            function: 0,
+        };
+        let config = |offset| mmio.read_firmware_config(bridge, offset, 4).ok();
+        // An Intel host bridge (class 06h, subclass 00h).
+        if config(0)? & 0xffff != 0x8086 || config(8)? >> 8 != 0x06_0000 {
+            return None;
+        }
+        let register = mchbar(config(0x48)?, config(0x4c)?)? + MMIO_POWER_LIMIT;
+        if !mmio.firmware_owned(register, register + 8) {
+            return None;
+        }
+        // SAFETY: the loader root, which AML's SystemMemory mappings use and
+        // which keeps the engine window, on the BSP whose local record is
+        // installed, as `gpu::keep_video_bios_table` enters it here.
+        let _root = unsafe { super::storage::RestoreRoot::enter(root) };
+        let pointer = acpi.firmware_memory(register, 8)?.cast::<u32>();
+        // SAFETY: the host bridge's register, outside RAM, mapped uncached
+        // by the call above; reads have no effect.
+        let (low, high) = unsafe { (pointer.read_volatile(), pointer.add(1).read_volatile()) };
+        Some(u64::from(high) << 32 | u64::from(low))
+    })();
+    let package_status = stela_boot_core::host_clock::PACKAGE_THERM_STATUS
+        .implemented()
+        // SAFETY: CPUID.06H:EAX[6] enumerates the register; reading has no
+        // effect.
+        .then(|| unsafe { stela_boot_core::host_clock::PACKAGE_THERM_STATUS.read() });
+    output::arguments(format_args!(
+        "{}",
+        intel_line(IntelPackage {
+            units: host::pmu::read(0x606),
+            limit,
+            mmio_limit,
+            info: host::pmu::read(0x614),
+            temperature_target: host::pmu::read(0x1a2),
+            package_status,
+        })
+    ));
+}
+
 fn start_platform(
     handoff: &'static Handoff,
     host_owner: &mut host::HostOwner,
     options: &Options,
+    native_processors: Option<&'static crate::native_smp::firmware::Capture>,
 ) -> Platform {
     // The owned MMIO permission the host devices' services map through. A
     // host it cannot check is reported, and those services refuse.
@@ -2597,6 +2690,23 @@ fn start_platform(
     static PCI_FUNCTIONS: &str = "taking over the PC's devices: stopping its PCI functions";
     static CONTROLLERS: &str =
         "taking over the PC's devices: DMA remapping units and interrupt controllers";
+    // First: from here every other processor answers the firmware's SMIs,
+    // which its AML, its services and its handlers of Stela's device
+    // accesses can raise (`park_before_firmware`).
+    static PROCESSORS: &str = "taking over the PC's devices: parking the other processors";
+    takeover_part("other processors", &PROCESSORS);
+    if let Some(capture) = native_processors {
+        // SAFETY: the installed boot processor in the engine's root with
+        // interrupts masked; no processor started from the startup page
+        // and no AML ran yet.
+        unsafe {
+            crate::native_smp::executor::park_before_firmware(
+                handoff,
+                capture,
+                super::step_watchdog::progress,
+            )
+        };
+    }
     takeover_part("memory-mapped registers", &REGISTERS);
     let activating = host::rdtsc();
     // SAFETY: this boot's capture, on the installed boot processor before
@@ -2722,6 +2832,7 @@ fn start_platform(
         takeover_part("PCI ports", &PCI_PORTS);
         super::pci_power::power_on_ports(acpi, mmio, handoff.tsc_hz);
     }
+    report_power_limits(host_acpi, native_mmio, handoff.root);
     // Retire the configuration census and park the contained function owners
     // before either SCI publication or remapper takeover.
     takeover_part("PCI functions", &PCI_FUNCTIONS);
@@ -3012,7 +3123,7 @@ fn start_devices(
     } = wanted;
     let mut fdr_device = None;
     let mut host_usb = None;
-    let host_bluetooth: Option<bluetooth::HostBluetooth> = None;
+    let mut host_bluetooth: Option<bluetooth::HostBluetooth> = None;
     let (services, medium, preboot, host_input, host_network, usb_disks, guest_network, host_disks) =
         if targets.is_empty()
             && options.install_source.is_none()
@@ -3237,18 +3348,18 @@ fn start_devices(
                 crate::status::info(super::firmware_requests::MISSING);
             }
             host_usb = Some(usb);
-            // macOS gets no Bluetooth controller. Its bluetoothd picks the
-            // guest's USB controller and never sends it a command, in every
-            // run with a host controller or the model, and Setup's Language
-            // Chooser then waits for bluetoothd with a black screen. Without
-            // a controller bluetoothd restarts and Setup goes on. The host's
-            // controller is released in the loader's root by its drop. The
-            // log says so once, with a host controller or without one.
-            if let Some(line) = stela_boot_core::guest_bluetooth::unsupported_line(
+            // The guest's controller is the model of Apple's internal USB
+            // module, for every boot with host input. The host's controller
+            // is not lent: the guest's function would carry the host's
+            // vendor commands and replies, which BlueTool's chip boot and
+            // bluetoothd's bring-up do not take. It is released in the
+            // loader's root by its drop. The log says so once.
+            if let Some(line) = stela_boot_core::guest_bluetooth::model_line(
                 host_controller.is_some(),
                 options.input,
             ) {
                 output::arguments(format_args!("{line}"));
+                host_bluetooth = Some(bluetooth::HostBluetooth::modeled(handoff.root));
             }
             drop(host_controller);
             // With no adapter started, the screen names each one found and

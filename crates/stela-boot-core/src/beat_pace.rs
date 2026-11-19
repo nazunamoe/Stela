@@ -1,12 +1,17 @@
 //! How often a running macOS writes its heartbeat. The full beat is a
-//! hundred lines or so, 14 to 25 KiB: every [`BEAT_SECONDS`] it fills the
-//! boot log's ring in under an hour, and the boot's own first lines go
-//! with it. A boot's first [`FULL_RATE_SECONDS`] keep that rate, which is
-//! when it starts, signs in and is measured. After them the full beat
-//! comes every [`LATE_BEAT_SECONDS`], over the whole interval since the
-//! last, and a short line every [`BEAT_SECONDS`] between says the guest
-//! still runs and where. Every [`IDENT_SECONDS`] one line repeats what the
-//! boot runs on ([`crate::boot_ident`]).
+//! hundred lines or so, 14 to 25 KiB on the PCs of the 0.5.0 reports and
+//! 36 to 98 KiB (46 at the median) on an 8-PE desktop measured 2026-11-18:
+//! every [`BEAT_SECONDS`] it writes about 2.8 MB in ten minutes. A boot's
+//! first [`FULL_RATE_SECONDS`] keep that rate, which is when it starts,
+//! signs in and is measured. Until [`LONG_RUN_SECONDS`] the full beat comes
+//! every [`LATE_BEAT_SECONDS`], about 3.4 MB an hour with the rest of the
+//! lines, and after that every [`LONG_BEAT_SECONDS`], about 0.8 MB an
+//! hour: so a day's run is about 24 MB, which the USB's log holds whole
+//! (`stela_runtime::pc::boot_log::FILE_BYTES`), and its last hour is never
+//! overwritten. Each full beat covers the whole interval since the last,
+//! and a short line every [`BEAT_SECONDS`] between says the guest still
+//! runs and where. Every [`IDENT_SECONDS`] one line repeats what the boot
+//! runs on ([`crate::boot_ident`]).
 //!
 //! `--profile` keeps the full beat every [`BEAT_SECONDS`]: its reports are
 //! read by the interval.
@@ -17,6 +22,10 @@ pub const BEAT_SECONDS: u64 = 10;
 pub const FULL_RATE_SECONDS: u64 = 600;
 /// Seconds between full beats after that.
 pub const LATE_BEAT_SECONDS: u64 = 60;
+/// Seconds of a boot's run after which full beats are further apart.
+pub const LONG_RUN_SECONDS: u64 = 3600;
+/// Seconds between full beats after [`LONG_RUN_SECONDS`].
+pub const LONG_BEAT_SECONDS: u64 = 600;
 /// Seconds between the boot's identity lines.
 pub const IDENT_SECONDS: u64 = 600;
 
@@ -34,8 +43,10 @@ pub enum Due {
 pub const fn full_seconds(ran: u64, profiling: bool) -> u64 {
     if profiling || ran < FULL_RATE_SECONDS {
         BEAT_SECONDS
-    } else {
+    } else if ran < LONG_RUN_SECONDS {
         LATE_BEAT_SECONDS
+    } else {
+        LONG_BEAT_SECONDS
     }
 }
 
@@ -115,6 +126,36 @@ mod tests {
         let full = late.iter().filter(|(_, due)| *due == Due::Full).count();
         let short = late.iter().filter(|(_, due)| *due == Due::Short).count();
         assert_eq!((full, short), (5, 26));
+    }
+
+    #[test]
+    fn after_an_hour_the_full_beat_comes_every_ten_minutes_with_short_lines_between() {
+        let lines = run(3 * 3600, false, |_| true);
+        let late: Vec<_> = lines
+            .iter()
+            .filter(|(at, _)| *at >= LONG_RUN_SECONDS)
+            .copied()
+            .collect();
+        let full: Vec<_> = late
+            .iter()
+            .filter(|(_, due)| *due == Due::Full)
+            .map(|(at, _)| *at)
+            .collect();
+        // The last full beat of the hour before was at 3590.
+        assert_eq!(full[..3], [4190, 4790, 5390]);
+        assert!(
+            full.windows(2)
+                .all(|pair| pair[1] - pair[0] == LONG_BEAT_SECONDS)
+        );
+        // A line every 10 s, as before: two hours of them, both ends in.
+        assert_eq!(late.len(), 721);
+        assert!(
+            late.windows(2)
+                .all(|pair| pair[1].0 - pair[0].0 == BEAT_SECONDS)
+        );
+        assert_eq!(full_seconds(3599, false), 60);
+        assert_eq!(full_seconds(3600, false), 600);
+        assert_eq!(full_seconds(36_000, true), 10);
     }
 
     #[test]

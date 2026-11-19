@@ -159,7 +159,7 @@ impl AppleDevices {
             network,
             bluetooth,
         } = cables;
-        let extras = usize::from(network.is_some()) + usize::from(bluetooth);
+        let extras = usize::from(network.is_some()) + usize::from(bluetooth.is_some());
         if 1 + extras + disks.len() > hub::MAX_PORTS {
             return Err(refuse!("the native hub has seven ports"));
         }
@@ -178,7 +178,10 @@ impl AppleDevices {
         let attachments = Attachments {
             input: Peripheral::new(),
             network,
-            bluetooth: bluetooth.then(Hci::new),
+            bluetooth: bluetooth.map(|kind| match kind {
+                UsbBluetooth::Host => Hci::new(),
+                UsbBluetooth::Model => Hci::modeled(crate::usb::hci::model::address(self.ecid)),
+            }),
             disks,
         };
         master.peripheral = Some(Hub::new(attachments, "0001")?);
@@ -243,23 +246,20 @@ impl AppleDevices {
         self.usb_bluetooth()?.take()
     }
 
-    /// Answers the guest's Bluetooth controller with the controller model,
-    /// for a host that lends none; its BD_ADDR derives from the board's
-    /// ECID. The address, or `None` without a controller.
-    pub fn bluetooth_model(&mut self) -> Option<[u8; 6]> {
-        let address = crate::usb::hci::model::address(self.ecid);
-        let hci = self.usb_bluetooth()?;
-        if !hci.modeled() {
-            hci.use_model(address);
-        }
-        Some(address)
-    }
-
     /// Opcodes the modeled controller answered Unknown HCI Command, each
     /// once.
     pub fn bluetooth_unknown(&mut self) -> Vec<u16> {
         self.usb_bluetooth()
             .map(|hci| hci.take_unknown())
+            .unwrap_or_default()
+    }
+
+    /// The Bluetooth function's trace for the owner's log since it was
+    /// last taken: configurations, resets and the first commands after each
+    /// configuration.
+    pub fn bluetooth_trace(&mut self) -> Vec<UsbBluetoothTrace> {
+        self.usb_bluetooth()
+            .map(|hci| hci.take_trace())
             .unwrap_or_default()
     }
 

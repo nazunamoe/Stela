@@ -487,6 +487,21 @@ impl<R: Registers, D: Delay> Phy<R, D> {
             }
         })
     }
+    /// `registers` read in one transaction for a state report: a register
+    /// the PHY does not answer is `None`, not a failure of the transport.
+    pub fn peek(&mut self, registers: &[Register]) -> Result<alloc::vec::Vec<Option<u16>>, Error> {
+        self.transaction(|this| {
+            let mut values = alloc::vec::Vec::with_capacity(registers.len());
+            for &register in registers {
+                values.push(match this.access(register, None) {
+                    Ok(value) => Some(value),
+                    Err(Fault::MdicTimeout | Fault::MdicResponse(_)) => None,
+                    Err(error) => return Err(error),
+                });
+            }
+            Ok(values)
+        })
+    }
     /// `e1000_phy_is_accessible_pchlan`'s identity read: whether the PHY
     /// answers with a valid ID, tried twice with MDIC retries off. A PHY that
     /// does not answer is an answer, not a failure of the transport.

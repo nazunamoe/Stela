@@ -6,7 +6,9 @@ use alloc::{rc::Rc, vec};
 use core::cell::{Cell, RefCell};
 mod elantech_tests;
 mod observation_tests;
+mod presence_tests;
 mod timing_tests;
+mod translation_tests;
 
 #[test]
 fn idle_poll_reads_status_once_and_still_checks_a_silent_prefix() {
@@ -31,6 +33,42 @@ fn idle_poll_reads_status_once_and_still_checks_a_silent_prefix() {
     assert!(controller.poll().unwrap().is_empty());
     assert_eq!(controller.framing_errors(), 1);
     assert!(controller.is_ready());
+}
+
+#[test]
+fn the_bytes_each_port_gave_and_the_controller_state_are_counted_for_the_log() {
+    let (mut controller, hardware) = controller(Config::default());
+    controller.initialize().unwrap();
+    let start = controller.bytes_read();
+    hardware
+        .borrow_mut()
+        .output
+        .extend([(Port::Keyboard, 0x1c, 0), (Port::Keyboard, 0xf0, 0)]);
+    hardware
+        .borrow_mut()
+        .output
+        .push_back((Port::Keyboard, 0x1c, 0));
+    let inputs = controller.poll().unwrap();
+    assert!(!inputs.is_empty());
+    assert_eq!(controller.bytes_read()[0] - start[0], 3);
+    assert_eq!(controller.bytes_read()[1], start[1]);
+    let (status, config) = controller.controller_state();
+    assert!(status.is_some());
+    let config = config.expect("the start read the configuration byte");
+    let line = describe_controller(status, Some(config));
+    assert!(line.contains("keyboard port on"), "{line}");
+    assert_eq!(standing_status(0x1d), 0x14);
+    assert_eq!(standing_status(0xff), 0xff);
+    assert_eq!(
+        describe_controller(Some(0x04), Some(0x64)),
+        "status 04 (system flag on, keyboard inhibited, last byte's timeout off and parity \
+         error off), configuration 64 (keyboard port on, mouse port off, translation on, \
+         keyboard interrupt off, mouse interrupt off)"
+    );
+    assert_eq!(
+        describe_controller(Some(0xff), None),
+        "status ff (no controller answers), configuration not read"
+    );
 }
 
 #[test]
@@ -132,6 +170,18 @@ fn a_mouse_port_sending_only_framed_bytes_fails_alone() {
 }
 mod synaptics_tests;
 
+/// The set-1 code an i8042 translates each set-2 code below 0x80 to.
+const I8042_TRANSLATION: [u8; 128] = [
+    0xff, 0x43, 0x41, 0x3f, 0x3d, 0x3b, 0x3c, 0x58, 0x64, 0x44, 0x42, 0x40, 0x3e, 0x0f, 0x29, 0x59,
+    0x65, 0x38, 0x2a, 0x70, 0x1d, 0x10, 0x02, 0x5a, 0x66, 0x71, 0x2c, 0x1f, 0x1e, 0x11, 0x03, 0x5b,
+    0x67, 0x2e, 0x2d, 0x20, 0x12, 0x05, 0x04, 0x5c, 0x68, 0x39, 0x2f, 0x21, 0x14, 0x13, 0x06, 0x5d,
+    0x69, 0x31, 0x30, 0x23, 0x22, 0x15, 0x07, 0x5e, 0x6a, 0x72, 0x32, 0x24, 0x16, 0x08, 0x09, 0x5f,
+    0x6b, 0x33, 0x25, 0x17, 0x18, 0x0b, 0x0a, 0x60, 0x6c, 0x34, 0x35, 0x26, 0x27, 0x19, 0x0c, 0x61,
+    0x6d, 0x73, 0x28, 0x74, 0x1a, 0x0d, 0x62, 0x6e, 0x3a, 0x36, 0x1c, 0x1b, 0x75, 0x2b, 0x63, 0x76,
+    0x55, 0x56, 0x77, 0x78, 0x79, 0x7a, 0x0e, 0x7b, 0x7c, 0x4f, 0x7d, 0x4b, 0x47, 0x7e, 0x7f, 0x6f,
+    0x52, 0x53, 0x50, 0x4c, 0x4d, 0x48, 0x01, 0x45, 0x57, 0x4e, 0x51, 0x4a, 0x37, 0x49, 0x46, 0x54,
+];
+
 #[derive(Clone)]
 struct Model(Rc<RefCell<Hardware>>);
 struct Hardware {
@@ -157,6 +207,17 @@ struct Hardware {
     after_self_test: Vec<u8>,
     interface_test: u8,
     translation_stuck: bool,
+    /// A translating controller holds a set-2 F0 for the next byte.
+    translated_break: bool,
+    /// Configuration bytes the first reads give instead of the real one.
+    unsettled_config: VecDeque<u8>,
+    /// The controller loops a byte back to the auxiliary port's output.
+    aux_loop: bool,
+    loop_write: bool,
+    /// The keyboard answers no command, yet sends its keys.
+    keyboard_mute: bool,
+    /// The keyboard's GETID answer after its ACK.
+    keyboard_id: Vec<u8>,
     busy_forever: bool,
     flood: bool,
     resend: Option<(Port, u8, usize)>,
@@ -181,7 +242,7 @@ impl Hardware {
             time,
             busy_until: None,
             output: VecDeque::new(),
-            config: TRANSLATION | IRQ_BITS,
+            config: IRQ_BITS,
             config_write: false,
             mouse_write: false,
             argument: [None, None],
@@ -199,6 +260,12 @@ impl Hardware {
             after_self_test: Vec::new(),
             interface_test: 0,
             translation_stuck: false,
+            translated_break: false,
+            unsettled_config: VecDeque::new(),
+            aux_loop: true,
+            loop_write: false,
+            keyboard_mute: false,
+            keyboard_id: vec![0xab, 0x83],
             busy_forever: false,
             flood: false,
             resend: None,
@@ -216,8 +283,33 @@ impl Hardware {
             delay_at_read: alloc::collections::BTreeMap::new(),
         }
     }
+    /// A byte the device sends; a translating controller hands a keyboard
+    /// byte over in set 1, with a set-2 F0 folded into the next byte's bit 7.
     fn emit(&mut self, port: Port, data: u8) {
+        if port == Port::Keyboard && self.config & TRANSLATION != 0 {
+            if data == 0xf0 {
+                self.translated_break = true;
+                return;
+            }
+            let data = match data {
+                0..0x80 => I8042_TRANSLATION[usize::from(data)],
+                0x83 => 0x41,
+                0x84 => 0x54,
+                _ => data,
+            };
+            let release = if core::mem::take(&mut self.translated_break) {
+                0x80
+            } else {
+                0
+            };
+            self.output.push_back((port, data | release, 0));
+            return;
+        }
         self.output.push_back((port, data, 0));
+    }
+    /// A byte the controller itself answers with, never translated.
+    fn reply(&mut self, data: u8) {
+        self.output.push_back((Port::Keyboard, data, 0));
     }
     fn input_busy(&self) -> bool {
         self.busy_forever
@@ -230,6 +322,9 @@ impl Hardware {
         if port == Port::Mouse { 1 } else { 0 }
     }
     fn device(&mut self, port: Port, data: u8) {
+        if port == Port::Keyboard && self.keyboard_mute {
+            return;
+        }
         if port == Port::Mouse
             && data == DISABLE_REPORTING
             && self.scanning[1]
@@ -478,8 +573,9 @@ impl Hardware {
             }
             // An MF2 keyboard's ID, unless it does not answer GETID.
             GET_ID if self.no_ack != Some((port, GET_ID)) => {
-                self.emit(port, 0xab);
-                self.emit(port, 0x83);
+                for byte in self.keyboard_id.clone() {
+                    self.emit(port, byte);
+                }
             }
             GET_ID => {}
             // A mouse's status: disabled, resolution 2, 100 reports a second.
@@ -551,21 +647,21 @@ impl Registers for Model {
                     h.config & KEYBOARD_DISABLED != 0 || !h.scanning[0],
                     "CTR reply lane is not owned while a keyboard can report"
                 );
-                let config = h.config;
-                h.emit(Port::Keyboard, config);
+                let config = h.unsettled_config.pop_front().unwrap_or(h.config);
+                h.reply(config);
             }
             WRITE_CONFIG => h.config_write = true,
             SELF_TEST => {
                 let reply = h.self_test;
                 h.config = TRANSLATION | IRQ_BITS;
-                h.emit(Port::Keyboard, reply);
+                h.reply(reply);
                 for byte in core::mem::take(&mut h.after_self_test) {
                     h.emit(Port::Keyboard, byte);
                 }
             }
             TEST_KEYBOARD | TEST_MOUSE => {
                 let reply = h.interface_test;
-                h.emit(Port::Keyboard, reply);
+                h.reply(reply);
             }
             DISABLE_KEYBOARD => h.config |= KEYBOARD_DISABLED,
             DISABLE_MOUSE => h.config |= MOUSE_DISABLED,
@@ -579,6 +675,7 @@ impl Registers for Model {
             }
             ENABLE_MOUSE => h.config &= !MOUSE_DISABLED,
             SEND_MOUSE => h.mouse_write = true,
+            AUX_LOOP => h.loop_write = true,
             _ => panic!("unknown controller command {value:x}"),
         }
     }
@@ -587,7 +684,11 @@ impl Registers for Model {
         assert!(!h.input_busy(), "write with IBF set");
         h.busy_until = Some(h.time.get().wrapping_add(1));
         h.writes.push((false, value));
-        if h.config_write {
+        if core::mem::take(&mut h.loop_write) {
+            if h.aux_loop {
+                h.emit(Port::Mouse, value);
+            }
+        } else if h.config_write {
             h.config_write = false;
             h.config = value | if h.translation_stuck { TRANSLATION } else { 0 };
         } else {
@@ -602,11 +703,7 @@ impl Registers for Model {
                 KEYBOARD_DISABLED
             };
             assert_eq!(h.config & bit, 0, "device command while clock disabled");
-            assert_eq!(
-                h.config & (IRQ_BITS | TRANSLATION),
-                0,
-                "IRQs/translation must be disabled"
-            );
+            assert_eq!(h.config & IRQ_BITS, 0, "IRQs must be disabled");
             h.device(port, value);
         }
     }
@@ -862,15 +959,30 @@ fn the_auxiliary_port_test_passes_with_fa_or_ff_as_linux_accepts() {
             ..Config::default()
         });
         h.borrow_mut().interface_test = reply;
+        h.borrow_mut().aux_loop = false;
         c.initialize().unwrap();
         assert!(!h.borrow().writes.contains(&(true, TEST_KEYBOARD)));
+        assert!(h.borrow().writes.contains(&(true, TEST_MOUSE)));
     }
+    // A controller that loops the byte back is not given the port test,
+    // whose error would not count.
     let (mut c, h) = controller(Config {
         keyboard: false,
         reset_on_start: false,
         ..Config::default()
     });
     h.borrow_mut().interface_test = 1;
+    c.initialize().unwrap();
+    assert!(h.borrow().writes.contains(&(true, AUX_LOOP)));
+    assert!(!h.borrow().writes.contains(&(true, TEST_MOUSE)));
+    assert!(c.is_ready());
+    let (mut c, h) = controller(Config {
+        keyboard: false,
+        reset_on_start: false,
+        ..Config::default()
+    });
+    h.borrow_mut().interface_test = 1;
+    h.borrow_mut().aux_loop = false;
     assert_eq!(
         c.initialize().unwrap_err().kind,
         ErrorKind::ControllerReply {
@@ -1186,7 +1298,10 @@ fn unsupported_interface_or_controller_state_is_read_back_and_refused() {
         let (mut c, h) = controller(Config::default());
         match mode {
             0 => h.borrow_mut().self_test = 0xfc,
-            1 => h.borrow_mut().interface_test = 1,
+            1 => {
+                h.borrow_mut().interface_test = 1;
+                h.borrow_mut().aux_loop = false;
+            }
             2 => h.borrow_mut().translation_stuck = true,
             _ => h.borrow_mut().force_id = Some(5),
         }
@@ -1385,9 +1500,11 @@ fn already_reporting_keyboard_cannot_alias_ctr_or_publish_old_scan_set_bytes() {
     h.borrow_mut().keyboard_on_enable = vec![0x0c, 0x1e, 0xe0, 0xf0];
     h.borrow_mut().after_self_test = vec![0x0c];
     c.initialize().unwrap();
-    assert_eq!(h.borrow().config, 4);
+    // The firmware's translation stays; its interrupts do not.
+    assert_eq!(h.borrow().config, TRANSLATION | 4);
     assert!(c.poll().unwrap().is_empty());
-    assert_eq!(c.discarded_before_start(), 5);
+    // The translating controller holds the old F0 for the next byte.
+    assert_eq!(c.discarded_before_start(), 4);
     // The first owned set2 input still decodes with fresh framing.
     emit(&h, Port::Keyboard, &[0x1c, 0xf0, 0x1c]);
     assert_eq!(

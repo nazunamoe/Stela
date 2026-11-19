@@ -43,6 +43,7 @@ use core::{
         AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
     },
 };
+use stela_boot_core::client_fault::{self, Place, Span, Unserved};
 use stela_boot_core::gpu_requests::{HostCall, Request as Code};
 use stela_boot_core::page_window::Cache;
 use stela_boot_core::posted_call::{self, Claim};
@@ -91,6 +92,9 @@ impl LibcClock {
 const EINVAL: i64 = -22;
 const ENODEV: i64 = -19;
 const EFAULT: i64 = -14;
+/// A refault of a page no client's mapping covers: Linux's fault handler
+/// finds no VMA there.
+const ENXIO: i64 = -6;
 const ENOMEM: i64 = -12;
 const EAGAIN: i64 = -11;
 const ETIMEDOUT: i64 = -110;
@@ -531,7 +535,9 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                 result
             }
             Operation::Unmap(address) => {
-                let Some((mapping, pages)) = gpu.mappings.borrow_mut().remove(&address) else {
+                let Some(ClientMap { mapping, pages, .. }) =
+                    gpu.mappings.borrow_mut().remove(&address)
+                else {
                     return EFAULT;
                 };
                 client::unmap(mapping);
@@ -544,16 +550,30 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
             }
             Operation::Fault { address, write } => {
                 let mappings = gpu.mappings.borrow();
-                let found = mappings.range(..=address).next_back();
-                let Some((&start, &(mapping, pages))) = found else {
-                    return EFAULT;
+                let span = |(&start, map): (&u64, &ClientMap)| map.span(start);
+                let below = mappings.range(..=address).next_back();
+                let above = mappings.range(address.saturating_add(1)..).next();
+                let place = client_fault::place(below.map(span), above.map(span), address);
+                let result = match place {
+                    Place::Inside { .. } => {
+                        let (_, map) = below.expect("a place inside has its mapping");
+                        if client::fill_around(map.mapping, address, write) {
+                            return 0;
+                        }
+                        EFAULT
+                    }
+                    Place::Outside { .. } => ENXIO,
                 };
-                if address >= start + pages as u64 * PAGE
-                    || !client::fill_around(mapping, address, write)
-                {
-                    return EFAULT;
-                }
-                0
+                // No allocation: the faulting code may hold the heap's lock.
+                output::arguments(format_args!(
+                    "GPU {}\n",
+                    Unserved {
+                        address,
+                        write,
+                        place
+                    }
+                ));
+                result
             }
             Operation::Thread(_) => unreachable!("a thread runs in its original managed child"),
             Operation::Export(runs, count) => {
@@ -604,13 +624,41 @@ unsafe fn map_pages(gpu: &Installed, fd: c_int, offset: u64, size: usize) -> i64
     // SAFETY: as the function's; the window reserved `address` for it.
     match unsafe { client::map(fd, address, size, offset) } {
         Ok(mapping) => {
-            gpu.mappings.borrow_mut().insert(address, (mapping, pages));
+            gpu.mappings.borrow_mut().insert(
+                address,
+                ClientMap {
+                    mapping,
+                    pages,
+                    fd,
+                    offset,
+                },
+            );
             MAPPINGS.fetch_add(1, Ordering::Relaxed);
             address as i64
         }
         Err(error) => {
             gpu.window.release(address, pages);
             error.into()
+        }
+    }
+}
+
+/// A client's mapping of a file in the window.
+pub(super) struct ClientMap {
+    mapping: client::Mapping,
+    pages: usize,
+    /// The descriptor and file offset it maps, which name it in a line.
+    fd: c_int,
+    offset: u64,
+}
+
+impl ClientMap {
+    fn span(&self, start: u64) -> Span {
+        Span {
+            start,
+            pages: self.pages as u64,
+            fd: self.fd,
+            offset: self.offset,
         }
     }
 }
@@ -1765,10 +1813,39 @@ fn device_control(fd: c_int) -> impl FnMut(u32, *mut c_void) -> i32 {
 /// the window a map or an earlier fault filled, or one Linux unmapped as it
 /// moved the buffer behind it. For the #PF handler, which leaves the fault,
 /// and the fill of the rest of its window, to the faulting context
-/// ([`serve_moved`]).
+/// ([`serve_moved`]). A guard page of a stack in the window is no client's:
+/// that fault is the host code's own, and stops as one.
 pub(in crate::engine) fn client_fault(address: u64) -> bool {
-    installed()
-        .is_some_and(|gpu| gpu.window.contains(address) && MAPPINGS.load(Ordering::Relaxed) != 0)
+    installed().is_some_and(|gpu| {
+        gpu.window.contains(address)
+            && MAPPINGS.load(Ordering::Relaxed) != 0
+            && stack::guard_hit(address).is_none()
+    })
+}
+
+/// For the #PF handler's stop: says, on the port, that `address` is a guard
+/// page of a stack in the window, and which side, before the fault's own
+/// report names the code. It neither allocates nor waits, as the faulting
+/// code may hold the heap's lock.
+pub(in crate::engine) fn note_stack_guard(address: u64) {
+    use core::fmt::Write;
+    let Some(hit) = stack::guard_hit(address) else {
+        return;
+    };
+    let _ = writeln!(
+        crate::serial::Serial,
+        "GPU STACK GUARD fault at {address:#x}: the absent page {} the GPU stack \
+         {:#x}..{:#x} ({} KiB); {}",
+        if hit.above { "above" } else { "below" },
+        hit.usable.start,
+        hit.usable.end,
+        (hit.usable.end - hit.usable.start) >> 10,
+        if hit.above {
+            "code read past the stack's top"
+        } else {
+            "the stack overflowed"
+        },
+    );
 }
 
 /// Client faults served so far, for the report of the first and of each
@@ -1800,6 +1877,17 @@ pub(in crate::engine) fn serve_moved(address: u64, write: bool, rip: u64) {
         ));
     }
     let result = submit(Operation::Fault { address, write });
+    if result == ENXIO {
+        // The line before says which mappings are near. The host code's own
+        // error, as Linux's kernel faulting with no VMA and no fixup: no
+        // client's operation can fail for it.
+        output::fatal(format_args!(
+            "host code at +{:#x} on processor {} faulted at {address:#x}, a page of the GPU \
+             window that no client maps",
+            image_offset(rip),
+            host::processor()
+        ));
+    }
     if result != 0 {
         output::fatal(format_args!(
             "a GPU client fault at {address:#x} from +{:#x} on processor {} was not \

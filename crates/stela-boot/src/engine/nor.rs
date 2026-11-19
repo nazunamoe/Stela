@@ -415,7 +415,8 @@ pub(crate) fn open_log(disk: &Shared, block: u64, available: u64) -> bool {
         disk.window(boot_log::OFFSET / block, boot_log::LOG_BYTES / block)
             .expect("the partition holds the log region"),
     );
-    let writer = match boot_log::Writer::open(&mut *device) {
+    let note = format!("version={}", env!("CARGO_PKG_VERSION"));
+    let writer = match boot_log::Writer::open_noted(&mut *device, &note) {
         Ok(writer) => writer,
         Err(error @ (BlockError::Unsupported(_) | BlockError::ReadOnly)) => {
             output::arguments(format_args!("BOOT LOG off: {error}\n"));
@@ -428,6 +429,11 @@ pub(crate) fn open_log(disk: &Shared, block: u64, available: u64) -> bool {
     };
     if let Some(reason) = writer.fresh() {
         output::arguments(format_args!("BOOT LOG fresh: {reason}\n"));
+    }
+    if writer.restored() {
+        output::arguments(format_args!(
+            "BOOT LOG header did not decode; its copy did and names the log\n"
+        ));
     }
     if writer.converted() {
         output::arguments(format_args!(

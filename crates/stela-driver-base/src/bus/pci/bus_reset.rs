@@ -5,8 +5,8 @@
 //! device are admitted when the caller owns them: the reset stops them too,
 //! and their saved state is written back after it.
 use super::{
-    Address, BlockError, ConfigError, ConfigSpace, Function, HEADER_BRIDGE, SECONDARY_BUS, Saved,
-    express_offset, owned::OwnedConfig, power, regs, wait_ready,
+    Address, BlockError, ConfigError, ConfigSpace, Function, HEADER_BRIDGE, LinkPower,
+    SECONDARY_BUS, Saved, express_offset, owned::OwnedConfig, power, regs, wait_ready,
 };
 use alloc::vec::Vec;
 use core::cell::Cell;
@@ -138,14 +138,20 @@ where
         let express = sibling.express_offset()?;
         // A sibling's restore stays within the writes it admits
         // (`admit_restore`), which name no Resizable BAR control.
-        saved.push(Saved::save(&sibling.config, express, None)?);
+        saved.push(Saved::save(
+            &sibling.config,
+            express,
+            None,
+            LinkPower::default(),
+        )?);
     }
     let own = function.express_offset()?;
     let rebar = match own {
         Some(_) => function.extended_capability(super::EXTENDED_REBAR)?,
         None => None,
     };
-    let first = Saved::save(&function.config, own, rebar)?;
+    let power = function.link_power(own)?;
+    let first = Saved::save(&function.config, own, rebar, power)?;
     first.disable(&mut function.config)?;
     let slot = match express {
         Some(express) => mask_slot(bridge, express)?,

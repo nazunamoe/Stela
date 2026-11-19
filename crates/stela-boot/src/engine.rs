@@ -48,6 +48,7 @@ mod service;
 mod services;
 mod session;
 mod speculation;
+pub(crate) mod speed;
 mod step_watchdog;
 pub(crate) use step_watchdog::alone_idle_stage;
 pub(crate) mod storage;

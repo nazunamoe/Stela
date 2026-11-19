@@ -222,10 +222,64 @@ impl Disk {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Table {
     pub disk_guid: Guid,
     pub partitions: Vec<Partition>,
+    /// The entry each partition is in, in the order of `partitions`, as
+    /// [`parse_entries`] read them; empty for a table made in memory, whose
+    /// partitions take the entries in order. Systems number a partition by
+    /// its entry (Linux's `nvme0n1p3` is the third, and a UEFI boot entry's
+    /// `HD()` node names it), so [`encode`] keeps each partition in its
+    /// entry: a rewrite that moved one would renumber it.
+    pub slots: Vec<u32>,
+}
+
+/// Tables are equal when they put the same partitions in the same entries:
+/// no slots and slots naming each entry in order are one layout.
+impl PartialEq for Table {
+    fn eq(&self, other: &Self) -> bool {
+        self.disk_guid == other.disk_guid
+            && self.partitions == other.partitions
+            && (0..self.partitions.len()).all(|index| self.slot(index) == other.slot(index))
+    }
+}
+
+impl Eq for Table {}
+
+impl Table {
+    /// The entry partition `index` is in.
+    pub fn slot(&self, index: usize) -> u32 {
+        match self.slots.get(index) {
+            Some(&slot) if self.slots.len() == self.partitions.len() => slot,
+            _ => index as u32,
+        }
+    }
+
+    /// Remove partition `index`; every other partition keeps its entry.
+    pub fn remove(&mut self, index: usize) -> Partition {
+        self.pin_slots();
+        self.slots.remove(index);
+        self.partitions.remove(index)
+    }
+
+    /// Add `partition` in the first unused entry; every other partition
+    /// keeps its own.
+    pub fn add(&mut self, partition: Partition) {
+        self.pin_slots();
+        let free = (0..)
+            .find(|slot| !self.slots.contains(slot))
+            .expect("fewer partitions than u32 entries");
+        self.slots.push(free);
+        self.partitions.push(partition);
+    }
+
+    /// Name every partition's entry, so a change to the list keeps them.
+    fn pin_slots(&mut self) {
+        if self.slots.len() != self.partitions.len() {
+            self.slots = (0..self.partitions.len() as u32).collect();
+        }
+    }
 }
 
 /// The IEEE CRC-32 of GPT headers and entry arrays.
@@ -307,7 +361,11 @@ pub fn parse_entries(info: &HeaderInfo, bytes: &[u8]) -> Result<Table, PayloadEr
         return Err(PayloadError::Disk("GPT entry array CRC mismatch"));
     }
     let mut partitions = Vec::new();
-    for entry in bytes[..length].chunks(info.entry_bytes as usize) {
+    let mut slots = Vec::new();
+    for (slot, entry) in bytes[..length]
+        .chunks(info.entry_bytes as usize)
+        .enumerate()
+    {
         let type_guid = guid_at(entry, 0);
         if type_guid.is_zero() {
             continue;
@@ -332,10 +390,12 @@ pub fn parse_entries(info: &HeaderInfo, bytes: &[u8]) -> Result<Table, PayloadEr
             return Err(PayloadError::Disk("GPT entry outside the usable range"));
         }
         partitions.push(partition);
+        slots.push(slot as u32);
     }
     Ok(Table {
         disk_guid: info.disk_guid,
         partitions,
+        slots,
     })
 }
 
@@ -439,6 +499,7 @@ pub fn plan(
         None => Table {
             disk_guid: Guid::from_entropy(entropy()),
             partitions: Vec::new(),
+            slots: Vec::new(),
         },
     };
     let fixed = [
@@ -452,9 +513,7 @@ pub fn plan(
         if first + count > end {
             return Err(PayloadError::Disk("target disk is too small"));
         }
-        table
-            .partitions
-            .push(new_partition(role, first, count, &mut entropy));
+        table.add(new_partition(role, first, count, &mut entropy));
         next = first + count;
     }
     let first = align_up(next, alignment);
@@ -464,7 +523,7 @@ pub fn plan(
             "target disk leaves too little space for the Apple region",
         ));
     }
-    table.partitions.push(new_partition(
+    table.add(new_partition(
         Role::AppleRegion,
         first,
         last - first,
@@ -510,10 +569,18 @@ pub fn encode(disk: Disk, table: &Table) -> Result<Vec<Write>, PayloadError> {
     }
     let block = disk.block_bytes as usize;
     let mut entries = vec![0u8; ENTRY_ARRAY_BYTES as usize];
-    for (slot, partition) in entries
-        .chunks_mut(ENTRY_BYTES as usize)
-        .zip(&table.partitions)
-    {
+    let mut taken = [false; ENTRY_COUNT as usize];
+    for (index, partition) in table.partitions.iter().enumerate() {
+        let number = table.slot(index) as usize;
+        if number >= ENTRY_COUNT as usize {
+            return Err(PayloadError::Disk(
+                "a partition is in an entry past the 128 this table holds",
+            ));
+        }
+        if core::mem::replace(&mut taken[number], true) {
+            return Err(PayloadError::Disk("two partitions in one entry"));
+        }
+        let slot = &mut entries[number * ENTRY_BYTES as usize..][..ENTRY_BYTES as usize];
         if partition.first_lba < disk.first_usable()
             || partition.last_lba > disk.last_usable()
             || partition.first_lba > partition.last_lba

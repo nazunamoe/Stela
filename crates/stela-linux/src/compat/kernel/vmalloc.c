@@ -260,7 +260,6 @@ void *kvrealloc_node_align_noprof(const void *object, DECL_TOKEN_PARAMS(size, to
 static u8 memory[PAGES * PAGE_SIZE] __aligned(PAGE_SIZE);
 static size_t next_page;
 static u64 pin_physical[PAGES];
-static unsigned int released;
 static bool exhausted;
 
 static int validate(void *context, u32 gfp, unsigned int order, bool atomic)
@@ -294,7 +293,6 @@ static void release(void *context, void *pin)
 {
 	(void)context;
 	(void)pin;
-	released++;
 }
 
 static const struct stela_linux_page_ops ops = {

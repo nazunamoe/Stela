@@ -332,7 +332,7 @@ fn a_pending_overflow_is_reported_in_the_stream() {
 
     // The writer's own buffer between flushes.
     let mut disk = Recorder::new(HEADER_BYTES + 4 * 4096, 512);
-    let mut writer = Writer::with_pending(&mut disk, 64, true).unwrap();
+    let mut writer = Writer::with_pending(&mut disk, 64, Some("")).unwrap();
     for line in 0..10 {
         writer.append(format!("line {line:02}\n").as_bytes());
     }
@@ -352,7 +352,9 @@ fn a_blank_or_invalid_header_starts_a_fresh_log_and_the_reader_refuses_it() {
     let mut writer = Writer::open(&mut disk).unwrap();
     writer.append(b"old boot\n");
     writer.flush(&mut disk).unwrap();
-    let good = disk.disk.bytes.clone();
+    // Without the header's copy, as a writer older than it left the log.
+    let mut good = disk.disk.bytes.clone();
+    good[COPY_AT as usize..HEADER_BYTES as usize].fill(0);
 
     let damage = |offset: usize| {
         let mut bytes = good.clone();
@@ -513,7 +515,7 @@ fn small_disk(block: u32) -> Recorder {
 }
 
 fn open_small(disk: &mut Recorder, new_boot: bool) -> Writer {
-    Writer::with_layout(disk, PENDING_BYTES, new_boot, SMALL).unwrap()
+    Writer::with_layout(disk, PENDING_BYTES, new_boot.then_some(""), SMALL).unwrap()
 }
 
 /// `count` numbered lines of 12 bytes from `from`.
@@ -861,4 +863,449 @@ fn a_record_that_does_not_start_with_its_boot_is_not_read() {
     let at = SMALL.record_at(1) as usize;
     disk.disk.bytes[at..at + 12].copy_from_slice(b"line 000999\n");
     assert!(disk.log().unwrap().starts.is_empty());
+}
+
+/// A store that fails part way, as a USB stick that times out once, loses
+/// no line: the next store writes the ring blocks it did not, before the
+/// header that counts them.
+#[test]
+fn a_failed_store_s_lines_are_written_by_the_next() {
+    for block in [512, 4096] {
+        for allowed in 0..4 {
+            let mut disk = small_disk(block);
+            let mut writer = open_small(&mut disk, true);
+            writer.append(&lines(0, 100));
+            writer.flush(&mut disk).unwrap();
+            // Several blocks of lines, the ring turned past its end.
+            writer.append(&lines(100, 3000));
+            disk.writes_left = Some(allowed);
+            assert_eq!(writer.flush(&mut disk), Err(BlockError::Timeout));
+            disk.writes_left = None;
+            writer.append(&lines(3100, 10));
+            writer.flush(&mut disk).unwrap();
+            let mut stream = b"=== STELA BOOT 1 ===\n".to_vec();
+            stream.extend_from_slice(&lines(0, 3110));
+            let log = disk.log().unwrap();
+            let ring = SMALL.ring_bytes as usize;
+            assert_eq!(
+                text(&log),
+                String::from_utf8(stream[stream.len() - ring..].to_vec()).unwrap(),
+                "{block} {allowed}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_log_file_s_region_is_its_whole_pages_up_to_the_longest() {
+    assert_eq!(file_region(LOG_BYTES - 1), None);
+    assert_eq!(file_region(LOG_BYTES), Some(LOG_BYTES));
+    assert_eq!(file_region(LOG_BYTES + 100), Some(LOG_BYTES));
+    assert_eq!(file_region(FILE_BYTES), Some(FILE_BYTES));
+    assert_eq!(file_region((33 << 20) + 4095), Some(33 << 20));
+    assert_eq!(file_region(1 << 30), Some(MAX_FILE_BYTES));
+    // The region a machine-state partition holds keeps its layout, so
+    // every log written before stays readable.
+    assert_eq!(Layout::of(LOG_BYTES).ring_bytes, 3_141_632);
+    assert_eq!(Layout::of(LOG_BYTES).records, RECORDS);
+    // A long file: larger records for more boots, the rest ring.
+    let large = Layout::of(FILE_BYTES);
+    assert_eq!(
+        (large.records, large.first_bytes, large.last_bytes),
+        (LARGE_RECORDS, 384 << 10, 64 << 10)
+    );
+    assert_eq!(
+        large.ring_bytes,
+        FILE_BYTES - HEADER_BYTES - ((16 * 448) << 10)
+    );
+    for region in [LARGE_BYTES, FILE_BYTES, 20 << 20, MAX_FILE_BYTES] {
+        for block in [512, 4096] {
+            assert!(Layout::of(region).fits(region, block), "{region} {block}");
+        }
+    }
+    // Its header names every record in its first block.
+    assert!(FIELDS + LARGE_RECORDS as usize * RECORD_FIELDS + 32 <= 512);
+}
+
+/// A boot on a long log file keeps up to 384 KiB of its first lines, all
+/// it prints before macOS starts, past the ring's turn.
+#[test]
+fn a_long_log_file_keeps_each_boot_s_first_lines_whole() {
+    let mut disk = Recorder::new(FILE_BYTES, 512);
+    let mut writer = Writer::open(&mut disk).unwrap();
+    assert_eq!(writer.layout(), Layout::of(FILE_BYTES));
+    // A head of 300 KB, then more than the ring.
+    let head = lines(0, 25_000);
+    writer.append(&head);
+    writer.flush(&mut disk).unwrap();
+    let ring = writer.ring_bytes() as usize;
+    let mut written = head.len();
+    let mut next = 25_000;
+    while written < ring + (1 << 20) {
+        let chunk = lines(next, 20_000);
+        next += 20_000;
+        written += chunk.len();
+        writer.append(&chunk);
+        writer.flush(&mut disk).unwrap();
+    }
+    let log = disk.log().unwrap();
+    assert_eq!(log.ring_bytes, ring as u64);
+    assert!(log.overwritten() > 0);
+    let [start] = &log.starts[..] else {
+        panic!("{}", log.starts.len());
+    };
+    let mut expected = b"=== STELA BOOT 1 ===\n".to_vec();
+    expected.extend_from_slice(&head);
+    assert!(start.first.len() > head.len() && start.first.starts_with(&expected));
+    assert_eq!(log.kept_starts().count(), 1);
+}
+
+/// `stela` makes a 4 MiB log file 32 MiB long: every line it held stays
+/// at its position, each kept boot's record goes with it, and the next
+/// boot writes on.
+#[test]
+fn a_log_laid_out_again_in_a_longer_file_keeps_its_lines_and_records() {
+    let mut disk = Recorder::new(LOG_BYTES, 512);
+    // Ten boots of 600 KB each: the 3 MiB ring has turned, eight records.
+    let mut next = 0;
+    for _ in 0..10 {
+        let mut writer = Writer::open(&mut disk).unwrap();
+        for _ in 0..5 {
+            writer.append(&lines(next, 10_000));
+            next += 10_000;
+            writer.flush(&mut disk).unwrap();
+        }
+    }
+    let old = disk.log().unwrap();
+    assert_eq!(old.starts.len(), 8);
+    assert!(old.overwritten() > 0);
+    let grown = relayout(&disk.disk.bytes, FILE_BYTES).unwrap();
+    let new = read(&grown).unwrap();
+    assert_eq!((new.boots, new.head), (old.boots, old.head));
+    assert_eq!(new.ring_bytes, Layout::of(FILE_BYTES).ring_bytes);
+    assert_eq!(new.stream, old.stream);
+    assert_eq!(new.starts, old.starts);
+    // The next boot opens it as it is and fills the last boot's record.
+    let mut disk = Recorder::new(FILE_BYTES, 512);
+    disk.disk.bytes.copy_from_slice(&grown);
+    let mut writer = Writer::open(&mut disk).unwrap();
+    assert!(writer.fresh().is_none());
+    writer.append(b"after the change\n");
+    writer.flush(&mut disk).unwrap();
+    let log = disk.log().unwrap();
+    assert!(log.stream.starts_with(&old.stream));
+    assert!(
+        log.stream
+            .ends_with(b"=== STELA BOOT 11 ===\nafter the change\n")
+    );
+    assert_eq!(log.starts.len(), 9);
+    assert!(!log.starts[7].last.is_empty());
+    // A version 1 log is laid out too, without records.
+    let stream = lines(0, 6000);
+    let v1 = version_1(LOG_BYTES, 512, &stream, 3);
+    let grown = read(&relayout(&v1.disk.bytes, FILE_BYTES).unwrap()).unwrap();
+    assert_eq!((grown.boots, grown.stream), (3, stream));
+    // A blank file is refused by name.
+    assert_eq!(
+        relayout(&vec![0; LOG_BYTES as usize], FILE_BYTES),
+        Err(HeaderError::Blank)
+    );
+}
+
+/// A loader older than the longer file opens it as a 4 MiB region and
+/// starts a 4 MiB log at its start. The reader reads that log, and the next
+/// boot lays it out in the whole file in place with its boots, where it
+/// started the file fresh again and they were lost.
+#[test]
+fn a_smaller_log_an_older_loader_started_in_the_file_is_grown_in_place() {
+    for older_boots in [3, 12] {
+        let mut disk = Recorder::new(FILE_BYTES, 512);
+        let mut next = 0;
+        for _ in 0..2 {
+            let mut writer = Writer::open(&mut disk).unwrap();
+            writer.append(&lines(next, 1000));
+            next += 1000;
+            writer.flush(&mut disk).unwrap();
+        }
+        // The older loader sees the file's first 4 MiB, whose header is not
+        // its region's, and starts a log there; twelve boots of 600 KB turn
+        // its ring.
+        let mut older = Recorder::new(LOG_BYTES, 512);
+        older
+            .disk
+            .bytes
+            .copy_from_slice(&disk.disk.bytes[..LOG_BYTES as usize]);
+        for boot in 0..older_boots {
+            let mut writer = Writer::open(&mut older).unwrap();
+            assert_eq!(writer.fresh().is_some(), boot == 0);
+            for _ in 0..5 {
+                writer.append(&lines(next, 10_000));
+                next += 10_000;
+                writer.flush(&mut older).unwrap();
+            }
+        }
+        disk.disk.bytes[..LOG_BYTES as usize].copy_from_slice(&older.disk.bytes);
+        let small = older.log().unwrap();
+        assert_eq!(small.overwritten() > 0, older_boots == 12);
+        assert_eq!(disk.log().unwrap(), small, "read in the whole file");
+        assert_eq!(
+            read_newest(&mut disk, 1 << 20, |_| false).unwrap(),
+            small.stream,
+            "its newest lines read back"
+        );
+        let mut writer = Writer::open(&mut disk).unwrap();
+        assert!(writer.fresh().is_none());
+        assert!(!writer.converted());
+        assert_eq!(writer.grown(), Some(LOG_BYTES));
+        assert_eq!(writer.layout(), Layout::of(FILE_BYTES));
+        writer.append(b"after the older loader\n");
+        writer.flush(&mut disk).unwrap();
+        let log = disk.log().unwrap();
+        assert_eq!(log.boots, older_boots + 1);
+        assert_eq!(log.overwritten(), small.overwritten());
+        assert!(log.stream.starts_with(&small.stream));
+        let marker = format!(
+            "=== STELA BOOT {} ===\nafter the older loader\n",
+            older_boots + 1
+        );
+        assert!(log.stream.ends_with(marker.as_bytes()));
+        assert_eq!(log.starts.len(), small.starts.len() + 1);
+        for (grown, kept) in log.starts.iter().zip(&small.starts) {
+            assert_eq!(
+                (grown.boot, grown.start, &grown.first),
+                (kept.boot, kept.start, &kept.first)
+            );
+        }
+    }
+}
+
+/// Each boot's marker says what it is and when it started, and its record
+/// is read with it.
+#[test]
+fn a_boot_s_marker_carries_its_note_and_its_record_is_read_with_it() {
+    let mut disk = small_disk(512);
+    let mut writer = Writer::with_layout(
+        &mut disk,
+        PENDING_BYTES,
+        Some("version=9.9.9 firmware_clock=2026-11-18 01:44:12"),
+        SMALL,
+    )
+    .unwrap();
+    writer.append(&lines(0, 400));
+    writer.flush(&mut disk).unwrap();
+    writer.append(b"more\n");
+    writer.flush(&mut disk).unwrap();
+    let log = disk.log().unwrap();
+    assert!(log.stream.starts_with(
+        b"=== STELA BOOT 1 === version=9.9.9 firmware_clock=2026-11-18 01:44:12\nline 000000\n"
+    ));
+    let [start] = &log.starts[..] else {
+        panic!("{}", log.starts.len());
+    };
+    assert!(
+        start
+            .first
+            .starts_with(b"=== STELA BOOT 1 === version=9.9.9")
+    );
+    // Another boot's number with a note does not pass for this one's.
+    let at = SMALL.record_at(1) as usize;
+    disk.disk.bytes[at..at + 22].copy_from_slice(b"=== STELA BOOT 10 === ");
+    assert!(disk.log().unwrap().starts.is_empty());
+}
+
+/// Every store writes the header's 4 KiB: the header, and its copy in the
+/// last 512 bytes. A header that no longer decodes is read from its copy,
+/// by the reader and by the next boot, which goes on with the log where it
+/// started it fresh before; a newer version's header is not.
+#[test]
+fn a_header_that_does_not_decode_is_read_from_its_copy() {
+    for block in [512, 4096] {
+        let mut disk = small_disk(block);
+        for boot in 0..3 {
+            let mut writer = open_small(&mut disk, true);
+            writer.append(&lines(boot * 100, 100));
+            writer.flush(&mut disk).unwrap();
+        }
+        let before = disk.log().unwrap();
+        let page = &disk.disk.bytes[..HEADER_BYTES as usize];
+        assert_eq!(page[COPY_AT as usize..], page[..512], "{block}");
+        // A torn header block.
+        disk.disk.bytes[16] ^= 0xff;
+        assert_eq!(disk.log().unwrap(), before, "{block}");
+        assert_eq!(
+            read_newest(&mut disk, 1 << 20, |_| false).unwrap(),
+            before.stream
+        );
+        let mut writer = open_small(&mut disk, true);
+        assert!(writer.restored() && writer.fresh().is_none(), "{block}");
+        assert!(!writer.converted());
+        assert_eq!(writer.boots(), 4);
+        writer.append(b"after the torn header\n");
+        writer.flush(&mut disk).unwrap();
+        let log = disk.log().unwrap();
+        assert!(log.stream.starts_with(&before.stream));
+        assert!(
+            log.stream
+                .ends_with(b"=== STELA BOOT 4 ===\nafter the torn header\n")
+        );
+        // A newer version's header is its own: the log starts fresh.
+        disk.disk.bytes[8..12].copy_from_slice(&9u32.to_le_bytes());
+        assert_eq!(disk.log(), Err(HeaderError::Version(9)));
+        let writer = open_small(&mut disk, true);
+        assert_eq!(writer.fresh(), Some(&HeaderError::Version(9)));
+    }
+}
+
+/// What a released loader (0.5.0 and older) leaves in a longer log file:
+/// its version 1 log of `stream` and `boots` in the file's first 4 MiB,
+/// written through 512-byte blocks, its header's block and the ring blocks
+/// its stream reached, and nothing else.
+fn as_a_released_loader_writes(disk: &mut Recorder, stream: &[u8], boots: u64) {
+    let older = version_1(LOG_BYTES, 512, stream, boots);
+    let ring = LOG_BYTES - HEADER_BYTES;
+    let reached = (stream.len() as u64).min(ring).next_multiple_of(512);
+    let bytes = &mut disk.disk.bytes;
+    bytes[..512].copy_from_slice(&older.disk.bytes[..512]);
+    let ring_at = HEADER_BYTES as usize..(HEADER_BYTES + reached) as usize;
+    bytes[ring_at.clone()].copy_from_slice(&older.disk.bytes[ring_at]);
+}
+
+/// The released loader's boots after the ones a newer loader wrote: the
+/// stream a released loader starts its log with.
+fn released_boots(boots: u64, lines_each: usize) -> Vec<u8> {
+    let mut stream = Vec::new();
+    for boot in 1..=boots {
+        stream.extend_from_slice(format!("=== STELA BOOT {boot} ===\n").as_bytes());
+        stream.extend_from_slice(&lines(boot as usize * 1_000_000, lines_each));
+    }
+    stream
+}
+
+/// A loader older than the longer file starts its own 4 MiB log at the
+/// file's start, over the newer log's header and the start of its ring. The
+/// header's copy, which it leaves alone, still names the newer log: the
+/// reader and the next boot keep that log's boots, its records and the
+/// lines the older loader did not write over, then the older loader's boots
+/// numbered on, where they had only the older loader's before.
+#[test]
+fn the_boots_before_an_older_loader_s_log_are_kept_with_it() {
+    // Unwrapped: 3 short boots; wrapped: 12 boots that turn its ring.
+    for (older_boots, older_lines) in [(3u64, 2_000usize), (12, 30_000)] {
+        let mut disk = Recorder::new(FILE_BYTES, 512);
+        // 20 boots of 1.6 MB turn the 25 MiB ring: 16 records.
+        for boot in 0..20 {
+            let mut writer = Writer::open(&mut disk).unwrap();
+            for part in 0..10 {
+                writer.append(&lines(boot * 200_000 + part * 13_000, 13_000));
+                writer.flush(&mut disk).unwrap();
+            }
+        }
+        let newer = disk.log().unwrap();
+        assert_eq!((newer.boots, newer.starts.len()), (20, 16));
+        assert!(newer.overwritten() > 0);
+        let stream = released_boots(older_boots, older_lines);
+        as_a_released_loader_writes(&mut disk, &stream, older_boots);
+        let older = read(&disk.disk.bytes[..LOG_BYTES as usize]).unwrap();
+        assert_eq!(older.boots, older_boots);
+        assert_eq!(older.overwritten() > 0, older_boots == 12);
+
+        let log = disk.log().unwrap();
+        assert_eq!(log.boots, 20 + older_boots);
+        // Every record of the newer log, with its first lines.
+        assert_eq!(log.starts.len(), 16);
+        for (kept, was) in log.starts.iter().zip(&newer.starts) {
+            assert_eq!((kept.boot, &kept.first), (was.boot, &was.first));
+        }
+        // Its last boot's last lines are its own, kept in its record.
+        let last = log.starts.last().unwrap();
+        assert_eq!(last.boot, 20);
+        assert!(!last.last.is_empty());
+        assert!(newer.stream.ends_with(&last.last));
+        // The newer lines the older loader did not write over, a line in
+        // place of those it did, then the older loader's boots numbered on.
+        let text = String::from_utf8(log.stream.clone()).unwrap();
+        let gap = text
+            .find("bytes are missing here: an older Stela wrote its own log over them]\n")
+            .expect("the gap is said");
+        let newest = String::from_utf8(newer.stream[newer.stream.len() - 1000..].to_vec()).unwrap();
+        let newest = &newest[newest.find('\n').unwrap() + 1..];
+        assert!(text.contains(newest), "the newer log's newest lines");
+        let older_text = String::from_utf8(older.stream.clone()).unwrap();
+        let mut numbered = 0;
+        for boot in 1..=older_boots {
+            if !older_text.contains(&format!("=== STELA BOOT {boot} ===\n")) {
+                continue;
+            }
+            let marker = format!("=== STELA BOOT {} ===\n", 20 + boot);
+            let at = text.find(&marker).unwrap_or_else(|| panic!("{marker}"));
+            assert!(at > gap);
+            numbered += 1;
+        }
+        // Those the older loader's own ring turned over are gone from both.
+        assert!(numbered + 2 >= older_boots, "{numbered}");
+        assert!(log.stream.ends_with(&stream[stream.len() - 1000..]));
+        assert_eq!(
+            text.contains("the older Stela's log overwrote them"),
+            older_boots == 12
+        );
+        // The newest lines read back are the same.
+        let newest = read_newest(&mut disk, 1 << 20, |_| false).unwrap();
+        assert!(log.stream.ends_with(&newest) && !newest.is_empty());
+
+        // The next boot lays both out in the file and counts on from them.
+        let mut writer = Writer::open(&mut disk).unwrap();
+        assert_eq!(writer.grown(), Some(LOG_BYTES));
+        assert_eq!(writer.kept_earlier(), Some(20));
+        assert_eq!(writer.boots(), 21 + older_boots);
+        writer.append(b"after the older loader\n");
+        writer.flush(&mut disk).unwrap();
+        let after = disk.log().unwrap();
+        assert_eq!(after.boots, 21 + older_boots);
+        let marker = format!(
+            "=== STELA BOOT {} ===\nafter the older loader\n",
+            21 + older_boots
+        );
+        let laid_out = after
+            .stream
+            .strip_suffix(marker.as_bytes())
+            .expect("this boot's lines come last");
+        // As the reader read both, or their newest that the ring holds.
+        assert!(log.stream.ends_with(laid_out));
+        assert!(laid_out.len() as u64 >= (log.stream.len() as u64).min(after.ring_bytes - 64));
+        // The newer log's records stay, its last boot's last lines its own:
+        // none took the older loader's lines.
+        for kept in &after.starts {
+            if let Some(was) = log.starts.iter().find(|was| was.boot == kept.boot) {
+                assert_eq!(kept, was);
+            }
+        }
+        // Read again, the file is one log: no older loader's log is left.
+        let mut again = Writer::open(&mut disk).unwrap();
+        assert_eq!((again.grown(), again.kept_earlier()), (None, None));
+        again.flush(&mut disk).unwrap();
+        assert_eq!(disk.log().unwrap().boots, 22 + older_boots);
+    }
+}
+
+/// An older loader that wrote its header through 4 KiB blocks wrote over
+/// the copy too: its log is grown alone, as before the copy.
+#[test]
+fn an_older_loader_s_log_over_the_copy_is_grown_alone() {
+    let mut disk = Recorder::new(FILE_BYTES, 512);
+    for boot in 0..2 {
+        let mut writer = Writer::open(&mut disk).unwrap();
+        writer.append(&lines(boot * 1000, 1000));
+        writer.flush(&mut disk).unwrap();
+    }
+    let stream = released_boots(2, 100);
+    as_a_released_loader_writes(&mut disk, &stream, 2);
+    disk.disk.bytes[512..HEADER_BYTES as usize].fill(0);
+    let log = disk.log().unwrap();
+    assert_eq!((log.boots, &log.stream[..]), (2, &stream[..]));
+    let writer = Writer::open(&mut disk).unwrap();
+    assert_eq!(
+        (writer.grown(), writer.kept_earlier()),
+        (Some(LOG_BYTES), None)
+    );
+    assert_eq!(writer.boots(), 3);
 }

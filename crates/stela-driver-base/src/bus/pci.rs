@@ -24,6 +24,7 @@ pub mod assignment;
 pub mod bus_reset;
 pub mod capability;
 pub mod hotplug;
+pub mod link_report;
 pub mod msi;
 pub mod msix;
 pub mod native;
@@ -31,6 +32,7 @@ pub mod owned;
 pub mod power;
 pub mod regs;
 pub mod requester;
+pub mod substates;
 pub use aspm::{
     aspm_control, disable_aspm_l1_2_link, disable_aspm_link, link_control_word, link_speed,
     native as native_aspm,
@@ -101,6 +103,10 @@ const FLR_READY_POLL_US: u64 = 1_000;
 const FLR_READY_US: u64 = 60_000_000;
 /// The ARI extended capability's ID.
 const EXTENDED_ARI: u16 = 0x0e;
+/// The Latency Tolerance Reporting and L1 PM Substates extended
+/// capabilities' IDs (`PCI_EXT_CAP_ID_LTR`, `PCI_EXT_CAP_ID_L1SS`).
+const EXTENDED_LTR: u16 = 0x18;
+const EXTENDED_L1SS: u16 = 0x1e;
 /// The Resizable BAR extended capability's ID, and in each of its control
 /// registers (one per resizable BAR, eight bytes apart from offset 8) the
 /// number of resizable BARs (first register only) and the BAR Size field
@@ -151,14 +157,41 @@ impl Method {
     }
 }
 
+/// The extended capabilities whose controls a reset clears and Linux's
+/// `pci_restore_pcie_state` writes back before the PCI Express controls:
+/// Latency Tolerance Reporting (`pci_restore_ltr_state`) and L1 PM
+/// Substates (`pci_restore_aspm_l1ss_state`), each by its offset.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LinkPower {
+    ltr: Option<u16>,
+    l1ss: Option<u16>,
+}
+
+/// LTR's Max Snoop and Max No-Snoop Latency, one DWORD after its header
+/// (`PCI_LTR_MAX_SNOOP_LAT`), and the L1 PM Substates Control 1 and 2
+/// registers (`PCI_L1SS_CTL1`, `PCI_L1SS_CTL2`) with Control 1's two L1.2
+/// enables (`PCI_L1SS_CTL1_L1_2_MASK`), which must be written after the
+/// timing they use.
+const LTR_MAX_LATENCY: u16 = 4;
+const L1SS_CONTROL_1: u16 = 8;
+const L1SS_CONTROL_2: u16 = 0xc;
+const L1SS_L1_2_ENABLES: u32 = 0b101;
+/// Link Control's ASPM Control field, off while L1 PM Substates change.
+const LINK_ASPM: u16 = 3;
+
 /// What Linux's `pci_dev_save_and_disable` keeps of a function before a
 /// reset and `pci_dev_restore` writes back after it: the header after its
 /// command register, the command register, the PCI Express device and link
-/// controls, and each Resizable BAR control.
+/// controls, LTR's latency limits and the L1 PM Substates controls, and each
+/// Resizable BAR control.
 struct Saved {
     header: [u32; HEADER_REST_WORDS],
     command: u16,
     controls: Option<[(u16, u16); 4]>,
+    /// LTR's Max Snoop and No-Snoop Latency register and what it held.
+    ltr: Option<(u16, u32)>,
+    /// The L1 PM Substates capability's offset and its Control 1 and 2.
+    l1ss: Option<(u16, u32, u32)>,
     /// Each Resizable BAR control register and what it held. A reset puts
     /// every BAR back at its default size, where firmware may have set
     /// another, and the BAR registers alone do not carry the size.
@@ -171,8 +204,9 @@ impl Saved {
         config: &mut C,
         express: Option<u16>,
         rebar: Option<u16>,
+        power: LinkPower,
     ) -> Result<Self, ConfigError> {
-        let saved = Self::save(config, express, rebar)?;
+        let saved = Self::save(config, express, rebar, power)?;
         saved.disable(config)?;
         Ok(saved)
     }
@@ -185,6 +219,7 @@ impl Saved {
         config: &C,
         express: Option<u16>,
         rebar: Option<u16>,
+        power: LinkPower,
     ) -> Result<Self, ConfigError> {
         let mut header = [0; HEADER_REST_WORDS];
         for (word, value) in header.iter_mut().enumerate() {
@@ -209,6 +244,22 @@ impl Saved {
             }
             None => None,
         };
+        // Both are PCI Express capabilities: without that capability the
+        // offsets name nothing a reset clears.
+        let ltr = match (express, power.ltr) {
+            (Some(_), Some(ltr)) => {
+                Some((ltr + LTR_MAX_LATENCY, config.read32(ltr + LTR_MAX_LATENCY)?))
+            }
+            _ => None,
+        };
+        let l1ss = match (express, power.l1ss) {
+            (Some(_), Some(l1ss)) => Some((
+                l1ss,
+                config.read32(l1ss + L1SS_CONTROL_1)?,
+                config.read32(l1ss + L1SS_CONTROL_2)?,
+            )),
+            _ => None,
+        };
         let mut resizable = Vec::new();
         if let Some(rebar) = rebar {
             let first = config.read32(rebar + REBAR_CONTROL)?;
@@ -222,12 +273,37 @@ impl Saved {
             header,
             command,
             controls,
+            ltr,
+            l1ss,
             rebar: resizable,
         })
     }
     /// The writes [`Self::restore`] makes, in order, each an offset, a width
-    /// in bytes and a value: the command register last.
+    /// in bytes and a value: the command register last. As Linux's
+    /// `pci_restore_pcie_state`, LTR's latency limits and the L1 PM
+    /// Substates controls go back first, LTR's before Device Control 2
+    /// enables it; the substates' timing goes back with L1.2 off, which is
+    /// then enabled as it was, all while the function's Link Control has
+    /// ASPM off (PCIe r6.0 5.5.4), and Link Control comes back with the
+    /// other PCI Express controls after the header.
     fn writes(&self) -> Vec<(u16, u8, u32)> {
+        // Link Control, second of the controls [`Self::save`] reads.
+        let link_control = self.controls.map(|controls| controls[1]);
+        let mut writes = Vec::new();
+        if let (Some((control, value)), Some(_)) = (link_control, self.l1ss) {
+            writes.push((control, 2, u32::from(value & !LINK_ASPM)));
+        }
+        if let Some((latency, value)) = self.ltr {
+            writes.push((latency, 4, value));
+        }
+        if let Some((l1ss, control_1, control_2)) = self.l1ss {
+            let timing = control_1 & !L1SS_L1_2_ENABLES;
+            writes.push((l1ss + L1SS_CONTROL_1, 4, timing));
+            writes.push((l1ss + L1SS_CONTROL_2, 4, control_2));
+            if timing != control_1 {
+                writes.push((l1ss + L1SS_CONTROL_1, 4, control_1));
+            }
+        }
         let header = self
             .header
             .into_iter()
@@ -238,10 +314,12 @@ impl Saved {
             .into_iter()
             .flatten()
             .map(|(control, value)| (control, 2, u32::from(value)));
-        header
-            .chain(controls)
-            .chain([(regs::COMMAND, 2, u32::from(self.command))])
-            .collect()
+        writes.extend(
+            header
+                .chain(controls)
+                .chain([(regs::COMMAND, 2, u32::from(self.command))]),
+        );
+        writes
     }
     /// Write the saved state back: each Resizable BAR's size first, as
     /// Linux `pci_restore_rebar_state` does before the BARs, and like it
@@ -254,6 +332,9 @@ impl Saved {
             config.write32(control, current & !REBAR_SIZE | saved & REBAR_SIZE)?;
         }
         for (offset, width, value) in self.writes() {
+            // One DWORD each for LTR and L1 PM Substates, which some
+            // devices take only so (Linux); Link Control and the others
+            // narrow, as Link Status beside it clears on a written one.
             match width {
                 4 => config.write32(offset, value)?,
                 _ => config.write16(offset, value as u16)?,
@@ -948,8 +1029,9 @@ impl<C: ConfigSpace> Function<C> {
             Some(_) => self.extended_capability(EXTENDED_REBAR)?,
             None => None,
         };
+        let power = self.link_power(express)?;
         let mut config = transaction::Transaction::new(&mut self.config);
-        let saved = Saved::save_and_disable(&mut config, express, rebar)?;
+        let saved = Saved::save_and_disable(&mut config, express, rebar, power)?;
         match method {
             Method::FunctionLevel { express } => {
                 for attempt in 0..3 {
@@ -991,6 +1073,18 @@ impl<C: ConfigSpace> Function<C> {
     /// The PCI Express capability's offset, from the complete checked list.
     fn express_offset(&self) -> Result<Option<u16>, CapabilityError> {
         express_offset(&self.config)
+    }
+    /// Where this function's LTR and L1 PM Substates controls are, which a
+    /// reset clears and its restore writes back; none without the PCI
+    /// Express capability.
+    fn link_power(&self, express: Option<u16>) -> Result<LinkPower, CapabilityError> {
+        if express.is_none() {
+            return Ok(LinkPower::default());
+        }
+        Ok(LinkPower {
+            ltr: self.extended_capability(EXTENDED_LTR)?,
+            l1ss: self.extended_capability(EXTENDED_L1SS)?,
+        })
     }
     /// Each Resizable BAR and the size its control register selects now: a
     /// reset restores the sizes before it without checking them, as Linux

@@ -12,6 +12,10 @@
 //! [`mask_line`] does the same to text Stela relays without formatting it,
 //! as the guest's console and its restore ledger: MAC addresses anywhere,
 //! and the value after a name that says it is an identifier.
+//! [`mask_stored_line`] adds the disk serials of lines older Stela versions
+//! wrote in full, for `stela log`, which writes lines a stick kept from
+//! before. A tag is never tagged again, so a line masked twice reads as
+//! one masked once.
 use alloc::{borrow::Cow, string::String};
 use core::fmt::{self, Write as _};
 
@@ -112,6 +116,18 @@ fn is_word(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+/// Whether `value` is already a tag: `none`, a [`Tail`] (`..` and at most
+/// four characters) or a [`Name`] (`#` and four hex digits).
+fn is_tag(value: &str) -> bool {
+    value == "none"
+        || value
+            .strip_prefix("..")
+            .is_some_and(|tail| (1..=KEPT).contains(&tail.chars().count()))
+        || value.strip_prefix('#').is_some_and(|hash| {
+            hash.len() == 4 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
 /// Where `name` ends when it starts at `at` of `bytes`, any case, and ends
 /// a word there.
 fn name_at(bytes: &[u8], at: usize, name: &str) -> Option<usize> {
@@ -130,6 +146,10 @@ fn number_after(bytes: &[u8], from: usize) -> Option<(usize, usize, bool)> {
     let limit = bytes.len().min(from + NUMBER_WITHIN);
     let mut at = from;
     while at < limit {
+        // A tag in the number's place: masked already.
+        if bytes[at..].starts_with(b"..") {
+            return None;
+        }
         if bytes[at] == b'[' {
             let end = at + 1 + bytes[at + 1..].iter().position(|&byte| byte == b']')?;
             if bytes[at + 1..end].iter().any(u8::is_ascii_digit) {
@@ -238,6 +258,7 @@ pub fn mask_line(line: &str) -> Cow<'_, str> {
         {
             let value = &line[start..end];
             at = match list {
+                _ if is_tag(value) => end,
                 true => replace(start, end, &Name(value)),
                 false => replace(start, end, &Tail(value)),
             };
@@ -248,7 +269,10 @@ pub fn mask_line(line: &str) -> Cow<'_, str> {
             .flatten()
             .and_then(|end| name_after(bytes, end))
         {
-            at = replace(start, end, &Name(&line[start..end]));
+            at = match is_tag(&line[start..end]) {
+                true => end,
+                false => replace(start, end, &Name(&line[start..end])),
+            };
             continue;
         }
         if let Some(folder) = ACCOUNT_FOLDERS.iter().find(|folder| {
@@ -261,9 +285,9 @@ pub fn mask_line(line: &str) -> Cow<'_, str> {
                 .iter()
                 .position(|&byte| matches!(byte, b'/' | b' ' | b'"' | b'\'' | b')' | b','))
                 .map_or(bytes.len(), |end| start + end);
-            at = match end > start {
+            at = match end > start && !is_tag(&line[start..end]) {
                 true => replace(start, end, &Name(&line[start..end])),
-                false => start,
+                false => end,
             };
             continue;
         }
@@ -275,6 +299,104 @@ pub fn mask_line(line: &str) -> Cow<'_, str> {
     }
     masked.push_str(&line[copied..]);
     Cow::Owned(masked)
+}
+
+/// The quoted value at `at` of `bytes`: its start and end inside the
+/// quotes.
+fn quoted_at(bytes: &[u8], at: usize) -> Option<(usize, usize)> {
+    (bytes.get(at) == Some(&b'"')).then_some(())?;
+    let end = bytes[at + 1..].iter().position(|&byte| byte == b'"')?;
+    Some((at + 1, at + 1 + end))
+}
+
+/// The value of `serial=` ending at `from`: quoted (`serial="…"`, also
+/// inside `Some(…)`) up to its quote, else up to a space, comma,
+/// semicolon or bracket.
+fn serial_value(bytes: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut at = from;
+    if bytes[at..].starts_with(b"Some(") {
+        at += 5;
+    }
+    if let Some(quoted) = quoted_at(bytes, at) {
+        return Some(quoted);
+    }
+    let end = bytes[at..]
+        .iter()
+        .position(|&byte| {
+            byte.is_ascii_whitespace() || matches!(byte, b',' | b';' | b')' | b']' | b'}')
+        })
+        .map_or(bytes.len(), |end| at + end);
+    (end > at).then_some((at, end))
+}
+
+/// [`mask_line`] for a line a boot log holds, which an older Stela may have
+/// written with a disk's whole serial: `serial=VALUE`, `serial="VALUE"`,
+/// `serial=Some("VALUE")`, `serial "VALUE"`, `reporting "VALUE"` and the
+/// quoted serials `found` lists after such a serial, each as its [`Tail`].
+/// A value of four characters or fewer stays, since its tail is all of
+/// it: so do XNU's `serial=3` boot argument and the plain `serial N` of a
+/// GPU command, which names no disk.
+pub fn mask_stored_line(line: &str) -> Cow<'_, str> {
+    let bytes = line.as_bytes();
+    let mut masked = String::new();
+    let mut copied = 0;
+    let mut at = 0;
+    // A serial was named: the quoted values `found` lists are serials too.
+    let mut named = false;
+    while at < bytes.len() {
+        let word_start = at == 0 || !is_word(bytes[at - 1]);
+        let value = if !word_start {
+            None
+        } else if let Some(end) = name_at(bytes, at, "serial") {
+            match bytes.get(end) {
+                Some(b'=') => serial_value(bytes, end + 1),
+                Some(b' ') => quoted_at(bytes, end + 1),
+                _ => None,
+            }
+        } else if let Some(end) = name_at(bytes, at, "reporting")
+            .filter(|_| named)
+            .or_else(|| name_at(bytes, at, "found").filter(|_| named))
+        {
+            (bytes.get(end) == Some(&b' '))
+                .then(|| quoted_at(bytes, end + 1))
+                .flatten()
+        } else {
+            None
+        };
+        let Some((start, mut end)) = value else {
+            at += line[at..].chars().next().map_or(1, char::len_utf8);
+            continue;
+        };
+        named = true;
+        // A list of quoted serials: `"a", "b"`.
+        let mut values = alloc::vec![(start, end)];
+        while bytes[end..].starts_with(b"\", \"") {
+            let Some(next) = quoted_at(bytes, end + 3) else {
+                break;
+            };
+            values.push(next);
+            end = next.1;
+        }
+        for (start, end) in values {
+            let value = &line[start..end];
+            if value.chars().count() > KEPT && !is_tag(value) {
+                masked.push_str(&line[copied..start]);
+                let _ = write!(masked, "{}", Tail(value));
+                copied = end;
+            }
+        }
+        at = end;
+    }
+    let serials = if copied == 0 {
+        Cow::Borrowed(line)
+    } else {
+        masked.push_str(&line[copied..]);
+        Cow::Owned(masked)
+    };
+    match serials {
+        Cow::Borrowed(line) => mask_line(line),
+        Cow::Owned(line) => Cow::Owned(mask_line(&line).into_owned()),
+    }
 }
 
 #[cfg(test)]
@@ -383,6 +505,57 @@ mod tests {
         ];
         for (line, expected) in cases {
             assert_eq!(mask_line(line), expected, "{line}");
+            // A masked line masked again is the same line.
+            assert_eq!(mask_line(expected), expected, "{expected}");
+            assert_eq!(mask_stored_line(expected), expected, "{expected}");
+        }
+    }
+
+    #[test]
+    fn serials_of_older_stela_lines_become_tails() {
+        let cases = [
+            (
+                "STORAGE DEVICE Nvme at 0000:01:00.0 serial=\"S4EWNX0R123456Z\" model=\"SSD\" blocks=1",
+                "STORAGE DEVICE Nvme at 0000:01:00.0 serial=\"..456Z\" model=\"SSD\" blocks=1",
+            ),
+            (
+                "HOST DISK IO serial=WD-WX12A3456789 reads=3",
+                "HOST DISK IO serial=..6789 reads=3",
+            ),
+            (
+                "INSTALLER disk 2 Nvme serial=Some(\"2108E5A3B9C1\") bytes=5",
+                "INSTALLER disk 2 Nvme serial=Some(\"..B9C1\") bytes=5",
+            ),
+            (
+                "HOST DISK no disk reports serial \"ABCDEF123456\"; its partition GUID is on the \
+                 disk reporting \"ZYXW98765432\", which is taken",
+                "HOST DISK no disk reports serial \"..3456\"; its partition GUID is on the \
+                 disk reporting \"..5432\", which is taken",
+            ),
+            (
+                "no disk has serial \"disk-c-0001\"; found \"disk-a-0001\", \"blank-0002\"",
+                "no disk has serial \"..0001\"; found \"..0001\", \"..0002\"",
+            ),
+            (
+                "NETWORK candidate driver=r8169 adapter=0000:03:00.0 mac=00:e0:4c:12:34:5e",
+                "NETWORK candidate driver=r8169 adapter=0000:03:00.0 mac=00:e0:4c:..:..:5e",
+            ),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(mask_stored_line(line), expected, "{line}");
+            assert_eq!(mask_stored_line(expected), expected, "{expected}");
+        }
+        // What names no disk serial stays as it is.
+        for line in [
+            "boot-args -v serial=3 serial-device-name=uart0",
+            "GPU REFUSED buffer of connection 3 made at serial 1234567",
+            "configuring debugging over serial",
+            "HOST DISK HELD serial=disk call=finish",
+            "STORAGE DEVICE Nvme at 0000:01:00.0 serial=..456Z model=\"SSD\"",
+            "lookup found \"com.apple.example\" in the cache",
+            "the disk reporting \"WD-WX12A3456789\" alone",
+        ] {
+            assert!(matches!(mask_stored_line(line), Cow::Borrowed(_)), "{line}");
         }
     }
 }

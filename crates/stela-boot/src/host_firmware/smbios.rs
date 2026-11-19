@@ -107,6 +107,12 @@ fn record_board(capture: &Capture) {
     let Some(Ok(parsed)) = bytes.get(..length).map(|raw| entry(raw, format)) else {
         return;
     };
+    // The memory devices' sizes, speeds and channels (`HOST MEMORY
+    // MODULES`); no serial number, asset tag or part number is read.
+    crate::output::arguments(format_args!(
+        "{}",
+        stela_boot_core::host_speed::memory(&bytes[length..]).line()
+    ));
     let Ok(system) = identity(parsed, &bytes[length..]) else {
         return;
     };

@@ -19,7 +19,11 @@ pub const OUTSIDE_KINDS: usize = ExitKind::Amx as usize + 2;
 /// slowed by a PROCHOT# or FORCEPR# signal; and the last sample's degrees
 /// below the core's highest allowed temperature. `counters` and `thermal`
 /// say which of the two register sets the core has; a host that has
-/// neither leaves both false.
+/// neither leaves both false. Where the core has them, the same samples
+/// count its package over its thermal limit, held by a package power limit
+/// or slowed by PROCHOT (`package`), its turbo or boost switched off
+/// (`switch`), and its highest allowed P-state below the fastest
+/// (`limit`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HostClock {
     pub actual: u64,
@@ -31,6 +35,14 @@ pub struct HostClock {
     pub headroom: Option<u8>,
     pub counters: bool,
     pub thermal: bool,
+    pub package_hot: u64,
+    pub package_power: u64,
+    pub package_prochot: u64,
+    pub turbo_off: u64,
+    pub limited: u64,
+    pub package: bool,
+    pub switch: bool,
+    pub limit: bool,
 }
 
 /// One PE's System registers that take none of the board's locks, as

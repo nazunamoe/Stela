@@ -202,8 +202,9 @@ fn kept_counts_reach_the_board() {
 
 /// A discard of every block on a shared board counts as one flush in the
 /// board's report, whichever PE makes it, and takes every block out of
-/// reach: the heartbeat's `CODE CACHE flushes=` then says how often the
-/// whole window had to be compiled again.
+/// reach: the heartbeat's `CODE CACHE pe_flushes=` then says how often a
+/// PE forgot the whole window, each PE that applies the same guest
+/// invalidation counting once.
 #[test]
 fn a_flush_of_every_block_counts_on_the_board() {
     let mut memory = vec![0u8; 16 * 4096];

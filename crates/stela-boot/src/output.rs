@@ -20,9 +20,10 @@ use core::{
     convert::Infallible,
     fmt::{self, Write},
     mem::MaybeUninit,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 use stela_boot_core::first_stop::{Claim, FirstStop};
+use stela_boot_core::log_budget::{Gate, Piece};
 use stela_drivers::block::{BlockDevice, BlockError, Submission};
 use stela_runtime::pc::boot_log::{PENDING_BYTES, Pending, Unkept, Writer};
 
@@ -492,6 +493,69 @@ fn unqueue_serial() {
 static RECORD: Global<Pending<[u8; PENDING_BYTES]>> =
     Global(RefCell::new(Pending::new([0; PENDING_BYTES])));
 
+/// The byte budgets of the lines that reach [`RECORD`], per family
+/// (`stela_boot_core::log_budget`): one source that floods the log is
+/// thinned, and counted, before it pushes the others out of the logs'
+/// rings. The serial port gets every line. Reached only under [`WRITING`].
+static GATE: Global<Gate> = Global(RefCell::new(Gate::new()));
+/// Reports whose size their pace bounds are being written ([`periodic`]):
+/// their lines pass the budgets.
+static PERIODIC: AtomicU32 = AtomicU32::new(0);
+/// Writes that reached the serial port but not [`RECORD`], which another
+/// processor held past the wait or a handler reached during a write; the
+/// next line the record takes says how many.
+static BUSY: AtomicU64 = AtomicU64::new(0);
+
+/// While the returned value lives, this boot's lines are a periodic report
+/// whose size its pace bounds (the heartbeat, `beat_pace`), which the
+/// per-family budgets leave alone.
+pub fn periodic() -> Periodic {
+    PERIODIC.fetch_add(1, Ordering::Relaxed);
+    Periodic(())
+}
+
+/// See [`periodic`].
+pub struct Periodic(());
+
+impl Drop for Periodic {
+    fn drop(&mut self) {
+        PERIODIC.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Milliseconds since the PC started, for the budgets; `None` before the
+/// counter's rate is known.
+fn budget_clock() -> Option<u64> {
+    match TSC_HZ.load(Ordering::Relaxed) {
+        0 => None,
+        hz => Some(rdtsc() / (hz / 1000).max(1)),
+    }
+}
+
+/// Every line once a stop began, and periodic reports, pass the budgets.
+fn exempt() -> bool {
+    PERIODIC.load(Ordering::Relaxed) != 0 || FIRST_STOP.began()
+}
+
+/// Hand `record` what the gate passes, each line after its stamp.
+fn to_record(record: &mut Pending<[u8; PENDING_BYTES]>) -> impl FnMut(Piece<'_>) + '_ {
+    move |piece| match piece {
+        Piece::LineStart => stamp(record),
+        Piece::Bytes(bytes) => record.push(bytes),
+    }
+}
+
+/// Say every family the budgets thinned and has not said yet, as a stop or
+/// the logs' close does: the reader knows what the log lacks.
+pub fn say_thinned() {
+    let _ = exclusive(|| {
+        if let (Ok(mut record), Ok(mut gate)) = (RECORD.0.try_borrow_mut(), GATE.0.try_borrow_mut())
+        {
+            gate.say(budget_clock(), true, &mut to_record(&mut record));
+        }
+    });
+}
+
 /// An open log, the blocks that hold it and its position in the record.
 struct Sink {
     writer: Writer,
@@ -507,6 +571,8 @@ struct Sink {
     began: Option<u64>,
     /// The store's request in progress on the device.
     request: Option<Submission>,
+    /// Stores that failed in a row; the next store writes what they did not.
+    failures: u32,
 }
 
 impl Sink {
@@ -568,6 +634,11 @@ fn passed(deadline: u64) -> bool {
 const MACHINE_FLUSH_SECONDS: u64 = 5;
 /// Seconds between the USB log's stores while the engine runs.
 const USB_FLUSH_SECONDS: u64 = 10;
+/// Stores that may fail in a row before a log closes for the boot: a
+/// stick that times out once, or for half a minute, loses no line, as each
+/// store writes what the failed ones did not (`Writer::completed`); one
+/// that is gone is closed within a minute.
+const FAILED_STORES: u32 = 6;
 
 /// The BSP's counter on any core (`engine::host::rdtsc`): log times and
 /// flush deadlines are compared across cores.
@@ -628,8 +699,6 @@ static RAW_SCREEN: AtomicBool = AtomicBool::new(false);
 /// The time-stamp counter's rate, once known, which stamps each line the
 /// logs keep with the seconds since the PC started.
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
-/// The record's next byte starts a line.
-static LINE_START: AtomicBool = AtomicBool::new(true);
 
 /// Stamp the logs' lines from now on with the time from the counter running
 /// at `tsc_hz`.
@@ -737,15 +806,17 @@ pub fn unkept_lines(into: &mut [u8]) -> usize {
 
 /// Put the loader's lines that no log stored ([`unkept_lines`]) at the
 /// head of this image's record, with their stamps, for every log it opens
-/// to store first. The serial port had them from the loader.
+/// to store first. The serial port had them from the loader, and they
+/// passed its budgets.
 pub fn carry_loader_lines(lines: &[u8]) {
     if lines.is_empty() {
         return;
     }
     let _ = exclusive(|| {
-        if let Ok(mut record) = RECORD.0.try_borrow_mut() {
+        if let (Ok(mut record), Ok(mut gate)) = (RECORD.0.try_borrow_mut(), GATE.0.try_borrow_mut())
+        {
             record.push(lines);
-            LINE_START.store(lines.ends_with(b"\n"), Ordering::Relaxed);
+            gate.resume(lines.ends_with(b"\n"));
         }
     });
 }
@@ -816,16 +887,35 @@ impl Write for Output {
         if RAW_SCREEN.load(Ordering::Relaxed) {
             console::write(&[(value, console::Color::Text)]);
         }
-        if let Ok(mut record) = RECORD.0.try_borrow_mut() {
-            for line in value.split_inclusive('\n') {
-                if LINE_START.load(Ordering::Relaxed) {
-                    stamp(&mut record);
-                }
-                record.push(line.as_bytes());
-                LINE_START.store(line.ends_with('\n'), Ordering::Relaxed);
-            }
+        let (Ok(mut record), Ok(mut gate)) = (RECORD.0.try_borrow_mut(), GATE.0.try_borrow_mut())
+        else {
+            BUSY.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        };
+        let now = budget_clock();
+        let mut out = to_record(&mut record);
+        if gate.at_line_start() && BUSY.load(Ordering::Relaxed) != 0 {
+            let mut note = Text::<128>::default();
+            let _ = writeln!(
+                note,
+                "BOOT LOG busy: {} writes reached the serial port only, while the log was held \
+                 elsewhere",
+                BUSY.swap(0, Ordering::Relaxed)
+            );
+            gate.write(note.as_bytes(), now, true, &mut out);
         }
+        gate.write(value.as_bytes(), now, exempt(), &mut out);
         Ok(())
+    }
+}
+
+impl Output {
+    /// End a write: the budgets decide a line whose start they still hold.
+    fn end() {
+        if let (Ok(mut record), Ok(mut gate)) = (RECORD.0.try_borrow_mut(), GATE.0.try_borrow_mut())
+        {
+            gate.end(budget_clock(), &mut to_record(&mut record));
+        }
     }
 }
 
@@ -878,6 +968,7 @@ pub fn add_log(
             ticks: 0,
             began: None,
             request: None,
+            failures: 0,
         })
     });
     Ok(())
@@ -886,6 +977,7 @@ pub fn add_log(
 /// Store what every open log lacks and close them all, before the disks
 /// they live on are shut down; later output reaches the serial port only.
 pub fn close_logs() {
+    say_thinned();
     flush_log();
     with_sinks(true, Vec::clear);
 }
@@ -960,7 +1052,10 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
         return;
     }
     let mut failed = Vec::new();
+    let mut retried = Vec::new();
     let mut late = Vec::new();
+    // A store of this call failed: its lines are not on the device yet.
+    let mut unstored = false;
     // One deadline for every log's store.
     let started = rdtsc();
     let deadline = wait.then(|| {
@@ -1006,6 +1101,21 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
                     if wait && !done {
                         late.push(sink.kind);
                     }
+                    if done && sink.failures != 0 {
+                        retried.push(Retry::Stored(sink.kind, sink.failures));
+                        sink.failures = 0;
+                    }
+                    index += 1;
+                }
+                Err(error) if sink.failures + 1 < FAILED_STORES => {
+                    unstored = true;
+                    sink.failures += 1;
+                    sink.began = None;
+                    // The next store waits its interval, as a due one does.
+                    sink.flushed = rdtsc();
+                    if sink.failures == 1 {
+                        retried.push(Retry::Failed(sink.kind, error));
+                    }
                     index += 1;
                 }
                 Err(error) => failed.push((sinks.remove(index).kind, error)),
@@ -1017,7 +1127,24 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
         );
     });
     if wait {
-        UNSTORED.store(reached.is_none() || !late.is_empty(), Ordering::Relaxed);
+        UNSTORED.store(
+            reached.is_none() || !late.is_empty() || unstored,
+            Ordering::Relaxed,
+        );
+    }
+    for retry in retried {
+        match retry {
+            Retry::Failed(kind, error) => arguments(format_args!(
+                "BOOT LOG {} store failed: {error}; the next stores write its lines, and the log \
+                 closes after {FAILED_STORES} failures in a row\n",
+                kind.name()
+            )),
+            Retry::Stored(kind, failures) => arguments(format_args!(
+                "BOOT LOG {} stored again after {failures} failed stores, with every line they \
+                 held\n",
+                kind.name()
+            )),
+        }
     }
     for (kind, error) in failed {
         log_lost(kind, error);
@@ -1034,6 +1161,13 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
             millis_since(started)
         ));
     }
+}
+
+/// A log store that failed and will be tried again, or that went through
+/// after failures.
+enum Retry {
+    Failed(Log, BlockError),
+    Stored(Log, u32),
 }
 
 /// The counter now, for [`millis_since`].
@@ -1074,7 +1208,12 @@ pub fn report_log_stores() {
 }
 
 pub fn arguments(args: fmt::Arguments<'_>) {
-    if exclusive(|| Output.write_fmt(args)).is_none() {
+    let written = exclusive(|| {
+        let _ = Output.write_fmt(args);
+        Output::end();
+    });
+    if written.is_none() {
+        BUSY.fetch_add(1, Ordering::Relaxed);
         let _ = Serial.write_fmt(args);
     }
 }
@@ -1098,6 +1237,7 @@ pub fn hypervisor_exit_port() -> bool {
 pub fn terminate(code: u32) -> ! {
     heap_stops();
     stop_heap_report();
+    say_thinned();
     arguments(format_args!(
         "STELA STOPPED code={code:#x}; power off to continue\n"
     ));

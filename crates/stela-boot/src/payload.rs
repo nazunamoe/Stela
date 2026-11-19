@@ -134,9 +134,11 @@ fn path16(path: &str) -> Result<CString16> {
 
 fn open_file(root: &mut Directory, path: &str) -> Result<RegularFile> {
     root.open(&path16(path)?, FileMode::Read, FileAttribute::empty())
-        .map_err(|_| refuse!("cannot open a payload file"))?
-        .into_regular_file()
-        .ok_or(refuse!("a payload path is a directory"))
+        .map_err(|_| refuse!("cannot open a payload file"))
+        .and_then(|handle| {
+            crate::file_kind::regular(handle)
+                .map_err(|answers| refuse!("a payload path is a directory", %answers))
+        })
 }
 
 fn file_size(file: &mut RegularFile) -> Result<u64> {

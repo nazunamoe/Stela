@@ -164,6 +164,8 @@ impl<R: LptRegisters, D: Delay + Clone> Controller<R, D> {
             profile: Profile::Lpt(limits),
             config_read: None,
             ulp_exit_failed: false,
+            ulp_exit: None,
+            lanphypc_done: None,
         })
     }
 }
