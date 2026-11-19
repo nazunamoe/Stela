@@ -135,9 +135,14 @@ pub(super) fn inspect<R: Registers>(
         }
         ranges.push(current);
         match id {
-            // Never touched: a nonzero descriptor count only lengthens a
-            // region this walk under-measures, which never forges overlap.
-            CAP_GTS => {}
+            // A nonzero descriptor count lengthens GTS past the 0x40 bytes
+            // measured above, so a later capability could sit in that tail
+            // unseen by the overlap check; such layouts stay refused.
+            CAP_GTS => {
+                if registers.read32(offset + 4) != 0 {
+                    return Err(Error::UnsupportedExtendedCapability { id, version });
+                }
+            }
             CAP_PP | CAP_SPB | CAP_DRSM => {
                 if control(registers, offset + 4)? != 0 {
                     return Err(Error::ProcessingOwned { offset: offset + 4 });
