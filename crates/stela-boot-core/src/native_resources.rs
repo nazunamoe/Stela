@@ -83,13 +83,15 @@ pub const ORDINARY_GENERAL_TASKS: usize = 4;
 /// ones. Each Linux kthread, ioctl worker and driver thread holds one.
 pub const KERNEL_GENERAL_TASKS: usize =
     TASK_STACKS - stela_driver_base::platform::work::ROLE_STACKS - ORDINARY_GENERAL_TASKS;
-/// A Linux task's stack: Linux's `THREAD_SIZE` as Stela's Linux build sets
-/// it, which also aligns it (`stela_linux::task::stack_requirement`).
-pub const LINUX_TASK_STACK_BYTES: u64 = 32 * 1024;
 /// An ordinary task's Rust stack. Native driver probes run on one, through
 /// controller attach paths whose frames alone pass 128 KiB.
 pub const ORDINARY_TASK_STACK_BYTES: u64 = 1024 * 1024;
 pub const TASK_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+/// A Linux task's stack and its alignment: Linux's THREAD_SIZE
+/// (`stela-linux`'s `compat/asm/thread_info.h`), 64 KiB, which amdgpu's
+/// probe on a Navi 48 needs past 16 KiB with the host's paths a printk
+/// reaches.
+pub const LINUX_TASK_STACK_BYTES: u64 = 64 * 1024;
 /// The BSP's work pool. A Linux task runs only on a stack of exactly its
 /// configured size and alignment, so the service and the kernel General
 /// continuations have that shape; the other roles and the last

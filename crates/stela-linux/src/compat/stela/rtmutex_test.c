@@ -17,7 +17,7 @@ void stela_linux_rt_mutex_test_run(void *opaque);
 
 static struct rt_mutex first, second;
 static unsigned int high_entered, high_done, middle_done, medium_done;
-static struct task_struct *owner, *middle, *high_task;
+static struct task_struct *middle, *high_task;
 
 static void wait_for(const unsigned int *value, unsigned int expected)
 {
@@ -33,7 +33,6 @@ static void foreground(const struct rt_call *call)
 	rt_mutex_init(&first);
 	rt_mutex_init(&second);
 	high_entered = high_done = middle_done = medium_done = 0;
-	owner = current;
 	middle = NULL;
 	high_task = NULL;
 	assert(current->policy == SCHED_NORMAL && current->prio == DEFAULT_PRIO);

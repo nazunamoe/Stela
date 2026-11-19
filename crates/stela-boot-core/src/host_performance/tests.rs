@@ -8,8 +8,6 @@ struct Logged {
     accesses: Vec<(char, u32, u64)>,
     /// Model-specific registers a probe finds; others are refused.
     probed: Vec<(u32, u64)>,
-    /// Registers whose writes the processor ignores.
-    fixed: Vec<u32>,
 }
 
 impl Logged {
@@ -45,9 +43,6 @@ impl Registers for Logged {
 
     unsafe fn write(&mut self, msr: Msr, value: u64) {
         self.accesses.push(('w', msr.index, value));
-        if self.fixed.contains(&msr.index) {
-            return;
-        }
         if let Some(entry) = self
             .values
             .iter_mut()
@@ -308,7 +303,7 @@ fn the_summary_counts_outcomes_and_the_range_of_levels() {
         lines[1],
         "HOST POWER class=all processors=3 mechanism=cppc:2,none:1 highest=166-176 \
          nominal=124 lowest=18 requested_min=124 requested_max=166-176 legacy_level=- \
-         package_request_released=0 turbo(on/enabled/refused/absent)=3/0/0/0 \
+         package_request_released=0 turbo(on/firmware_off/absent)=3/0/0 \
          clock_modulation_cleared=0 energy_bias_firmware=- energy_bias=0"
     );
     // Processors with an empty capability register are said once, together.
@@ -333,7 +328,7 @@ fn each_core_class_has_its_own_power_line() {
             intel(true, false, true),
             &mut Logged::with(&[(PM_ENABLE, 1), (HWP_CAPABILITIES, 0x0100_1c00 | highest)]),
         ),
-        turbo: Turbo::Enabled,
+        turbo: Turbo::On,
         modulation: None,
         energy_bias: Some(6),
     };
@@ -345,7 +340,7 @@ fn each_core_class_has_its_own_power_line() {
         ..hwp(36, Class::Efficiency)
     });
     tally.record(Report {
-        turbo: Turbo::Refused,
+        turbo: Turbo::FirmwareOff,
         ..hwp(36, Class::Efficiency)
     });
     let line = tally.summary();
@@ -357,7 +352,7 @@ fn each_core_class_has_its_own_power_line() {
         lines[1],
         "HOST POWER class=performance processors=2 mechanism=hwp:2 highest=63 nominal=28 \
          lowest=1 requested_min=63 requested_max=63 legacy_level=- package_request_released=0 \
-         turbo(on/enabled/refused/absent)=0/2/0/0 clock_modulation_cleared=0 \
+         turbo(on/firmware_off/absent)=2/0/0 clock_modulation_cleared=0 \
          energy_bias_firmware=6 energy_bias=0"
     );
     assert!(
@@ -366,20 +361,20 @@ fn each_core_class_has_its_own_power_line() {
         "{line}"
     );
     assert!(
-        lines[2].contains(
-            " turbo(on/enabled/refused/absent)=0/1/1/0 clock_modulation_cleared=1(duty%=75) "
-        ),
+        lines[2]
+            .contains(" turbo(on/firmware_off/absent)=1/1/0 clock_modulation_cleared=1(duty%=75) "),
         "{line}"
     );
     assert!(
-        lines[3].starts_with("UNSUPPORTED turbo on 1 processors: "),
+        lines[3].starts_with("HOST POWER turbo is off on 1 processors: "),
         "{line}"
     );
 }
 
 #[test]
-fn turbo_that_firmware_switched_off_is_switched_on_first() {
-    // Intel: IA32_MISC_ENABLE bit 38 set; every other bit is written back.
+fn turbo_that_firmware_switched_off_stays_off() {
+    // Intel: IA32_MISC_ENABLE bit 38 set: reported, and the register is not
+    // written.
     let features = Features {
         turbo_switch: true,
         ..intel(true, false, true)
@@ -390,17 +385,9 @@ fn turbo_that_firmware_switched_off_is_switched_on_first() {
         (HWP_CAPABILITIES, 0x0810_2430),
     ]);
     let report = run(features, &mut registers);
-    assert_eq!(report.turbo, Turbo::Enabled);
-    assert_eq!(
-        registers.writes()[0],
-        (0x1a0, 0x850089),
-        "before the request"
-    );
+    assert_eq!(report.turbo, Turbo::FirmwareOff);
+    assert!(registers.writes().iter().all(|(index, _)| *index != 0x1a0));
     assert!(matches!(report.outcome, Outcome::Hwp { .. }));
-    // A processor that keeps it off says so.
-    let mut registers = Logged::with(&[(MISC_ENABLE, TURBO_DISABLE)]);
-    registers.fixed.push(0x1a0);
-    assert_eq!(run(features, &mut registers).turbo, Turbo::Refused);
     // Left on: no write; on or absent as CPUID.06H:EAX[1] says.
     for (turbo, expected) in [(true, Turbo::On), (false, Turbo::Absent)] {
         let mut registers = Logged::with(&[(MISC_ENABLE, 0x850089)]);
@@ -418,8 +405,8 @@ fn turbo_that_firmware_switched_off_is_switched_on_first() {
         ..amd(false)
     };
     let mut registers = Logged::with(&[(AMD_HWCR, BOOST_DISABLE | 0x0100_0010)]);
-    assert_eq!(run(features, &mut registers).turbo, Turbo::Enabled);
-    assert_eq!(registers.writes(), vec![(0xc001_0015, 0x0100_0010)]);
+    assert_eq!(run(features, &mut registers).turbo, Turbo::FirmwareOff);
+    assert!(registers.writes().is_empty());
     let mut registers = Logged::with(&[(AMD_HWCR, 0x0100_0010)]);
     assert_eq!(run(features, &mut registers).turbo, Turbo::On);
     assert!(registers.writes().is_empty());
@@ -541,7 +528,7 @@ fn amd_without_usable_cppc_asks_for_p0() {
 }
 
 #[test]
-fn the_order_is_turbo_modulation_bias_then_the_level() {
+fn the_order_is_modulation_bias_then_the_level() {
     let features = Features {
         boost_switch: true,
         energy_bias: true,
@@ -554,7 +541,7 @@ fn the_order_is_turbo_modulation_bias_then_the_level() {
     ]);
     run(features, &mut registers);
     let order: Vec<u32> = registers.writes().iter().map(|(index, _)| *index).collect();
-    assert_eq!(order, vec![0xc001_0015, 0x1b0, 0xc001_02b1, 0xc001_02b3]);
+    assert_eq!(order, vec![0x1b0, 0xc001_02b1, 0xc001_02b3]);
 }
 
 #[test]

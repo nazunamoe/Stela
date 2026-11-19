@@ -185,11 +185,23 @@ fn report(writer: &Writer, through: &str) {
             writer.ring_bytes() >> 10
         ));
     }
-    if let Some(smaller) = writer.grown() {
-        output::arguments(format_args!(
+    match (writer.grown(), writer.kept_earlier()) {
+        (Some(smaller), Some(earlier)) => output::arguments(format_args!(
+            "BOOT LOG FILE grew from the {} KiB log an older loader started at its start to the \
+             whole file, after the {earlier} boots of the log before it that the header's copy \
+             names: both logs' boots stay, without the lines the older loader wrote over\n",
+            smaller >> 10
+        )),
+        (Some(smaller), None) => output::arguments(format_args!(
             "BOOT LOG FILE grew from the {} KiB log an older loader started at its start to the \
              whole file: that log's boots stay, the lines before it are gone\n",
             smaller >> 10
+        )),
+        (None, _) => {}
+    }
+    if writer.restored() {
+        output::arguments(format_args!(
+            "BOOT LOG FILE header did not decode; its copy did and names the log\n"
         ));
     }
     let layout = writer.layout();

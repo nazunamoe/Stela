@@ -1296,6 +1296,10 @@ fn repair_steps(environment: &Environment<'_>, command: &Request) -> Result<Stri
     if checked.is_some() && record.medium_checked < checked {
         record.medium_checked = checked;
     }
+    let log = crate::efi::keep_boot_log(environment.host, &esp, tool.len() as u64);
+    if let Some(log) = log.said() {
+        writeln!(text, "  boot log       {log}")?;
+    }
     publish(&mut record)?;
     write_record(&esp, &record)?;
     super::remove_bundles(&record, &stale)?;

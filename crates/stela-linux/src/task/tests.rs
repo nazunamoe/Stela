@@ -9,6 +9,10 @@ use core::{ops::Range, ptr, sync::atomic::AtomicPtr};
 use std::{sync::Mutex, thread};
 use stela_driver_base::platform::image::NativeReadOnlyImage;
 use stela_driver_base::platform::work::service;
+
+/// Linux's THREAD_SIZE and THREAD_ALIGN as `compat/asm/thread_info.h`
+/// compiles them, which every Linux task stack here has.
+const THREAD: usize = 64 * 1024;
 use stela_driver_base::platform::work::{Cpu, Executor, Kind, Queue, Stack, StackBacking};
 
 #[global_allocator]
@@ -63,8 +67,6 @@ impl Drop for MappedStack {
         self.dropped.fetch_add(1, Ordering::Relaxed);
     }
 }
-/// The compiled Linux task stack (`THREAD_SIZE`), which also aligns it.
-const LINUX_STACK: usize = 32 * 1024;
 
 fn stacks(dropped: &Arc<AtomicU64>, usable: usize) -> Vec<Stack> {
     stacks_count(dropped, usable, 4)
@@ -76,13 +78,13 @@ fn stacks_count(dropped: &Arc<AtomicU64>, usable: usize, count: usize) -> Vec<St
             let anonymous = 0x1000;
             #[cfg(not(target_os = "macos"))]
             let anonymous = 0x20;
-            // The compiled Linux stack contract requires THREAD_ALIGN=THREAD_SIZE,
-            // independently of the OS mmap page alignment.
-            let bytes = usable + 4096 + LINUX_STACK;
+            // The compiled Linux stack contract requires THREAD_ALIGN, the
+            // stack's size, independently of the OS mmap page alignment.
+            let bytes = usable + 4096 + THREAD;
             // SAFETY: OS-owned anonymous RW memory; no preexisting frames.
             let base = unsafe { mmap(ptr::null_mut(), bytes, 3, 2 | anonymous, -1, 0) };
             assert_ne!(base as usize, usize::MAX);
-            let start = (base as usize + 4096 + LINUX_STACK - 1) & !(LINUX_STACK - 1);
+            let start = (base as usize + 4096 + THREAD - 1) & !(THREAD - 1);
             // SAFETY: the page preceding aligned usable storage lies within
             // this larger owned mapping and becomes its real stack guard.
             assert_eq!(
@@ -319,7 +321,7 @@ unsafe extern "C" fn reject_large_stack(context: *mut c_void) {
 pub(crate) fn run_trees_child() {
     assert_eq!(
         super::stack_requirement(),
-        stela_driver_base::platform::work::StackRequirement::exact(LINUX_STACK, LINUX_STACK, 4096)
+        stela_driver_base::platform::work::StackRequirement::exact(THREAD, THREAD, 4096)
     );
     let executable = std::env::current_exe().unwrap();
     let output = std::process::Command::new(executable)
@@ -371,8 +373,7 @@ fn trees_child() {
         // SAFETY: the fixture is the queue's owner, and only this test thread produces
         // work.
         let queue = unsafe { Queue::<16>::new(cpu, f.clone()) }.unwrap();
-        let executor =
-            Executor::new_hosted_for_test(queue, stacks(&dropped, 2 * LINUX_STACK)).unwrap();
+        let executor = Executor::new_hosted_for_test(queue, stacks(&dropped, 2 * THREAD)).unwrap();
         let runtime = executor.runtime();
         f.runtime.store(
             runtime.get_ref() as *const Runtime<16> as *mut Runtime<16>,
@@ -396,7 +397,7 @@ fn trees_child() {
     // SAFETY: the fixture is the queue's owner, and only this test thread produces
     // work.
     let queue = unsafe { Queue::<16>::new(cpu.clone(), f.clone()) }.unwrap();
-    let executor = Executor::new_hosted_for_test(queue, stacks(&dropped, LINUX_STACK)).unwrap();
+    let executor = Executor::new_hosted_for_test(queue, stacks(&dropped, THREAD)).unwrap();
     let runtime = executor.runtime();
     f.runtime.store(
         runtime.get_ref() as *const Runtime<16> as *mut Runtime<16>,
@@ -547,8 +548,7 @@ fn service_roundtrip() {
     let queue = unsafe { Queue::<16>::new(cpu.clone(), f.clone()) }.unwrap();
     let dropped = Arc::new(AtomicU64::new(0));
     let executor =
-        Executor::new_hosted_service_for_test(queue, stacks_count(&dropped, LINUX_STACK, 5))
-            .unwrap();
+        Executor::new_hosted_service_for_test(queue, stacks_count(&dropped, THREAD, 5)).unwrap();
     let runtime = executor.runtime();
     f.runtime.store(
         runtime.get_ref() as *const Runtime<16> as *mut Runtime<16>,
@@ -774,8 +774,7 @@ fn clock_service_roundtrip(mode: u64) {
     let queue = unsafe { Queue::<16>::new(cpu.clone(), f.clone()) }.unwrap();
     let dropped = Arc::new(AtomicU64::new(0));
     let executor =
-        Executor::new_hosted_service_for_test(queue, stacks_count(&dropped, LINUX_STACK, 5))
-            .unwrap();
+        Executor::new_hosted_service_for_test(queue, stacks_count(&dropped, THREAD, 5)).unwrap();
     let runtime = executor.runtime();
     f.runtime.store(
         runtime.get_ref() as *const Runtime<16> as *mut Runtime<16>,
@@ -926,7 +925,7 @@ fn stack_catalog_capacity() {
     let queue = unsafe { Queue::<CATALOG_JOBS>::new(cpu.clone(), first.clone()) }.unwrap();
     let executor = Executor::new_hosted_policy_for_test(
         queue,
-        stacks_count(&dropped, LINUX_STACK, CATALOG),
+        stacks_count(&dropped, THREAD, CATALOG),
         stela_driver_base::platform::work::ReservationPolicy::NativeFirmwareProtected {
             gpe: stela_driver_base::platform::work::GpeQueueBudget::QUALIFICATION,
         },
@@ -973,7 +972,7 @@ fn stack_catalog_capacity() {
     // SAFETY: the fixture is the queue's owner, and only this test thread produces
     // work.
     let queue = unsafe { Queue::<CATALOG_JOBS>::new(cpu.clone(), second.clone()) }.unwrap();
-    let refused = Executor::new_hosted_for_test(queue, stacks(&dropped, LINUX_STACK)).unwrap();
+    let refused = Executor::new_hosted_for_test(queue, stacks(&dropped, THREAD)).unwrap();
     let rejected = refused.runtime();
     second.publish(rejected);
     // SAFETY: the callbacks are static, never unwind, and take the fixture the queue keeps
@@ -1000,7 +999,7 @@ fn stack_catalog_capacity() {
     // SAFETY: the fixture is the queue's owner, and only this test thread produces
     // work.
     let queue = unsafe { Queue::<CATALOG_JOBS>::new(cpu.clone(), third.clone()) }.unwrap();
-    let reused = Executor::new_hosted_for_test(queue, stacks(&dropped, LINUX_STACK)).unwrap();
+    let reused = Executor::new_hosted_for_test(queue, stacks(&dropped, THREAD)).unwrap();
     let available = reused.runtime();
     third.publish(available);
     // SAFETY: the callbacks are static, never unwind, and take the fixture the queue keeps
@@ -1279,7 +1278,7 @@ fn mutex_child() {
         // SAFETY: the fixture is the queue's owner, and only this test thread produces
         // work.
         let queue = unsafe { Queue::<16>::new(cpu.clone(), f.clone()) }.unwrap();
-        let executor = Executor::new_hosted_for_test(queue, stacks(&dropped, LINUX_STACK)).unwrap();
+        let executor = Executor::new_hosted_for_test(queue, stacks(&dropped, THREAD)).unwrap();
         let runtime = executor.runtime();
         f.runtime.store(
             runtime.get_ref() as *const Runtime<16> as *mut Runtime<16>,
@@ -1375,7 +1374,7 @@ fn mutex_quarantine_child() {
     // SAFETY: the fixture is the queue's owner, and only this test thread produces
     // work.
     let queue = unsafe { Queue::<16>::new(cpu, f.clone()) }.unwrap();
-    let executor = Executor::new_hosted_for_test(queue, stacks(&dropped, LINUX_STACK)).unwrap();
+    let executor = Executor::new_hosted_for_test(queue, stacks(&dropped, THREAD)).unwrap();
     let runtime = executor.runtime();
     f.runtime.store(
         runtime.get_ref() as *const Runtime<16> as *mut Runtime<16>,
@@ -1446,7 +1445,7 @@ pub(crate) unsafe fn terminal_foreground(
     let queue = unsafe { Queue::<16>::new(cpu, fixture.clone()) }.unwrap();
     let dropped = Arc::new(AtomicU64::new(0));
     let executor =
-        Executor::new_hosted_for_test(queue, stacks_count(&dropped, LINUX_STACK, 4)).unwrap();
+        Executor::new_hosted_for_test(queue, stacks_count(&dropped, THREAD, 4)).unwrap();
     let runtime = executor.runtime();
     fixture.runtime.store(
         runtime.get_ref() as *const Runtime<16> as *mut Runtime<16>,

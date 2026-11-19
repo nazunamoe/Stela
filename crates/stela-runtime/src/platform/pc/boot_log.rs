@@ -20,6 +20,14 @@
 //! | 52 | 4 | reserved, zero |
 //! | 56 | 24 each | per record: boot, `start`, first length, last length |
 //! | after them | 32 | SHA-256 of every byte before it |
+//! | 3584 | 512 | a copy of the header's first 512 bytes ([`COPY_AT`]) |
+//!
+//! Every store writes the 4 KiB whole, the copy with it. A header that does
+//! not decode is read from its copy, and so is the log a loader older than
+//! the copy started over a longer one's start: such a loader writes its
+//! header through a 512-byte block, never the copy, which then still names
+//! the longer log, whose records and ring past the older log stay
+//! ([`merged`]).
 //!
 //! The ring follows the header. Stream byte `i` lives at
 //! `ring[i % ring_bytes]`, so the valid stream is
@@ -67,8 +75,9 @@
 //! its lines at their positions. A loader older than the longer file opens
 //! it as a [`LOG_BYTES`] region and starts a log of that size at its start,
 //! whose header names a smaller region than the file's: [`read`] reads that
-//! log, as [`read_newest`] does, and a [`Writer`] lays it out in the whole
-//! file in place ([`grow`]), so the boots the older loader wrote stay. Writes reach its blocks directly, never
+//! log after the longer one its header's copy names, as [`read_newest`]
+//! does, and a [`Writer`] lays both out in the whole file in place
+//! ([`grow`]), so the boots of both stay. Writes reach its blocks directly, never
 //! the volume's directory or FAT: [`file_runs`] gives the block-aligned runs
 //! of its clusters, wherever they lie, that hold the bytes its layout needs.
 use super::fat32;
@@ -113,6 +122,10 @@ pub const LARGE_LAST_BYTES: u32 = 64 << 10;
 /// The smallest machine-state partition that holds the log.
 pub const PARTITION_BYTES: u64 = OFFSET + LOG_BYTES;
 pub const HEADER_BYTES: u64 = 4096;
+/// Where the header's copy starts in the header's 4 KiB: its last 512
+/// bytes, which no loader older than the copy writes (they write the
+/// header's first block alone, of 512 bytes on every path a stick takes).
+pub const COPY_AT: u64 = HEADER_BYTES - 512;
 /// The boot records of a [`LOG_BYTES`] region.
 pub const RECORDS: u32 = 8;
 /// A record's room for a boot's first lines: what a boot prints before it
@@ -436,6 +449,28 @@ impl Header {
         }
         let digest = Sha256::digest(&block[..at]);
         block[at..at + 32].copy_from_slice(&digest);
+    }
+
+    /// The header's 4 KiB `page`: the header at its start, zeros, and the
+    /// header's copy in its last 512 bytes ([`COPY_AT`]).
+    fn encode_page(&self, page: &mut [u8]) {
+        self.encode(page);
+        let (header, copy) = page.split_at_mut(COPY_AT as usize);
+        copy.copy_from_slice(&header[..copy.len()]);
+    }
+
+    /// The header the 4 KiB `page` names where its own does not decode
+    /// (`error`) for a region of `region` bytes: its copy ([`COPY_AT`]),
+    /// when that decodes. A header of a version this software does not
+    /// write is a newer one's, whose copy it does not know.
+    fn copy(page: &[u8], region: u64, error: &HeaderError) -> Option<Self> {
+        if matches!(error, HeaderError::Version(_)) {
+            return None;
+        }
+        let copy = page.get(COPY_AT as usize..HEADER_BYTES as usize)?;
+        Self::decode(copy, region)
+            .ok()
+            .filter(|header| header.version == VERSION)
     }
 
     /// The header at the start of `bytes`, of either version, for a region
@@ -870,20 +905,31 @@ fn convert(device: &mut dyn BlockDevice, old: &Header, layout: Layout) -> Result
     })
 }
 
-/// Lay the smaller log at the start of the region on `device`, whose header
-/// names a `prefix`-byte region, out in `layout` in place, as [`relayout`]
-/// lays it out in memory: its kept stream at its positions in the new ring,
-/// zeros in the ring's window before them, and each kept boot's record; the
-/// header that names them, which the caller writes last. `None` when the
-/// smaller region does not read as a log. An interruption leaves the
-/// smaller log's header, and lines it read in the ring's bytes, where its
-/// stream had wrapped, written over by the new layout's.
+/// Lay the smaller log at the start of the `region`-byte region on
+/// `device`, whose header names a `prefix`-byte region, out in `layout` in
+/// place, as [`relayout`] lays it out in memory: its kept stream at its
+/// positions in the new ring, zeros in the ring's window before them, and
+/// each kept boot's record; the header that names them, which the caller
+/// writes last, and how many boots of the longer log the header's copy
+/// still named came before ([`merged`]: the region is read whole then).
+/// `None` when the smaller region does not read as a log. An interruption
+/// leaves the smaller log's header and its copy, and lines it read in the
+/// ring's bytes written over by the new layout's: the next boot lays out
+/// what then reads.
 fn grow(
     device: &mut dyn BlockDevice,
+    region: u64,
     prefix: u64,
     layout: Layout,
-) -> Result<Option<Header>, BlockError> {
-    let mut bytes = vec![0; prefix as usize];
+) -> Result<Option<(Header, Option<u64>)>, BlockError> {
+    let mut page = vec![0; HEADER_BYTES as usize];
+    device.read(0, &mut page)?;
+    let error = Header::decode(&page, region).err();
+    let earlier = error
+        .and_then(|error| Header::copy(&page, region, &error))
+        .filter(|copy| copy.layout == layout)
+        .map(|copy| copy.boots);
+    let mut bytes = vec![0; if earlier.is_some() { region } else { prefix } as usize];
     device.read(0, &mut bytes)?;
     let Ok(log) = read(&bytes) else {
         return Ok(None);
@@ -905,7 +951,7 @@ fn grow(
     if device.identity().features.write_cache {
         device.flush_cache()?;
     }
-    Ok(Some(header))
+    Ok(Some((header, earlier)))
 }
 
 /// The log of one boot: appends wait in memory until a flush stores them.
@@ -933,6 +979,11 @@ pub struct Writer {
     converted: bool,
     /// The smaller region of the log this open laid out in the whole one.
     grown: Option<u64>,
+    /// The boots of the longer log the header's copy named, which this open
+    /// kept before the smaller log's ([`merged`]).
+    earlier: Option<u64>,
+    /// The header did not decode and this open took its copy's.
+    restored: bool,
     pending: Pending<Vec<u8>>,
     /// The store in progress: its steps to come and the one running.
     steps: VecDeque<Step>,
@@ -1003,10 +1054,10 @@ impl Writer {
             true => layout,
             false => Layout::ring_only(bytes),
         };
-        let mut first = vec![0; block];
-        device.read(0, &mut first)?;
-        let mut grown = None;
-        let (header, fresh, converted) = match Header::decode(&first, bytes) {
+        let mut page = vec![0; HEADER_BYTES as usize];
+        device.read(0, &mut page)?;
+        let (mut grown, mut earlier, mut restored) = (None, None, false);
+        let (header, fresh, converted) = match Header::decode(&page, bytes) {
             Ok(header) if header.version == VERSION => (header, None, false),
             Ok(old) => {
                 let head = convert(device, &old, layout)?;
@@ -1019,10 +1070,11 @@ impl Writer {
             }
             Err(error) => {
                 let laid_out = match prefix(&error, bytes, block as u64) {
-                    Some(smaller) => {
-                        grow(device, smaller, layout)?.inspect(|_| grown = Some(smaller))
-                    }
-                    None => None,
+                    Some(smaller) => grow(device, bytes, smaller, layout)?.map(|(header, kept)| {
+                        (grown, earlier) = (Some(smaller), kept);
+                        header
+                    }),
+                    None => Header::copy(&page, bytes, &error).inspect(|_| restored = true),
                 };
                 match laid_out {
                     // Its header is still to be written, as a converted one's.
@@ -1071,6 +1123,8 @@ impl Writer {
             fresh,
             converted,
             grown,
+            earlier,
+            restored,
             pending: Pending::new(vec![0; pending]),
             steps: VecDeque::new(),
             running: None,
@@ -1117,9 +1171,13 @@ impl Writer {
         }
         let index = (self.boots % records as u64) as usize;
         let (head, oldest) = (self.ring.head, self.oldest());
-        let last = (0..records)
-            .filter(|&other| other != index && (1..self.boots).contains(&self.records[other].boot))
-            .max_by_key(|&other| self.records[other].boot);
+        // The boot before this one's: an older loader's boots after it
+        // have none, and the newest lines are theirs ([`merged`]).
+        let last = (0..records).find(|&other| {
+            other != index
+                && self.records[other].boot != 0
+                && self.records[other].boot + 1 == self.boots
+        });
         if let Some(last) = last {
             let mut record = self.records[last];
             if record.first == 0 && (oldest..head).contains(&record.start) {
@@ -1226,7 +1284,18 @@ impl Writer {
 
     /// Whether this open converted a version 1 log ([`convert`]).
     pub fn converted(&self) -> bool {
-        self.converted && self.grown.is_none()
+        self.converted && self.grown.is_none() && !self.restored
+    }
+
+    /// The boots of the longer log an older loader's log followed, which
+    /// this open kept before that log's ([`merged`]), if it did.
+    pub fn kept_earlier(&self) -> Option<u64> {
+        self.earlier
+    }
+
+    /// Whether the header did not decode and this open read its copy.
+    pub fn restored(&self) -> bool {
+        self.restored
     }
 
     /// The smaller region of the log an older loader started at the
@@ -1388,7 +1457,7 @@ impl Writer {
                 Step::Record { lba, data },
             ),
             Step::Header => {
-                let mut block = vec![0; ring.block];
+                let mut page = vec![0; HEADER_BYTES as usize];
                 Header {
                     version: VERSION,
                     head: ring.head,
@@ -1396,10 +1465,10 @@ impl Writer {
                     layout: self.layout,
                     records: self.records.clone(),
                 }
-                .encode(&mut block);
+                .encode_page(&mut page);
                 let request = Request::Write {
                     lba: 0,
-                    data: block,
+                    data: page,
                     durable: true,
                 };
                 (request, Step::Header)
@@ -1507,7 +1576,10 @@ impl Log {
 }
 
 /// The log a whole region holds, of either version: its stream in order
-/// and its boot records. A blank or invalid header is refused by name.
+/// and its boot records. A blank or invalid header is refused by name. A
+/// header that does not decode is read from its copy ([`COPY_AT`]); a
+/// smaller log an older loader started at the region's start is read with
+/// the log the copy names, where the copy has it ([`merged`]), else alone.
 pub fn read(region: &[u8]) -> Result<Log, HeaderError> {
     let bytes = region.len() as u64;
     if bytes <= HEADER_BYTES {
@@ -1516,14 +1588,21 @@ pub fn read(region: &[u8]) -> Result<Log, HeaderError> {
     // A log file's region: its whole pages up to the longest a boot writes.
     let bytes = file_region(bytes).unwrap_or(bytes);
     let region = &region[..bytes as usize];
-    let header = match Header::decode(&region[..HEADER_BYTES as usize], bytes) {
-        Ok(header) => header,
-        // A smaller log at the region's start: an older loader's.
-        Err(error) => match prefix(&error, bytes, 1) {
-            Some(smaller) => return read(&region[..smaller as usize]),
-            None => return Err(error),
+    let page = &region[..HEADER_BYTES as usize];
+    match Header::decode(page, bytes) {
+        Ok(header) => Ok(read_with(region, &header)),
+        Err(error) => match (prefix(&error, bytes, 1), Header::copy(page, bytes, &error)) {
+            (Some(smaller), Some(copy)) => Ok(merged(region, &copy, smaller)),
+            // A smaller log at the region's start: an older loader's.
+            (Some(smaller), None) => read(&region[..smaller as usize]),
+            (None, Some(copy)) => Ok(read_with(region, &copy)),
+            (None, None) => Err(error),
         },
-    };
+    }
+}
+
+/// The log `header` names in `region`.
+fn read_with(region: &[u8], header: &Header) -> Log {
     let (head, layout) = (header.head, header.layout);
     let ring_bytes = layout.ring_bytes;
     let ring = &region[HEADER_BYTES as usize..(HEADER_BYTES + ring_bytes) as usize];
@@ -1539,6 +1618,19 @@ pub fn read(region: &[u8]) -> Result<Log, HeaderError> {
     // with them.
     let unwritten = stream.iter().take_while(|&&byte| byte == 0).count();
     stream.drain(..unwritten);
+    Log {
+        boots: header.boots,
+        head,
+        ring_bytes,
+        stream,
+        starts: records(region, header),
+    }
+}
+
+/// The boot records `header` names in `region` that hold their boot's
+/// lines, oldest boot first.
+fn records(region: &[u8], header: &Header) -> Vec<BootStart> {
+    let layout = header.layout;
     let mut starts: Vec<BootStart> = header
         .records
         .iter()
@@ -1551,10 +1643,7 @@ pub fn read(region: &[u8]) -> Result<Log, HeaderError> {
             // First lines start with their boot's marker, and its note:
             // other bytes are a record a write did not finish, never
             // another boot's lines.
-            let marker = format!("=== STELA BOOT {} ===", record.boot);
-            let marked = first
-                .strip_prefix(marker.as_bytes())
-                .is_some_and(|rest| matches!(rest.first(), Some(b'\n' | b' ')));
+            let marked = marker_of(first) == Some(record.boot);
             (first.is_empty() || marked).then(|| BootStart {
                 boot: record.boot,
                 start: record.start,
@@ -1564,13 +1653,180 @@ pub fn read(region: &[u8]) -> Result<Log, HeaderError> {
         })
         .collect();
     starts.sort_by_key(|start| start.boot);
-    Ok(Log {
-        boots: header.boots,
-        head,
-        ring_bytes,
+    starts
+}
+
+/// The boot whose marker `line` starts with: `=== STELA BOOT n ===` and the
+/// line's end or its note.
+fn marker_of(line: &[u8]) -> Option<u64> {
+    let rest = line.strip_prefix(b"=== STELA BOOT ")?;
+    let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    let boot = core::str::from_utf8(&rest[..digits]).ok()?.parse().ok()?;
+    let after = rest[digits..].strip_prefix(b" ===")?;
+    matches!(after.first(), Some(b'\n' | b' ')).then_some(boot)
+}
+
+/// The line that stands for `bytes` of a log that are gone, and why.
+fn missing_line(bytes: u64, why: &str) -> Vec<u8> {
+    format!("[boot log: {bytes} bytes are missing here: {why}]\n").into_bytes()
+}
+
+/// Why the newer loader's lines past an older loader's log are gone.
+const WRITTEN_OVER: &str = "an older Stela wrote its own log over them";
+
+/// The log a loader older than the longer file started at the start of
+/// `region`, `smaller` bytes long, read after the log it found there, which
+/// `copy` (the header's copy, [`COPY_AT`], which that loader leaves alone)
+/// still names: one log of every boot both kept. The older loader wrote its
+/// header block and the part of its ring its stream reached, nothing past
+/// it: the boot records of the longer log lie beyond, and so does the rest
+/// of its ring, whose lines stay where they were with a line in place of
+/// those written over. The older loader's boots follow, numbered on from
+/// the longer log's last, so the boot that opens the log next counts on
+/// from both. A smaller log with boot records of its own, which no
+/// released loader writes, is read alone, as is one whose header does not
+/// decode.
+fn merged(region: &[u8], copy: &Header, smaller: u64) -> Log {
+    let page = &region[..HEADER_BYTES as usize];
+    let small = match Header::decode(page, smaller) {
+        Ok(small) if small.layout.records == 0 => small,
+        _ => {
+            return read(&region[..smaller as usize]).unwrap_or_else(|_| read_with(region, copy));
+        }
+    };
+    let older = read_with(&region[..smaller as usize], &small);
+    let layout = copy.layout;
+    let ring = layout.ring_bytes;
+    // The ring positions the older log's stream reached, in whole pages.
+    let lost = small
+        .head
+        .min(small.layout.ring_bytes)
+        .next_multiple_of(HEADER_BYTES)
+        .min(smaller - HEADER_BYTES);
+    // What the longer ring keeps: its window without the lost positions.
+    let oldest = copy.head.saturating_sub(ring);
+    let mut parts: Vec<(u64, &[u8])> = Vec::new();
+    for turn in oldest / ring..copy.head.div_ceil(ring) {
+        let from = oldest.max(turn * ring + lost);
+        let to = copy.head.min((turn + 1) * ring);
+        if from < to {
+            let at = (HEADER_BYTES + from % ring) as usize;
+            parts.push((from, &region[at..at + (to - from) as usize]));
+        }
+    }
+    // Bytes no boot wrote, before the first.
+    if let Some((from, bytes)) = parts.first_mut() {
+        let unwritten = bytes.iter().take_while(|&&byte| byte == 0).count();
+        *from += unwritten as u64;
+        *bytes = &bytes[unwritten..];
+    }
+    parts.retain(|(_, bytes)| !bytes.is_empty());
+    // The stream starts where the first part does: a position where its
+    // bytes are, as overwritten ones stay where they were.
+    let base = parts
+        .first()
+        .map_or(oldest.max(copy.head.min(lost)), |(from, _)| *from);
+    let mut stream = Vec::new();
+    // Where each kept part, and the line in each gap's place, went: its
+    // positions in the longer log, and its first in the new one.
+    let mut moved: Vec<(u64, u64, u64, bool)> = Vec::new();
+    let mut at = base;
+    let say_gap = |stream: &mut Vec<u8>, moved: &mut Vec<_>, from: u64, to: u64| {
+        if stream.last().is_some_and(|&byte| byte != b'\n') {
+            stream.push(b'\n');
+        }
+        moved.push((from, to, base + stream.len() as u64, false));
+        stream.extend_from_slice(&missing_line(to - from, WRITTEN_OVER));
+    };
+    for (from, bytes) in &parts {
+        if *from > at {
+            say_gap(&mut stream, &mut moved, at, *from);
+        }
+        let to = *from + bytes.len() as u64;
+        moved.push((*from, to, base + stream.len() as u64, true));
+        stream.extend_from_slice(bytes);
+        at = to;
+    }
+    if at < copy.head {
+        say_gap(&mut stream, &mut moved, at, copy.head);
+    }
+    let newer_end = stream.len();
+    // A position of the longer log's stream in the new one: those before
+    // it stay, as overwritten ones; one written over is its gap's line's.
+    let place = |position: u64| -> u64 {
+        match moved
+            .iter()
+            .find(|(from, to, ..)| (*from..*to).contains(&position))
+        {
+            Some((from, _, placed, true)) => placed + (position - from),
+            Some((_, _, placed, false)) => *placed,
+            None if position < base => position,
+            None => base + newer_end as u64,
+        }
+    };
+    // The longer log's records lie past the smaller log, or are not its.
+    let mut starts: Vec<BootStart> = match layout.record_at(0) >= smaller {
+        true => records(region, copy),
+        false => Vec::new(),
+    };
+    for start in &mut starts {
+        start.start = place(start.start);
+    }
+    // Its last boot's lines end where the older loader's began: they are
+    // kept in its record now, as a later boot would take the newest lines
+    // of the stream, the older loader's, for them.
+    if let Some(last) = starts.iter_mut().find(|start| start.boot == copy.boots) {
+        let begin = (last.start.saturating_sub(base) as usize).min(newer_end);
+        let own = &stream[begin..newer_end];
+        if last.first.is_empty() && marker_of(own) == Some(last.boot) {
+            let room = own.len().min(layout.first_bytes as usize);
+            last.first = match room < own.len() {
+                true => whole_lines(&own[..room]).to_vec(),
+                false => own.to_vec(),
+            };
+        }
+        if last.last.is_empty() {
+            let after = (begin + last.first.len()).min(newer_end);
+            let tail = &stream[after..newer_end];
+            let mut kept = &tail[tail.len() - tail.len().min(layout.last_bytes as usize)..];
+            if kept.len() < tail.len()
+                && let Some(end) = kept.iter().position(|&byte| byte == b'\n')
+            {
+                kept = &kept[end + 1..];
+            }
+            last.last = kept.to_vec();
+        }
+    }
+    // The older loader's boots, numbered on, from a line's start.
+    if stream.last().is_some_and(|&byte| byte != b'\n') {
+        stream.push(b'\n');
+    }
+    if older.overwritten() != 0 {
+        stream.extend_from_slice(&missing_line(
+            older.overwritten(),
+            "the older Stela's log overwrote them with its own later lines",
+        ));
+    }
+    let mut line_start = true;
+    for line in older.stream.split_inclusive(|&byte| byte == b'\n') {
+        match (line_start, marker_of(line)) {
+            (true, Some(boot)) if (1..=small.boots).contains(&boot) => {
+                let digits = format!("{boot}").len();
+                stream
+                    .extend_from_slice(format!("=== STELA BOOT {}", boot + copy.boots).as_bytes());
+                stream.extend_from_slice(&line[15 + digits..]);
+            }
+            _ => stream.extend_from_slice(line),
+        }
+        line_start = line.ends_with(b"\n");
+    }
+    Log {
+        boots: copy.boots + small.boots,
+        head: base + stream.len() as u64,
+        ring_bytes: ring,
         stream,
         starts,
-    })
+    }
 }
 
 /// The log `old` holds (of either version), laid out in a `bytes`-long
@@ -1590,7 +1846,7 @@ pub fn relayout(old: &[u8], bytes: u64) -> Result<Vec<u8>, HeaderError> {
     for (offset, bytes) in pieces {
         region[offset as usize..offset as usize + bytes.len()].copy_from_slice(&bytes);
     }
-    header.encode(&mut region[..HEADER_BYTES as usize]);
+    header.encode_page(&mut region[..HEADER_BYTES as usize]);
     Ok(region)
 }
 
@@ -1667,16 +1923,28 @@ pub fn read_newest(
     if block == 0 || !HEADER_BYTES.is_multiple_of(block) || bytes <= HEADER_BYTES {
         return Ok(Vec::new());
     }
-    let mut header = vec![0; HEADER_BYTES as usize];
-    device.read(0, &mut header)?;
-    // A smaller log at the region's start, an older loader's, as `read`.
-    let header = match Header::decode(&header, bytes) {
+    let mut page = vec![0; HEADER_BYTES as usize];
+    device.read(0, &mut page)?;
+    // A smaller log at the region's start, an older loader's, and a header
+    // read from its copy, as `read`.
+    let header = match Header::decode(&page, bytes) {
         Ok(header) => header,
-        Err(error) => match prefix(&error, bytes, block)
-            .and_then(|smaller| Header::decode(&header, smaller).ok())
-        {
-            Some(header) => header,
-            None => return Ok(Vec::new()),
+        Err(error) => match (
+            prefix(&error, bytes, block),
+            Header::copy(&page, bytes, &error),
+        ) {
+            // Both logs, as one: the region whole, once after an older loader.
+            (Some(_), Some(_)) => {
+                let mut region = vec![0; bytes as usize];
+                device.read(0, &mut region)?;
+                return Ok(read(&region).map(|log| log.stream).unwrap_or_default());
+            }
+            (Some(smaller), None) => match Header::decode(&page, smaller) {
+                Ok(header) => header,
+                Err(_) => return Ok(Vec::new()),
+            },
+            (None, Some(copy)) => copy,
+            (None, None) => return Ok(Vec::new()),
         },
     };
     let (head, ring_bytes) = (header.head, header.layout.ring_bytes);

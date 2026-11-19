@@ -769,11 +769,23 @@ fn generate(sysroot: &Sysroot, build: &Path, path: &Path, libclang: &Path) -> Re
             .args(&targets)
             .current_dir(build)
             .env("BINDGEN_EXTRA_CLANG_ARGS", quoted.join(" "))
-            .env("LIBCLANG_PATH", libclang)
+            .env("LIBCLANG_PATH", bindgen_libclang(libclang))
             .env("PATH", path)
             // As in `setup`, should Ninja configure again.
             .env_remove("PKG_CONFIG_PATH"),
     )
+}
+
+/// What bindgen's `LIBCLANG_PATH` takes. On Windows, clang-sys looks for
+/// `libclang.dll` in a directory and finds nothing from the file's own path,
+/// least of all one in `\\?\` form; elsewhere the file serves as it is.
+fn bindgen_libclang(libclang: &Path) -> PathBuf {
+    if !cfg!(windows) {
+        return libclang.to_path_buf();
+    }
+    let directory = libclang.parent().unwrap_or(libclang);
+    let text = directory.to_string_lossy();
+    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned())
 }
 
 pub(super) fn resource_directory(clang: &Path) -> Result<String> {
@@ -825,7 +837,7 @@ fn bindings(build: &Path, path: &Path, flags: &[String], libclang: &Path) -> Res
                         .filter(|word| !host_define(word)),
                 )
                 .current_dir(build)
-                .env("LIBCLANG_PATH", libclang)
+                .env("LIBCLANG_PATH", bindgen_libclang(libclang))
                 .env("PATH", path),
         )?;
     }

@@ -35,12 +35,12 @@
 //!
 //! Independent of the tier, on each processor:
 //!
-//! - Turbo or boost that firmware switched off is switched on where the
-//!   processor offers it: Intel IA32_MISC_ENABLE bit 38 (set only on parts
-//!   with turbo, SDM Vol. 4 table 2-2), AMD HWCR bit 25 (CpbDis) where
-//!   CPUID 8000_0007H:EDX[9] reports core performance boost (Linux's
-//!   acpi-cpufreq `boost` switch writes the same bit). Turbo runs within
-//!   the processor's own power, current and thermal limits.
+//! - Turbo or boost that firmware switched off stays off and is reported:
+//!   Intel IA32_MISC_ENABLE bit 38 (set only on parts with turbo, SDM Vol. 4
+//!   table 2-2), AMD HWCR bit 25 (CpbDis) where CPUID 8000_0007H:EDX[9]
+//!   reports core performance boost. The bit is the PC's setup choice or
+//!   its maker's thermal design, and Linux's intel_pstate and amd-pstate
+//!   leave it as found too. Neither register is written.
 //! - On-demand clock modulation (IA32_CLOCK_MODULATION bit 4) left on is
 //!   cleared, as Linux's ACPI processor driver clears a throttling state at
 //!   start ("we'll crank up the speed", `acpi_processor_get_throttling_info`).
@@ -434,10 +434,8 @@ impl Outcome {
 pub enum Turbo {
     /// Offered and on as firmware left it.
     On,
-    /// Firmware had switched it off; it is on now.
-    Enabled,
-    /// Firmware had switched it off and the processor kept it off.
-    Refused,
+    /// Firmware switched it off, and it stays off.
+    FirmwareOff,
     /// Not offered, or the processor does not say (a hypervisor).
     Absent,
 }
@@ -499,11 +497,11 @@ impl Registers for Hardware {
     }
 }
 
-/// Switch turbo or boost back on where firmware switched it off.
+/// Whether turbo or boost is on as firmware left it; nothing is written.
 ///
 /// # Safety
 /// As [`request_with`].
-unsafe fn switch_turbo_on(features: Features, registers: &mut impl Registers) -> Turbo {
+unsafe fn turbo_state(features: Features, registers: &mut impl Registers) -> Turbo {
     let (msr, off) = if features.turbo_switch {
         (MISC_ENABLE, TURBO_DISABLE)
     } else if features.boost_switch {
@@ -512,24 +510,15 @@ unsafe fn switch_turbo_on(features: Features, registers: &mut impl Registers) ->
         return Turbo::Absent;
     };
     // SAFETY: IA32_MISC_ENABLE is architectural on Intel 64; HWCR is gated by
-    // CPUID's CPB bit. Bit 38 is set only on parts with turbo, and bit 25
-    // switches only boost; every other bit is written back as read.
-    unsafe {
-        let value = registers.read(msr);
-        if value & off == 0 {
-            // Intel: CPUID.06H:EAX[1] says whether turbo exists at all.
-            return if features.boost_switch || features.turbo {
-                Turbo::On
-            } else {
-                Turbo::Absent
-            };
-        }
-        registers.write(msr, value & !off);
-        if registers.read(msr) & off == 0 {
-            Turbo::Enabled
-        } else {
-            Turbo::Refused
-        }
+    // CPUID's CPB bit. Bit 38 is set only on parts with turbo.
+    let value = unsafe { registers.read(msr) };
+    if value & off != 0 {
+        Turbo::FirmwareOff
+    } else if features.boost_switch || features.turbo {
+        // Intel: CPUID.06H:EAX[1] says whether turbo exists at all.
+        Turbo::On
+    } else {
+        Turbo::Absent
     }
 }
 
@@ -543,7 +532,7 @@ unsafe fn switch_turbo_on(features: Features, registers: &mut impl Registers) ->
 pub unsafe fn request_with(features: Features, registers: &mut impl Registers) -> Report {
     // SAFETY: the caller's contract; each helper touches only registers
     // `features` enumerates.
-    let turbo = unsafe { switch_turbo_on(features, registers) };
+    let turbo = unsafe { turbo_state(features, registers) };
     let mut modulation = None;
     if features.clock_modulation {
         // SAFETY: CPUID.01H:EDX[22] enumerates IA32_CLOCK_MODULATION; bits
@@ -725,7 +714,7 @@ struct ClassTally {
     maximum: Range,
     /// PERF_CTL ratio, or AMD's current P-state limit.
     legacy: Range,
-    turbo: [AtomicU32; 4],
+    turbo: [AtomicU32; 3],
     modulation: AtomicU32,
     duty: Range,
     energy_bias: Range,
@@ -743,7 +732,7 @@ impl ClassTally {
             minimum: Range::new(),
             maximum: Range::new(),
             legacy: Range::new(),
-            turbo: [const { AtomicU32::new(0) }; 4],
+            turbo: [const { AtomicU32::new(0) }; 3],
             modulation: AtomicU32::new(0),
             duty: Range::new(),
             energy_bias: Range::new(),
@@ -771,7 +760,7 @@ impl ClassTally {
         Some(format!(
             "HOST POWER class={} processors={processors} mechanism={mechanisms} highest={} \
              nominal={} lowest={} requested_min={} requested_max={} legacy_level={} package_request_released={} \
-             turbo(on/enabled/refused/absent)={}/{}/{}/{} clock_modulation_cleared={modulated}{} \
+             turbo(on/firmware_off/absent)={}/{}/{} clock_modulation_cleared={modulated}{} \
              energy_bias_firmware={} energy_bias=0\n",
             class.name(),
             self.highest.text(),
@@ -784,7 +773,6 @@ impl ClassTally {
             turbo[0],
             turbo[1],
             turbo[2],
-            turbo[3],
             if modulated != 0 {
                 format!("(duty%={})", self.duty.text())
             } else {
@@ -875,7 +863,8 @@ impl Tally {
 
     /// The outcomes as the `HOST PERFORMANCE` line, one `HOST POWER` line
     /// per core class, and one `UNSUPPORTED` line for processors that
-    /// published no usable levels and for turbo the processor kept off.
+    /// published no usable levels, and one `HOST POWER turbo` line for
+    /// processors whose firmware switched turbo off.
     pub fn summary(&self) -> String {
         let package: u32 = self
             .classes
@@ -909,16 +898,16 @@ impl Tally {
                  register is reported, so each keeps the request its firmware left\n"
             ));
         }
-        let refused: u32 = self
+        let off: u32 = self
             .classes
             .iter()
-            .map(|class| class.turbo[Turbo::Refused.index()].load(Ordering::Relaxed))
+            .map(|class| class.turbo[Turbo::FirmwareOff.index()].load(Ordering::Relaxed))
             .sum();
-        if refused != 0 {
+        if off != 0 {
             line.push_str(&format!(
-                "UNSUPPORTED turbo on {refused} processors: firmware switched it off and the \
-                 processor kept it off when asked to switch it on, so they run at most at their \
-                 base clock\n"
+                "HOST POWER turbo is off on {off} processors: the PC's firmware switched it off \
+                 and Stela leaves it so, so they run at most at their base clock; the turbo or \
+                 boost setting in the firmware's setup switches it on\n"
             ));
         }
         line

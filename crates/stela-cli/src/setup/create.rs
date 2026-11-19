@@ -1238,6 +1238,15 @@ pub(super) fn apply(environment: &Environment<'_>, plan: Plan) -> Result<()> {
     if let Some(passphrase) = &plan.wifi_passphrase {
         wifi::write_key(&esp, passphrase)?;
     }
+    // A new stick's log is made whole without a word.
+    match efi::keep_boot_log(environment.host, &esp, plan.efi_image.len() as u64) {
+        efi::LogFile::Made(stela_runtime::pc::boot_log::FILE_BYTES) => {}
+        log => {
+            if let Some(log) = log.said() {
+                eprintln!("Note: boot log {log}");
+            }
+        }
+    }
     efi::add_mount(&esp, &plan.efi_image, None, Some(&record.options))?;
     publish(&mut record)?;
     record.complete = true;

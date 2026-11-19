@@ -430,6 +430,11 @@ pub(crate) fn open_log(disk: &Shared, block: u64, available: u64) -> bool {
     if let Some(reason) = writer.fresh() {
         output::arguments(format_args!("BOOT LOG fresh: {reason}\n"));
     }
+    if writer.restored() {
+        output::arguments(format_args!(
+            "BOOT LOG header did not decode; its copy did and names the log\n"
+        ));
+    }
     if writer.converted() {
         output::arguments(format_args!(
             "BOOT LOG layout changed to keep each boot's first lines: the newest {} KiB of the \
