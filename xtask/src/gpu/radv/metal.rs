@@ -65,14 +65,7 @@ const PCI: PciBusInfo = PciBusInfo {
 };
 /// The render node Mesa's DRM shim shows.
 const RENDER_NODE: &CStr = c"/dev/dri/renderD128";
-/// What the parent finds in the child's output.
-pub(super) const OPENED: &str = "Metal device:";
-pub(super) const REFUSED: &str = "Metal device refused:";
-/// What follows [`REFUSED`]: the requirements the device lacks, by name,
-/// between these.
-pub(super) const LACKS: &str = "the Vulkan device lacks ";
-pub(super) const LEFT_OUT: &str = "; the port leaves such a GPU out";
-pub(super) const CORPUS: &str = "Metal corpus:";
+use super::{CORPUS, LACKS, LEFT_OUT, OPENED, REFUSED};
 
 fn log(message: &str) {
     println!("  driver: {message}");

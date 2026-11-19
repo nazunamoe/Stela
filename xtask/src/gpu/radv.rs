@@ -46,8 +46,27 @@ const USED: &str = "amdgpu ioctls:";
 const SHIM: &str = "src/amd/drm-shim/libamdgpu_noop_drm_shim.so";
 
 mod devices;
+// The Metal device's child process loads RADV with `dlopen` and asks
+// amdgpu's render node, so it runs on Linux, under Mesa's DRM shim.
+#[cfg(unix)]
 mod metal;
+#[cfg(unix)]
 pub use metal::run as metal;
+
+/// `gpu radv-metal` off Linux: the child has no RADV to load.
+#[cfg(not(unix))]
+pub fn metal(_library: &Path, _linux: &Path, _corpus: &[PathBuf]) -> Result<()> {
+    anyhow::bail!("gpu radv-metal runs RADV under Mesa's DRM shim, on Linux only")
+}
+
+/// What the parent finds in the child's output.
+pub(super) const OPENED: &str = "Metal device:";
+pub(super) const REFUSED: &str = "Metal device refused:";
+/// What follows [`REFUSED`]: the requirements the device lacks, by name,
+/// between these.
+pub(super) const LACKS: &str = "the Vulkan device lacks ";
+pub(super) const LEFT_OUT: &str = "; the port leaves such a GPU out";
+pub(super) const CORPUS: &str = "Metal corpus:";
 
 pub fn test(jobs: u16, corpus: &[PathBuf]) -> Result<()> {
     let corpus = libraries(corpus)?;
@@ -315,10 +334,10 @@ fn open_metal(
         Ok(stdout)
     };
     let stdout = child(None, &output.join(format!("{device}.metal.log")))?;
-    if let Some(line) = stdout.lines().find(|line| line.starts_with(metal::REFUSED)) {
+    if let Some(line) = stdout.lines().find(|line| line.starts_with(REFUSED)) {
         let lacks = line
-            .split_once(metal::LACKS)
-            .and_then(|(_, rest)| rest.strip_suffix(metal::LEFT_OUT))
+            .split_once(LACKS)
+            .and_then(|(_, rest)| rest.strip_suffix(LEFT_OUT))
             .with_context(|| format!("the Metal device's refusal names no requirement: {line}"))?;
         return Ok(Opened::LeftOut(
             line.to_owned(),
@@ -327,7 +346,7 @@ fn open_metal(
     }
     let mut lines: Vec<String> = stdout
         .lines()
-        .filter(|line| line.starts_with(metal::OPENED))
+        .filter(|line| line.starts_with(OPENED))
         .map(str::to_owned)
         .collect();
     ensure!(
@@ -364,7 +383,7 @@ fn open_metal(
     Ok(Opened::Metal(lines))
 }
 
-/// A corpus line's counts (`metal::CORPUS`).
+/// A corpus line's counts (`CORPUS`).
 #[derive(Debug, Default, PartialEq)]
 struct Corpus {
     functions: usize,
@@ -379,7 +398,7 @@ struct Corpus {
 impl Corpus {
     fn parse(line: &str) -> Option<Self> {
         let numbers: Vec<usize> = line
-            .strip_prefix(metal::CORPUS)?
+            .strip_prefix(CORPUS)?
             .split(|c: char| !c.is_ascii_digit())
             .filter(|word| !word.is_empty())
             .map(|word| word.parse().ok())
@@ -420,7 +439,7 @@ impl Corpus {
         format!(
             "{} {} functions, {} pipelines built by ACO ({} compute, {} graphics), {} refused, \
              {} skipped, {} of {} kernels built again from the driver's cache data alone",
-            metal::CORPUS,
+            CORPUS,
             self.functions,
             self.compute + self.graphics,
             self.compute,
