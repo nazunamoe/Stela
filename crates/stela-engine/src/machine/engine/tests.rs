@@ -136,6 +136,13 @@ pub(super) struct FakeHost {
     /// What the next native blocks return, in order: unit tests do not
     /// run native code.
     pub(super) exits: Vec<NativeExit>,
+    /// What native blocks return in turn once [`Self::exits`] runs out,
+    /// over and over, for the run loop's timings; and the turns so far.
+    pub(super) cycle: Vec<NativeExit>,
+    turn: usize,
+    /// The counter reads the host's time stamp counter, as a real host's
+    /// does, for the run loop's timings.
+    pub(super) stamped: bool,
     /// A translation store, for the tests that give the host one.
     pub(super) store: Option<stored::tests::MemoryStore>,
     /// Pages whose fetch the host refuses, and its answers.
@@ -417,6 +424,11 @@ impl Host for FakeHost {
         Some(entry)
     }
     unsafe fn execute(&mut self, _: NativeCode, state: &mut GuestState) -> NativeExit {
+        if self.exits.is_empty() && !self.cycle.is_empty() {
+            let exit = self.cycle[self.turn % self.cycle.len()];
+            self.turn = self.turn.wrapping_add(1);
+            return exit;
+        }
         assert!(!self.exits.is_empty(), "unit tests do not run native code");
         if let Some((control, chained, account)) = self.chained.take() {
             state.account = account.0;
@@ -525,6 +537,11 @@ impl Host for FakeHost {
         self.counter_reads += 1;
         if self.real_counter {
             return super::board::timestamp();
+        }
+        if self.stamped {
+            // SAFETY: RDTSC only reads the time stamp counter. Seven bits
+            // off bring a few-GHz count near the profile's 24 MHz.
+            return unsafe { core::arch::x86_64::_rdtsc() } >> 7;
         }
         let now = self.now;
         self.now += self.counter_step;
@@ -728,6 +745,9 @@ pub(super) fn board_on<D: Devices>(
         live_patch_start: 0,
         chained: None,
         exits: Vec::new(),
+        cycle: Vec::new(),
+        turn: 0,
+        stamped: false,
         store: None,
         refused: Vec::new(),
         fetch_checks: 0,
@@ -10281,6 +10301,7 @@ mod pstate_features;
 mod recovery;
 mod reinstall_cost;
 mod retire_cost;
+mod run_overhead;
 mod shared_code;
 mod sharing;
 mod stage2_syndrome;
