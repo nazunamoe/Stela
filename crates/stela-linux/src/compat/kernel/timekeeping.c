@@ -31,6 +31,12 @@ u64 notrace ktime_get_mono_fast_ns(void)
 	return (u64)ktime_get();
 }
 
+/* The raw clock's fast accessor, by the same reasoning. */
+u64 notrace ktime_get_raw_fast_ns(void)
+{
+	return (u64)ktime_get_raw();
+}
+
 notrace u64 sched_clock(void)
 {
 	ktime_t now = ktime_get();

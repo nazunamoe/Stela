@@ -138,6 +138,22 @@ int string_get_size(u64 size, u64 blk_size, const enum string_size_units units, 
 			units & STRING_UNITS_NO_BYTES ? "" : "B");
 }
 
+/* lib/string_helpers.c's strim: the string without its leading spaces, its
+ * first trailing space (if any) replaced by the terminator. */
+char *strim(char *s)
+{
+	size_t size = strlen(s);
+
+	if (!size)
+		return s;
+	char *end = s + size - 1;
+
+	while (end >= s && isspace(*end))
+		end--;
+	*(end + 1) = '\0';
+	return skip_spaces(s);
+}
+
 #ifdef STELA_LINUX_STRING_HELPERS_TEST
 #include <linux/string_helpers.h>
 #include <stela/test.h>
@@ -262,6 +278,13 @@ int main(void)
 	assert(strreplace(writable, 'z', '!') == writable && !strcmp(writable, "a!b!c"));
 	char empty[] = "";
 	assert(strreplace(empty, 'x', 'y') == empty && !empty[0]);
+	char padded[] = "  a b \t\n";
+	char *stripped = strim(padded);
+	assert(stripped == padded + 2 && !strcmp(stripped, "a b"));
+	char blank[] = "   ";
+	assert(!strcmp(strim(blank), ""));
+	char none[] = "";
+	assert(strim(none) == none);
 	printf("Linux string helpers: byte order, bounds, search and replacement passed\n");
 	return 0;
 }

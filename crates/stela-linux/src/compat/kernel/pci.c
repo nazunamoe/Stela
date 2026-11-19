@@ -605,6 +605,40 @@ int pci_resize_resource(struct pci_dev *dev, int resno, int size, int exclude_ba
 	return -ENOTSUPP;
 }
 
+/* drivers/pci/bus.c's: a resource placed in a free part of the bus's
+ * windows. No bus has a window here (pci_bus_resource_n), so a driver that
+ * places a resource the firmware left unplaced goes without it: i915 then
+ * leaves MCHBAR off, as when Linux finds no room. */
+int pci_bus_alloc_resource(struct pci_bus *bus, struct resource *res, resource_size_t size,
+			   resource_size_t align, resource_size_t min, unsigned long type_mask,
+			   resource_alignf alignf, void *alignf_data)
+{
+	(void)bus, (void)res, (void)size, (void)align, (void)min, (void)type_mask;
+	(void)alignf, (void)alignf_data;
+	stela_linux_unsupported("placing a resource the firmware left unplaced in a PCI bus window: "
+				"the driver goes without it");
+	return -EBUSY;
+}
+
+/* The end of the legacy BIOS area (arch/x86/include/asm/e820/types.h). */
+#define BIOS_END 0x00100000
+
+/* arch/x86/pci/i386.c's alignment of a resource placed in a bus window,
+ * which pci_bus_alloc_resource asks for; it places none. */
+resource_size_t pcibios_align_resource(void *data, const struct resource *res,
+				       const struct resource *empty_res, resource_size_t size,
+				       resource_size_t align)
+{
+	resource_size_t start = res->start;
+
+	(void)data, (void)empty_res, (void)size, (void)align;
+	if ((res->flags & IORESOURCE_IO) && (start & 0x300))
+		start = (start + 0x3ff) & ~(resource_size_t)0x3ff;
+	else if ((res->flags & IORESOURCE_MEM) && start < BIOS_END)
+		start = BIOS_END;
+	return start;
+}
+
 /* What a BAR's resize released, assigned again. pci_resize_resource refuses
  * every resize, so each BAR keeps the firmware's assignment and nothing is
  * unassigned: there is nothing to do. */
@@ -644,6 +678,9 @@ static void bind(struct pci_driver *driver, struct pci_dev *dev)
 	if (error != -ENODEV)
 		dev_err(&dev->dev, "%s: probe failed: %pe\n", driver->name, ERR_PTR(error));
 	stela_linux_devres_release(&dev->dev);
+	/* What the driver's own error path left running is stopped before the
+	 * next driver is offered the function. */
+	stela_linux_pci_quiesce_failed(dev, driver->name);
 	dev->dev.driver = NULL;
 	dev->driver = NULL;
 }
@@ -659,6 +696,22 @@ static void unbind(struct pci_dev *dev)
 	stela_linux_devres_release(&dev->dev);
 	dev->dev.driver = NULL;
 	dev->driver = NULL;
+}
+
+/* drivers/base/dd.c's device_release_driver for one function while Linux
+ * runs on: its driver's remove, then its managed resources; what the remove
+ * left (interrupt requests, MSI, bus mastering) is stopped as after a failed
+ * probe. The function stays published and unbound. Whether a driver held
+ * it. */
+bool stela_linux_pci_release(struct pci_dev *dev)
+{
+	const char *driver = dev->driver ? dev->driver->name : NULL;
+
+	if (!driver)
+		return false;
+	unbind(dev);
+	stela_linux_pci_quiesce(dev, driver, "unload");
+	return true;
 }
 
 bool stela_linux_pci_devices_present(void)
@@ -695,6 +748,13 @@ int stela_linux_pci_publish_for_searches(struct pci_dev *dev)
 bool stela_linux_pci_bound(const struct pci_dev *device)
 {
 	return device->dev.driver;
+}
+
+/* The name of the driver bound to the device, which is the first registered
+ * driver whose table holds it and whose probe succeeded, or NULL. */
+const char *stela_linux_pci_driver_name(const struct pci_dev *device)
+{
+	return device->driver ? device->driver->name : NULL;
 }
 
 /* What the kernel's shutdown does of a device: its driver stops the hardware. */
@@ -1232,6 +1292,18 @@ int pci_dev_present(const struct pci_device_id *ids)
 
 /* Whether the function can signal PME# from state, as its power management
  * capability says (PCI PM 1.2, 3.2.3), which drivers/pci/pci.c caches. */
+/* drivers/pci/pci.c: whether the function may enter D3cold. Nothing here
+ * puts a function or its bridge into D3cold, so only the flag changes. */
+void pci_d3cold_enable(struct pci_dev *dev)
+{
+	dev->no_d3cold = false;
+}
+
+void pci_d3cold_disable(struct pci_dev *dev)
+{
+	dev->no_d3cold = true;
+}
+
 bool pci_pme_capable(struct pci_dev *dev, pci_power_t state)
 {
 	u8 capability = pci_find_capability(dev, PCI_CAP_ID_PM);
@@ -1244,7 +1316,12 @@ bool pci_pme_capable(struct pci_dev *dev, pci_power_t state)
 }
 
 /* The entries of the function's MSI-X table, following
- * drivers/pci/msi/api.c. */
+ * drivers/pci/msi/api.c, which answers -EINVAL for a function without an
+ * MSI-X capability: no more than its owner has lines for, since a driver
+ * may ask for every entry it is told of (xe does). Where the owner routes
+ * no MSI-X table or has no line left, Linux sees the function as one
+ * without the capability, and a driver that takes MSI-X when it is offered
+ * takes its one MSI vector instead, said once. */
 int pci_msix_vec_count(struct pci_dev *dev)
 {
 	u8 capability = pci_find_capability(dev, PCI_CAP_ID_MSIX);
@@ -1252,7 +1329,13 @@ int pci_msix_vec_count(struct pci_dev *dev)
 
 	if (!capability || pci_read_config_word(dev, capability + PCI_MSIX_FLAGS, &control))
 		return -EINVAL;
-	return (control & PCI_MSIX_FLAGS_QSIZE) + 1;
+	int lines = stela_linux_pci_msix_lines(dev);
+
+	if (lines <= 0) {
+		stela_linux_unsupported("PCI MSI-X tables: a function's driver gets its one MSI vector");
+		return -EINVAL;
+	}
+	return min((control & PCI_MSIX_FLAGS_QSIZE) + 1, lines);
 }
 
 /* BAR mappings, following drivers/pci/iomap.c. A port range has no mapping
@@ -1552,7 +1635,7 @@ static void log_line(void *context, int level, const char *message)
 		warnings++;
 }
 
-static unsigned int port_mappings, bus_windows, resizes;
+static unsigned int port_mappings, bus_windows, resizes, msix_tables;
 
 static void unsupported(void *context, const char *operation)
 {
@@ -1563,6 +1646,8 @@ static void unsupported(void *context, const char *operation)
 		bus_windows++;
 	else if (!strcmp(operation, "resizing a PCI BAR: BARs keep the sizes the firmware gave"))
 		resizes++;
+	else if (!strcmp(operation, "PCI MSI-X tables: a function's driver gets its one MSI vector"))
+		msix_tables++;
 	else
 		assert(false);
 }
@@ -1670,15 +1755,16 @@ int main(void)
 	stela_linux_devres_release(&dev.dev);
 	assert(!atomic_read(&dev.enable_cnt));
 
-	/* PME# from D3hot and D3cold only; an MSI-X table of eight entries. */
+	/* PME# from D3hot and D3cold only; an MSI-X table of eight entries,
+	 * which is not offered, since the owner routes one message. */
 	*(u16 *)&config[0x50 + PCI_PM_PMC] = 0x18 << PCI_PM_CAP_PME_SHIFT;
 	assert(pci_pme_capable(&dev, PCI_D3hot) && pci_pme_capable(&dev, PCI_D3cold));
 	assert(!pci_pme_capable(&dev, PCI_D0) && !pci_pme_capable(&dev, PCI_D2));
-	assert(pci_msix_vec_count(&dev) == -EINVAL);
+	assert(pci_msix_vec_count(&dev) == -EINVAL && !msix_tables);
 	config[0x60] = PCI_CAP_ID_MSIX;
 	config[0x61] = 0;
 	*(u16 *)&config[0x60 + PCI_MSIX_FLAGS] = 7;
-	assert(pci_msix_vec_count(&dev) == 8);
+	assert(pci_msix_vec_count(&dev) == -EINVAL && msix_tables == 1);
 
 	/* No extended list, then a resizable BAR capability behind another:
 	 * BAR 2 offers 256 MiB to 8 GiB. No bus lists a window to grow into. */

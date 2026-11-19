@@ -767,35 +767,59 @@ impl UpstreamPort {
 /// The ports above each display controller ([`Devices::gpu_ports`]).
 pub type GpuPorts = Vec<(Address, Vec<UpstreamPort>)>;
 
-/// A PCI-to-ISA bridge as the scan read it, without a write. Intel's display
-/// code finds the PCH by the bridge's IDs (`intel_pch.c`).
+/// A chipset function as the scan read it, without a write, which no driver
+/// here takes but a GPU's kernel driver reads: a PCI-to-ISA bridge, whose
+/// IDs name the PCH to Intel's display code (`intel_pch.c`), or, in an image
+/// with i915, a function of the host bridge's device (bus 0, device 0 of
+/// segment 0), whose configuration i915 reads (`i915_gmch.c` MCHBAR) and the
+/// stolen memory's registers are in (`early-quirks.c`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IsaBridge {
+pub struct ChipsetFunction {
     pub identity: crate::bus::pci::Identity,
     pub revision: u8,
     pub subsystem_vendor: u16,
     pub subsystem_device: u16,
+    /// A host bridge function's configuration as the scan read it.
+    pub configuration: Option<[u8; 256]>,
 }
 
-impl IsaBridge {
-    /// `function`'s, when its class is a PCI-to-ISA bridge's and its
-    /// revision and subsystem IDs read.
+impl ChipsetFunction {
+    /// `function`'s, when it is a PCI-to-ISA bridge or, in an image with
+    /// i915, a bridge, memory controller or system peripheral function of
+    /// the host bridge's device, and what it needs reads. An image without
+    /// i915 reads no more of the host bridge than the scan does.
     fn read<C: crate::bus::pci::ConfigSpace>(
         function: &mut crate::bus::pci::Function<C>,
     ) -> Option<Self> {
         use crate::bus::pci::regs;
-        if function.class[..2] != [0x06, 0x01] {
+        let address = function.address;
+        let isa = function.class[..2] == [0x06, 0x01];
+        let host = cfg!(feature = "i915-port")
+            && !isa
+            && (address.segment, address.bus, address.device) == (0, 0, 0)
+            && matches!(function.class[0], 0x05 | 0x06 | 0x08);
+        if !isa && !host {
             return None;
         }
         let identity = function.identity();
         let config = function.config();
         let revision = config.read8(regs::CLASS_REVISION).ok()?;
         let subsystem = config.read32(regs::SUBSYSTEM_VENDOR_ID).ok()?;
+        let configuration = if host {
+            let mut bytes = [0; 256];
+            for (offset, word) in (0u16..).step_by(4).zip(bytes.as_chunks_mut::<4>().0) {
+                *word = config.read32(offset).ok()?.to_le_bytes();
+            }
+            Some(bytes)
+        } else {
+            None
+        };
         Some(Self {
             identity,
             revision,
             subsystem_vendor: subsystem as u16,
             subsystem_device: (subsystem >> 16) as u16,
+            configuration,
         })
     }
 }
@@ -814,9 +838,10 @@ pub struct Devices {
     /// Linux's `acpi_pci_find_companion` finds it ([`native::companion`]):
     /// a GPU's kernel driver reads its firmware's methods there.
     pub gpu_companions: Vec<(Address, String)>,
-    /// PCI-to-ISA bridges as their configuration reads, which no driver
-    /// here takes: a GPU's kernel driver names the chipset by them.
-    pub isa_bridges: Vec<IsaBridge>,
+    /// PCI-to-ISA bridges and the host bridge's functions as their
+    /// configuration reads, which no driver here takes: a GPU's kernel
+    /// driver names the chipset by them and reads the host bridge.
+    pub chipset: Vec<ChipsetFunction>,
     /// The ports between each display controller and its root complex,
     /// nearest first ([`native::ports_above`]): a GPU's kernel driver reads
     /// the link its slot gives it from them, as amdgpu does on Linux.
@@ -1842,7 +1867,7 @@ pub unsafe fn probe_observed(
             if function.class[0] == 0x02 {
                 devices.network_functions.push(function.identity());
             }
-            devices.isa_bridges.extend(IsaBridge::read(&mut function));
+            devices.chipset.extend(ChipsetFunction::read(&mut function));
             // A network adapter joins the links, or its failure is recorded.
             macro_rules! attach_link {
                 ($attached:expr, $variant:path) => {{
@@ -3802,11 +3827,12 @@ mod tests {
         let mut ecam = alloc::vec![u32::MAX; (1 << 20) / 4];
         // 00:00.0 a multi-function NVIDIA display controller, 00:00.1 its
         // HD Audio function, whose identity the HD Audio driver admits,
-        // 00:00.2 a PCI-to-ISA bridge.
+        // 00:00.2 a PCI-to-ISA bridge, 00:00.3 a host bridge function.
         for (function, id, class, header) in [
             (0, 0x10de_2c02u32, 0x0300_0000u32, 0x0080_0000u32),
             (1, 0x10de_22e9, 0x0403_0000, 0x0080_0000),
             (2, 0x8086_5182, 0x0601_0001, 0x0080_0000),
+            (3, 0x8086_3e30, 0x0600_0000, 0x0080_0000),
         ] {
             let start = function * 4096 / 4;
             let page = &mut ecam[start..start + 4096 / 4];
@@ -3816,6 +3842,8 @@ mod tests {
             page[3] = header;
             page[11] = 0x22e7_17aa;
         }
+        // The host bridge's MCHBAR, which i915 reads from the scan's copy.
+        ecam[3 * 4096 / 4 + 0x48 / 4] = 0xfed1_0001;
         let window = EcamWindow {
             base: ecam.as_mut_ptr() as u64,
             segment: 0,
@@ -3857,8 +3885,12 @@ mod tests {
         assert!(services.preparations.borrow().is_empty());
         assert!(services.requests.borrow().is_empty());
         assert_eq!(
-            devices.isa_bridges,
-            [IsaBridge {
+            devices.chipset.len(),
+            if cfg!(feature = "i915-port") { 2 } else { 1 }
+        );
+        assert_eq!(
+            devices.chipset[0],
+            ChipsetFunction {
                 identity: crate::bus::pci::Identity {
                     address: Address {
                         function: 2,
@@ -3871,8 +3903,22 @@ mod tests {
                 revision: 0x01,
                 subsystem_vendor: 0x17aa,
                 subsystem_device: 0x22e7,
-            }]
+                configuration: None,
+            }
         );
+        // With i915, the host bridge function, with its configuration as
+        // read.
+        if cfg!(feature = "i915-port") {
+            let host = devices.chipset[1];
+            assert_eq!(host.identity.address.function, 3);
+            assert_eq!(
+                (host.identity.vendor, host.identity.device),
+                (0x8086, 0x3e30)
+            );
+            let configuration = host.configuration.unwrap();
+            assert_eq!(configuration[..4], [0x86, 0x80, 0x30, 0x3e]);
+            assert_eq!(configuration[0x48..0x4c], [0x01, 0x00, 0xd1, 0xfe]);
+        }
         assert!(devices.failures.iter().all(|(at, _)| *at != audio));
         assert!(
             devices

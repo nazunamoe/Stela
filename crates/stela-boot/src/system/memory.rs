@@ -150,7 +150,7 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
     let held = stela_boot_core::host_memory::held_bound(&sizes, plan);
     output::arguments(format_args!(
         "HOST MEMORY free={}M heap={}M code={}M pool={}M guest={}M gpu={}M aperture={}M \
-         pages={}\n",
+         pages={}{}\n",
         free >> 20,
         sizes.heap >> 20,
         sizes.code.bytes >> 20,
@@ -161,6 +161,10 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
         match held {
             Some(bytes) => format!("{}M", bytes >> 20),
             None => String::from("unbounded"),
+        },
+        match plan.fallback {
+            true => format!(" fallback={}M", sizes.fallback >> 20),
+            false => String::new(),
         },
     ));
     output::arguments(format_args!("HOST MEMORY gpu: {}\n", plan.describe(&sizes)));
@@ -194,7 +198,9 @@ pub(super) fn reserve(cores: usize, ram: &[(usize, usize)]) -> Result<EngineMemo
     // The GPU's pages come from the heap's allocator, held to their share
     // by Linux's page limit, so the share lies in the same region, as do
     // the page tables of the apertures drivers map whole.
-    let heap = allocate(sizes.heap + sizes.gpu + sizes.aperture)?;
+    // So is the room an integrated GPU that may draw in a discrete one's
+    // place keeps for Linux's pages, which the heap uses while none does.
+    let heap = allocate(sizes.heap + sizes.gpu + sizes.aperture + sizes.fallback)?;
     // The engine allocator uses this existing physmap directly. Prove the
     // complete firmware reservation is covered before publishing the handoff.
     if !ram.iter().any(|&(start, end)| {

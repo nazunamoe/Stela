@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 18:01:14 +0000
+Subject: [PATCH] fix(i915): a GTT mmap fills its object's pages with the page
+ tables any kernel with an MMU has, not only under Linux's x86 arch, where it
+ warned and mapped nothing
+
+---
+ drivers/gpu/drm/i915/i915_mm.c | 2 +-
+ drivers/gpu/drm/i915/i915_mm.h | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/i915_mm.c b/drivers/gpu/drm/i915/i915_mm.c
+index fd89e7c7d8d6f7501a7c5d5f9da1e1f276b1fdd0..5d7b8cd358a4b03353932450a92c52f202078e52 100644
+--- a/drivers/gpu/drm/i915/i915_mm.c
++++ b/drivers/gpu/drm/i915/i915_mm.c
+@@ -69,7 +69,7 @@ static int remap_sg(pte_t *pte, unsigned long addr, void *data)
+ 
+ #define EXPECTED_FLAGS (VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP)
+ 
+-#if IS_ENABLED(CONFIG_X86)
++#if IS_ENABLED(CONFIG_MMU)
+ static int remap_pfn(pte_t *pte, unsigned long addr, void *data)
+ {
+ 	struct remap_pfn *r = data;
+diff --git a/drivers/gpu/drm/i915/i915_mm.h b/drivers/gpu/drm/i915/i915_mm.h
+index 69f9351b1a1cd43a8dfcdec0e7181c3eaac86d08..928e83d122a3f2f556e604fd93a2ad3b27cbcdf3 100644
+--- a/drivers/gpu/drm/i915/i915_mm.h
++++ b/drivers/gpu/drm/i915/i915_mm.h
+@@ -13,7 +13,7 @@ struct vm_area_struct;
+ struct io_mapping;
+ struct scatterlist;
+ 
+-#if IS_ENABLED(CONFIG_X86)
++#if IS_ENABLED(CONFIG_MMU)
+ int remap_io_mapping(struct vm_area_struct *vma,
+ 		     unsigned long addr, unsigned long pfn, unsigned long size,
+ 		     struct io_mapping *iomap);

@@ -123,6 +123,31 @@ fn share_state() -> Option<stela_drivers::gpu::metal::device::share::ShareState>
     Some(state)
 }
 
+/// Linux's pages once an integrated GPU is to draw in place of a GPU that
+/// could not (`host_memory::fallback_pages`), from the bound the plan
+/// figured and what Linux holds and is held to now.
+pub(crate) fn fallback_pages() -> stela_boot_core::host_memory::FallbackPages {
+    let (held, limit) = stela_linux::pages::held_and_limit();
+    stela_boot_core::host_memory::fallback_pages(
+        fallback_bound(),
+        held as u64 * PAGE as u64,
+        limit as u64 * PAGE as u64,
+    )
+}
+
+/// The bytes the plan figured Linux's pages may hold (`Handoff::gpu_pages`),
+/// which a fallback holds them to where the plan did not.
+pub(crate) fn fallback_bound() -> u64 {
+    GPU_PAGES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Linux's pages are held to [`GPU_PAGES`] from now on: a fallback held
+/// them where the plan did not.
+#[cfg(feature = "nvk")]
+pub(crate) fn pages_held() {
+    GPU_PAGES_HELD.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// The ordinary pages Linux may hold at once (`Handoff::gpu_pages`): an
 /// integrated GPU's share of the heap, or what the heap holds past its own
 /// needs, in pages, so that no driver's pages take the heap's own; `None`

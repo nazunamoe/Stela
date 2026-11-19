@@ -10,11 +10,13 @@ publish = false
 
 [features]
 default = ["std"]
-# The AMD GPU port's firmware in the host firmware bundle
-# (`host_firmware::bundle::Ports`), off by default as amdgpu is in the boot
-# image: stela-boot's `amdgpu` and stela-cli's `amdgpu-port` turn it on, and
-# a test keeps those lists one.
+# The AMD and Intel GPU ports' firmware in the host firmware bundle
+# (`host_firmware::bundle::Ports`), off by default as their drivers are in
+# the boot image: stela-boot's and stela-cli's features turn each on with
+# its driver, and a test keeps those lists one.
 amdgpu-port = []
+xe-port = []
+i915-port = []
 # Without `std` only the kernel boot-bundle builder (`boot_bundle` and the
 # formats it reads) is built, for `stela.efi`.
 std = ["stela-soc-data/std",

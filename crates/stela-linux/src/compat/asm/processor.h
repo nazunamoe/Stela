@@ -4,6 +4,8 @@
 /* The processor services Linux code uses, from x86's asm/processor.h. */
 #include <linux/compiler.h>
 #include <linux/types.h>
+#include <asm/cpufeature.h>
+#include <asm/special_insns.h>
 
 /* Runtime owns the actual saved CPU frame and retained stack. This Linux
  * task metadata contains no duplicate architecture context switch state. */
@@ -17,10 +19,13 @@ struct thread_struct {
 #define INIT_TASK_STACK ((void *)0)
 
 
-/* The one CPU model fact Linux code here reads: family 6, past the i386. */
+/* The CPU model facts Linux code here reads: family 6, past the i386, and
+ * x86-64's 64-byte CLFLUSH line (CPUID 1, EBX bits 15:8, on every x86-64
+ * processor). */
 static const struct {
 	u8 x86;
-} boot_cpu_data __maybe_unused = {.x86 = 6};
+	u16 x86_clflush_size;
+} boot_cpu_data __maybe_unused = {.x86 = 6, .x86_clflush_size = 64};
 
 /* x86's struct cpuinfo_x86, with the fields Linux code here reads: the
  * maker, family and model of the processor, decoded from CPUID as Linux's

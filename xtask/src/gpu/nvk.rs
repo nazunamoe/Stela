@@ -198,7 +198,7 @@ const ANV: Driver = Driver {
     renamed: &[],
     options: &ANV_OPTIONS,
     host_tools: true,
-    // Intel's stack gives no Vulkan driver yet.
+    // A release image holds no Intel port.
     released: false,
     model: "anv_util.c",
     stand_ins: &["anv_nir_options"],

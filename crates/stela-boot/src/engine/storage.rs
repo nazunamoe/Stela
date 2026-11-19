@@ -2391,7 +2391,7 @@ pub unsafe fn open(
             core::mem::take(&mut devices.gpus)
         },
         gpu_companions: core::mem::take(&mut devices.gpu_companions),
-        isa_bridges: core::mem::take(&mut devices.isa_bridges),
+        chipset: core::mem::take(&mut devices.chipset),
         gpu_ports: core::mem::take(&mut devices.gpu_ports),
         usb,
         usb_disks,
@@ -2741,9 +2741,9 @@ pub struct Opened {
     pub gpus: alloc::vec::Vec<stela_drivers::gpu::Adapter>,
     /// Each display controller's ACPI companion path, where probe found one.
     pub gpu_companions: alloc::vec::Vec<(stela_drivers::bus::pci::Address, alloc::string::String)>,
-    /// The PCI-to-ISA bridges probe read, which a GPU's kernel driver may
-    /// name the chipset by.
-    pub isa_bridges: alloc::vec::Vec<stela_drivers::probe::IsaBridge>,
+    /// The PCI-to-ISA bridges and host bridge functions probe read, which a
+    /// GPU's kernel driver may name the chipset by or read.
+    pub chipset: alloc::vec::Vec<stela_drivers::probe::ChipsetFunction>,
     /// The ports above each display controller, which its kernel driver
     /// reads its slot's link from.
     pub gpu_ports: stela_drivers::probe::GpuPorts,

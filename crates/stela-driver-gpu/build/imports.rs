@@ -89,6 +89,12 @@ fn members(archive: &Path) -> Vec<Member> {
                 let Ok(name) = symbol.name() else {
                     continue;
                 };
+                // A weak reference left undefined resolves to null, as Linux's
+                // symbol_get of a module that is not loaded (i915's link to
+                // intel_ips), so it reaches no service.
+                if symbol.is_undefined() && symbol.is_weak() {
+                    continue;
+                }
                 if symbol.is_undefined() {
                     imported.insert(name.to_owned());
                 } else if symbol.is_global() {

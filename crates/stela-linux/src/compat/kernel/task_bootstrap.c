@@ -4,6 +4,7 @@
  * a second Linux scheduler. Every resource operation below is original code.
  * No callback-presence/flag-only producer or successful missing-resource shim.
  */
+#include <asm/tsc.h>
 #include <linux/backing-dev.h>
 #include <linux/types.h>
 #include <linux/errno.h>
@@ -101,6 +102,8 @@ int stela_linux_task_bootstrap_resources(const struct stela_linux_owner *owner)
     /* Match x86 get_loops_per_jiffy() using the retained calibrated rate.
      * The workqueue threshold uses this before any worker starts. */
     loops_per_jiffy = tsc_hz / HZ;
+    /* x86's tsc_khz, from the same rate (asm/tsc.h, cpu.c). */
+    tsc_khz = (unsigned int)(tsc_hz / 1000);
 
     /* Original early metadata with IRQs excluded only around the CPU setup.
      * The allocator and workqueue constructors below need process context. */

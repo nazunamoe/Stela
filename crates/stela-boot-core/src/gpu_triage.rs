@@ -95,7 +95,7 @@ pub struct Summary<'a> {
     pub vendor: u16,
     pub device: u16,
     pub revision: u8,
-    /// Its market name, or its maker and IDs.
+    /// Its market name, or its maker alone.
     pub market: &'a str,
     /// The kernel driver's name.
     pub driver: &'a str,

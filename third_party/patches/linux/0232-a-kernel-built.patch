@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:48:39 +0000
+Subject: [PATCH] fix(ttm): a kernel built with CONFIG_STELA writes back the
+ cache lines of pages a driver asks to have write-combined or uncached, as
+ x86's change of their memory type does, where it changed nothing and a line
+ dirtied when the page was cleared could later be written over what the GPU or
+ the display put there
+
+---
+ drivers/gpu/drm/ttm/ttm_pool.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/drivers/gpu/drm/ttm/ttm_pool.c b/drivers/gpu/drm/ttm/ttm_pool.c
+index 6142f90d43e2e121ce3a66dfeeff361353f4cd85..c120ce60ba2af75514409f863b995c3e92e144fe 100644
+--- a/drivers/gpu/drm/ttm/ttm_pool.c
++++ b/drivers/gpu/drm/ttm/ttm_pool.c
+@@ -42,6 +42,7 @@
+ #include <asm/set_memory.h>
+ #endif
+ 
++#include <drm/drm_cache.h>
+ #include <drm/ttm/ttm_backup.h>
+ #include <drm/ttm/ttm_pool.h>
+ #include <drm/ttm/ttm_tt.h>
+@@ -277,6 +278,19 @@ static int ttm_pool_apply_caching(struct ttm_pool_alloc_state *alloc)
+ 	case ttm_uncached:
+ 		return set_pages_array_uc(alloc->caching_divide, num_pages);
+ 	}
++#elif defined(CONFIG_STELA)
++	/*
++	 * A kernel built with CONFIG_STELA runs on x86-64 but keeps its own
++	 * mapping of these pages write-back, so it cannot change their memory
++	 * type as set_pages_array_wc() and set_pages_array_uc() do. What it
++	 * can do of theirs, and must, is write back the pages' cache lines:
++	 * a line the processor dirtied before (clearing the page) would
++	 * otherwise be written later over what the device put there.
++	 */
++	unsigned int num_pages = alloc->pages - alloc->caching_divide;
++
++	if (num_pages && alloc->tt_caching != ttm_cached)
++		drm_clflush_pages(alloc->caching_divide, num_pages);
+ #endif
+ 	alloc->caching_divide = alloc->pages;
+ 	return 0;

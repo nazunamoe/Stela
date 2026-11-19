@@ -425,6 +425,36 @@ fn a_reopened_device_serves_once_its_first_submission_signals() {
     cpu_buffer(&mut service, next, 4096, StorageMode::Shared);
 }
 
+/// A driver that checks a reopened device's first submission but releases
+/// lost devices (ANV's): the lost device retires once the reopened one
+/// serves, and none is kept.
+#[test]
+fn a_checked_reopen_retires_the_lost_device_once_it_serves() {
+    let mut service = service()
+        .with_reopen(Box::new(|| Ok(device_on(MockBackend::new()))))
+        .check_reopened(u64::MAX);
+    let held = connect(&mut service);
+    service.device().mark_lost();
+    service.disconnect(held).unwrap();
+    assert!(
+        service.device().is_lost(),
+        "its first submission has not signaled"
+    );
+    assert_eq!(service.retiring_devices(), 0);
+    let probing = service.probing.as_mut().unwrap();
+    let semaphore = probing.semaphore;
+    crate::metal::vulkan::backend::Backend::signal_semaphore(
+        probing.device.backend(),
+        semaphore,
+        1,
+    )
+    .unwrap();
+    let next = connect(&mut service);
+    assert!(!service.device().is_lost());
+    assert_eq!(service.retiring_devices(), 1, "the lost device retires");
+    service.disconnect(next).unwrap();
+}
+
 /// A reopened device whose first submission does not signal in its bound,
 /// as one whose GPU hangs again, fails the reopen; the next client tries a
 /// new one.

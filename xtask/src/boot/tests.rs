@@ -551,10 +551,11 @@ fn the_host_vfct_goes_to_the_run_only_when_it_holds_a_lent_gpus_video_bios() {
 }
 
 #[test]
-fn a_release_image_leaves_the_amd_port_out() {
-    // A development image holds amdgpu beside NVK; a release holds NVK
-    // alone, and stela-boot has no other GPU feature to choose.
-    assert_eq!(linked_features(false), "nvk,amdgpu");
+fn a_release_image_leaves_the_amd_and_intel_ports_out() {
+    // A development image holds amdgpu and the Intel port beside NVK; a
+    // release holds NVK alone, and stela-boot has no other GPU feature to
+    // choose.
+    assert_eq!(linked_features(false), "nvk,amdgpu,intel");
     assert_eq!(linked_features(true), "nvk");
     let manifest = include_str!("../../../crates/stela-boot/Cargo.toml");
     for feature in linked_features(false).split(',') {

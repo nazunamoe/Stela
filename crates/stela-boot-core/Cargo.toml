@@ -43,6 +43,8 @@ stela-soc-data = { path = "../stela-soc-data" }
 
 [dev-dependencies]
 stela-driver-base = { path = "../stela-driver-base", features = ["test-support"] }
+# The AMD port's refusal of a generation, for the GPU step's tests.
+stela-driver-core = { path = "../stela-driver-core" }
 serde_json.workspace = true
 # An independent SHA-256 the tests check digests against.
 sha2 = { version = "0.10", default-features = false }

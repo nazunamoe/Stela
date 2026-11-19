@@ -49,7 +49,8 @@ pub mod pins;
 pub mod pipelines;
 pub mod queue;
 mod reclaim;
-pub mod share;
+/// The share's budget, which the platform's memory plan reads too.
+pub use crate::share;
 pub use reclaim::Reclaimed;
 pub mod resources;
 pub use resources::SurfaceNote;

@@ -412,6 +412,33 @@ const void *free_irq(unsigned int irq, void *dev_id)
 	return name;
 }
 
+/* What a driver whose probe failed left requested on one of its function's
+ * lines: each request is freed as free_irq frees it, so the line is masked,
+ * its threads joined and its route retired before the function goes to the
+ * next driver or stays unbound. The handler and dev_id may belong to code
+ * that is gone; free_irq calls neither. */
+unsigned int stela_linux_irq_free_line(unsigned int irq)
+{
+	unsigned int freed = 0;
+
+	for (;;) {
+		struct requested *request;
+		void *dev_id = NULL;
+		bool found = false;
+
+		list_for_each_entry(request, &requests, node)
+			if (request->action.irq == irq && !request->closing) {
+				dev_id = request->action.dev_id;
+				found = true;
+				break;
+			}
+		if (!found)
+			return freed;
+		free_irq(irq, dev_id);
+		freed++;
+	}
+}
+
 /* A line's primary handlers run to completion in the one context Linux code
  * runs in, so none is in progress in a caller that may sleep. What may still
  * run is an action's thread, which is work: wait for each, as Linux waits
@@ -434,6 +461,26 @@ void synchronize_irq(unsigned int irq)
 		flush_work(&request->thread);
 	}
 	mutex_unlock(&line->request_mutex);
+}
+
+/* Linux code here runs on one owner at a time and a line's primary handlers
+ * run in that owner's hard-IRQ scope, so none is in flight while the caller
+ * runs; what is left is whether a threaded handler of the line is active,
+ * which Linux answers with false. */
+bool synchronize_hardirq(unsigned int irq)
+{
+	struct irq_line *line = line_owner(irq, false);
+	struct requested *request;
+	bool idle = true;
+
+	if (!line)
+		return true;
+	mutex_lock(&line->request_mutex);
+	list_for_each_entry(request, &requests, node)
+		if (request->line == line && READ_ONCE(request->thread_active))
+			idle = false;
+	mutex_unlock(&line->request_mutex);
+	return idle;
 }
 
 /* Run a line's primary handlers. The caller is in a hard-IRQ scope. */

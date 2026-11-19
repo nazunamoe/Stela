@@ -256,6 +256,25 @@ pub(super) fn registered_ioctls(source: &str, prefix: &str) -> Vec<String> {
         .collect()
 }
 
+/// The ioctls of a kernel driver's table that serve a render node: those
+/// registered with `DRM_RENDER_ALLOW` and a handler of the driver's own, not
+/// the DRM core's `drm_noop` or `drm_invalid_op`, which answer legacy
+/// ioctls without doing anything.
+pub(super) fn render_ioctls(source: &str, prefix: &str) -> Vec<String> {
+    source
+        .split(&format!("DRM_IOCTL_DEF_DRV({prefix}"))
+        .skip(1)
+        .filter_map(|rest| {
+            let entry = rest.split(')').next()?;
+            let mut fields = entry.split(',').map(str::trim);
+            let (name, handler, flags) = (fields.next()?, fields.next()?, fields.next()?);
+            (flags.contains("DRM_RENDER_ALLOW")
+                && !matches!(handler, "drm_noop" | "drm_invalid_op"))
+            .then(|| name.to_owned())
+        })
+        .collect()
+}
+
 /// What a test's exit line `marker NAME=count ...` says the driver used.
 pub(super) fn used_ioctls(output: &str, marker: &str) -> BTreeMap<String, u32> {
     output
@@ -281,6 +300,19 @@ mod tests {
             \t\t\t  DRM_AUTH|DRM_RENDER_ALLOW),\n};\n";
         assert_eq!(registered_ioctls(source, "AMDGPU_"), ["GEM_CREATE", "CTX"]);
         assert!(registered_ioctls(source, "XE_").is_empty());
+    }
+
+    #[test]
+    fn a_render_node_serves_only_its_drivers_own_render_ioctls() {
+        let source = "static const struct drm_ioctl_desc i915_ioctls[] = {\n\
+            \tDRM_IOCTL_DEF_DRV(I915_INIT, drm_noop, DRM_AUTH|DRM_MASTER|DRM_ROOT_ONLY),\n\
+            \tDRM_IOCTL_DEF_DRV(I915_GETPARAM, i915_getparam_ioctl, DRM_RENDER_ALLOW),\n\
+            \tDRM_IOCTL_DEF_DRV(I915_GEM_EXECBUFFER, drm_invalid_op, DRM_AUTH),\n\
+            \tDRM_IOCTL_DEF_DRV(I915_GEM_PIN, i915_gem_reject_pin_ioctl, DRM_AUTH|DRM_ROOT_ONLY),\n\
+            \tDRM_IOCTL_DEF_DRV(I915_GEM_WAIT, i915_gem_wait_ioctl,\n\
+            \t\t\t  DRM_RENDER_ALLOW),\n};\n";
+        assert_eq!(render_ioctls(source, "I915_"), ["GETPARAM", "GEM_WAIT"]);
+        assert_eq!(registered_ioctls(source, "I915_").len(), 5);
     }
 
     #[test]

@@ -11,60 +11,12 @@
 #include <linux/property.h>
 #include <linux/rcupdate.h>
 #include <linux/regmap.h>
+#include <linux/relay.h>
 #include <linux/sched/mm.h>
 #include <linux/seq_file.h>
 #include <linux/swap.h>
 #include <stela/linux.h>
 #include <unsupported.h>
-
-/* Pages behind shmem files: shmem-backed GEM objects and TTM's backup of
- * buffers it swaps out. TTM allocates pages from its own pool and Stela never
- * reclaims them, so nothing needs them; a page asked for anyway is refused,
- * said once, with the error Linux gives when shmem has no page to give, which
- * each caller returns (a GEM object's pages fail, a buffer stays unswapped).
- * No shmem page is ever read in, so a truncation finds none and a writeout or
- * a dirty bit has no page to act on. */
-struct folio *shmem_read_folio_gfp(struct address_space *mapping, pgoff_t index, gfp_t gfp)
-{
-	(void)mapping;
-	(void)index;
-	(void)gfp;
-	stela_linux_unsupported("pages of a shmem file: they are refused");
-	return ERR_PTR(-ENOMEM);
-}
-
-struct page *shmem_read_mapping_page_gfp(struct address_space *mapping, pgoff_t index, gfp_t gfp)
-{
-	(void)mapping;
-	(void)index;
-	(void)gfp;
-	stela_linux_unsupported("pages of a shmem file: they are refused");
-	return ERR_PTR(-ENOMEM);
-}
-
-void shmem_truncate_range(struct inode *inode, loff_t start, uoff_t end)
-{
-	(void)inode;
-	(void)start;
-	(void)end;
-}
-
-struct swap_iocb;
-int shmem_writeout(struct folio *folio, struct swap_iocb **plug, struct list_head *folio_list)
-{
-	(void)folio;
-	(void)plug;
-	(void)folio_list;
-	stela_linux_unsupported("writing a shmem page out: it is refused");
-	return -EOPNOTSUPP;
-}
-
-bool folio_clear_dirty_for_io(struct folio *folio)
-{
-	(void)folio;
-	stela_linux_unsupported("writing a shmem page out: it is refused");
-	return false;
-}
 
 /* An address for a client's mapping of a shmem-backed object, which only a
  * client with a Linux address space asks for; Stela's clients map through
@@ -219,6 +171,14 @@ STELA_UNSUPPORTED(int, single_open, struct file *, int (*)(struct seq_file *, vo
 STELA_UNSUPPORTED(int, single_release, struct inode *, struct file *)
 STELA_UNSUPPORTED(ssize_t, seq_read, struct file *, char __user *, size_t, loff_t *)
 STELA_UNSUPPORTED(loff_t, seq_lseek, struct file *, loff_t, int)
+/* Relay channels, which carry i915's GuC log to user space: only its debugfs
+ * file opens one, and the other calls run only on an open channel. */
+STELA_UNSUPPORTED(struct rchan *, relay_open, const char *, struct dentry *, size_t, size_t,
+		  const struct rchan_callbacks *, void *)
+STELA_UNSUPPORTED(void, relay_close, struct rchan *)
+STELA_UNSUPPORTED(void, relay_flush, struct rchan *)
+STELA_UNSUPPORTED(size_t, relay_switch_subbuf, struct rchan_buf *, size_t)
+STELA_UNSUPPORTED(int, relay_buf_full, struct rchan_buf *)
 /* Platform devices, which need the platform bus: only HDMI audio codecs and
  * the partitions of a partitioned accelerator reach DRM as such. */
 STELA_UNSUPPORTED(struct platform_device *, platform_device_register_full,

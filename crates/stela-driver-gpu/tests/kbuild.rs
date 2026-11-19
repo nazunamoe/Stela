@@ -180,6 +180,51 @@ fn reads_a_makefile_with_continuations_rules_and_tree_includes() {
 }
 
 #[test]
+fn reads_defines_late_references_and_dashed_definitions() {
+    // The forms i915's Makefile adds to xe's.
+    let root = tree(
+        "late",
+        &[
+            (
+                "Makefile",
+                "subdir-ccflags-y += -DI915\n\
+                 subdir-ccflags-$(CONFIG_RT) += -DNOTRACE\n\
+                 drv-y += core.o\n\
+                 gt-y += gt/a.o \\\n\
+                 \tgt/b.o\n\
+                 gt-$(CONFIG_X86) += gt/x86.o\n\
+                 drv-y += $(gt-y)\n\
+                 include $(src)/sub/Makefile\n\
+                 no-header-test := \\\n\
+                 \tdisplay/defs.h\n\
+                 ifdef CONFIG_WERROR\n\
+                 \x20   cmd_checkdoc = $(KERNELDOC) $<\n\
+                 endif\n",
+            ),
+            ("sub/Makefile", "kvmgt-$(CONFIG_GVT) += sub/a.o\n"),
+        ],
+    );
+    let kbuild = Kbuild::read(&root, &config("")).unwrap();
+    assert_eq!(
+        kbuild.objects("drv").unwrap(),
+        ["core.o", "gt/a.o", "gt/b.o"]
+    );
+    assert_eq!(kbuild.defines, ["I915"]);
+    assert!(kbuild.objects("kvmgt").is_err());
+    assert_eq!(
+        kbuild
+            .definitions
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<Vec<_>>(),
+        [("no-header-test", "display/defs.h")]
+    );
+    // A define of no plain name is refused.
+    fs::write(root.join("Makefile"), "subdir-ccflags-y += -DA=1\n").unwrap();
+    assert!(Kbuild::read(&root, &config("")).is_err());
+}
+
+#[test]
 fn refuses_what_it_cannot_evaluate_even_when_inactive() {
     for (name, text, header) in [
         ("unknown", "ifdef CONFIG_OFF\nifeq ($(A),b)\nendif\n", ""),
@@ -187,7 +232,7 @@ fn refuses_what_it_cannot_evaluate_even_when_inactive() {
         ("pattern", "drv-y += $(patsubst %.c,%.o,a.c)\n", ""),
         ("escape", "include $(src)/../Kbuild\n", ""),
         ("source", "drv-y += core/a.c\n", ""),
-        ("recursive", "a-y += a.o\ndrv-y += $(a-y)\n", ""),
+        ("recursive", "a-y += a.o\ndrv-y += $(a-y)\na-y += b.o\n", ""),
         ("undefined", "drv-y := $(missing-y)\n", ""),
         (
             "module",
@@ -201,7 +246,9 @@ fn refuses_what_it_cannot_evaluate_even_when_inactive() {
         ),
         ("unbalanced", "ifdef CONFIG_X86\ndrv-y += a.o\n", ""),
         ("stray", "endif\n", ""),
-        ("flag", "ccflags-y += -DDEBUG\n", ""),
+        ("flag", "ccflags-y += -O2\n", ""),
+        ("define value", "ccflags-y += -DDEBUG=1\n", ""),
+        ("module list", "drv-m += a.o\n", ""),
         ("option", "ccflags-y += $(call cc-option, -DDEBUG)\n", ""),
         ("assigned flags", "ccflags-y := -I$(src)\n", ""),
         ("outside", "ccflags-y += -I$(srctree)/../include\n", ""),

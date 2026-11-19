@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 07:47:45 +0000
+Subject: [PATCH] fix(drm): a kernel built with CONFIG_STELA writes back cache
+ lines as x86's does when a driver flushes them, where drm_clflush_pages,
+ drm_clflush_sg and drm_clflush_virt_range warned once and flushed nothing,
+ though i915 flushes with them every object the GPU or the display reads past
+ the processor's caches
+
+---
+ drivers/gpu/drm/drm_cache.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_cache.c b/drivers/gpu/drm/drm_cache.c
+index ea1d2d5d2c66cff6b3963095ecfa61e41cc6c6f2..e7e13019896aa4f037e141fc8d257bb9977852b7 100644
+--- a/drivers/gpu/drm/drm_cache.c
++++ b/drivers/gpu/drm/drm_cache.c
+@@ -39,7 +39,11 @@
+ /* A small bounce buffer that fits on the stack. */
+ #define MEMCPY_BOUNCE_SIZE 128
+ 
+-#if defined(CONFIG_X86)
++/*
++ * A kernel built with CONFIG_STELA runs only on x86-64 processors, so it
++ * writes back cache lines as x86 does.
++ */
++#if defined(CONFIG_X86) || defined(CONFIG_STELA)
+ #include <asm/smp.h>
+ 
+ /*
+@@ -87,7 +91,7 @@ void
+ drm_clflush_pages(struct page *pages[], unsigned long num_pages)
+ {
+ 
+-#if defined(CONFIG_X86)
++#if defined(CONFIG_X86) || defined(CONFIG_STELA)
+ 	if (static_cpu_has(X86_FEATURE_CLFLUSH)) {
+ 		drm_cache_flush_clflush(pages, num_pages);
+ 		return;
+@@ -126,7 +130,7 @@ EXPORT_SYMBOL(drm_clflush_pages);
+ void
+ drm_clflush_sg(struct sg_table *st)
+ {
+-#if defined(CONFIG_X86)
++#if defined(CONFIG_X86) || defined(CONFIG_STELA)
+ 	if (static_cpu_has(X86_FEATURE_CLFLUSH)) {
+ 		struct sg_page_iter sg_iter;
+ 
+@@ -156,7 +160,7 @@ EXPORT_SYMBOL(drm_clflush_sg);
+ void
+ drm_clflush_virt_range(void *addr, unsigned long length)
+ {
+-#if defined(CONFIG_X86)
++#if defined(CONFIG_X86) || defined(CONFIG_STELA)
+ 	if (static_cpu_has(X86_FEATURE_CLFLUSH)) {
+ 		const int size = boot_cpu_data.x86_clflush_size;
+ 		void *end = addr + length;

@@ -402,17 +402,35 @@ if stela_air_llvm != ''
     build_rpath : fs.parent(stela_air_llvm),
   )
   test('stela_metal_compiler', stela_metal_compiler_test, suite : 'stela')
-  if with_nvidia
-    # The shader coverage sweep over AIR modules compiled from MSL; a tool,
-    # since its inputs are Apple compiler output.
+  if with_nvidia or with_intel
+    # The shader coverage sweep over AIR modules compiled from MSL, with NAK
+    # and BRW as each is built; a tool, since its inputs are Apple compiler
+    # output.
+    stela_corpus_dependencies = [idep_stela_air]
+    stela_corpus_links = [stela_metal_compiler, stela_metal_abi]
+    stela_corpus_args = []
+    stela_corpus_includes = [inc_include, inc_src, inc_gpu]
+    if with_nvidia
+      stela_corpus_dependencies += [idep_nak]
+      stela_corpus_links += stela_nak
+      stela_corpus_args += ['-DSTELA_CORPUS_NAK']
+    endif
+    if with_intel
+      stela_corpus_dependencies += [idep_intel_compiler_brw, idep_intel_dev]
+      stela_corpus_args += ['-DSTELA_CORPUS_BRW']
+      stela_corpus_includes += [inc_intel]
+    endif
     stela_metal_corpus = executable(
       'stela_metal_corpus',
       'tests/metal_corpus.c',
-      include_directories : [inc_include, inc_src, inc_gpu],
-      dependencies : stela_air_test_dependencies,
-      link_with : [stela_metal_compiler, stela_metal_abi, stela_air_test_links],
+      include_directories : stela_corpus_includes,
+      dependencies : stela_corpus_dependencies,
+      link_with : stela_corpus_links,
+      c_args : stela_corpus_args,
       build_rpath : fs.parent(stela_air_llvm),
     )
+  endif
+  if with_nvidia
     stela_nvidia_air_render_test = executable(
       'stela_nvidia_air_render_test',
       '../nvidia/tests/air_render.c',

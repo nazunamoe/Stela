@@ -4,9 +4,10 @@
 //! (the Linux environment, the DRM ioctl path, the Metal device, the AIR
 //! compiler, the gate) is shared and reads a vendor only through this.
 //!
-//! [`GpuStack::select`] chooses by PCI vendor. Whether a device of that
-//! vendor is driven is then the kernel driver's own ID table's answer, when
-//! Linux matches the function against the registered driver.
+//! [`GpuStack::select`] chooses by PCI vendor and the kernel drivers' own ID
+//! tables, as Linux's driver core binds a function: to the first registered
+//! driver whose table holds it. A vendor with two drivers lists them in
+//! their registration order.
 use crate::{Adapter, Vendor};
 use alloc::string::String;
 use core::ffi::c_void;
@@ -74,8 +75,8 @@ pub struct Kernel {
     /// expansion ROM BAR where the GPU's own copy is not found, so its claim
     /// gives it the option ROM the firmware read (and ATRM's image) and
     /// places a ROM BAR the firmware left unassigned: amdgpu
-    /// (`amdgpu_get_bios`) and xe's display (`intel_bios_init`, its VBT
-    /// through `pci_map_rom`). nouveau shadows its image from PRAMIN or
+    /// (`amdgpu_get_bios`) and the Intel display code xe and i915 build
+    /// (`intel_bios_init`, its VBT through `pci_map_rom`). nouveau shadows its image from PRAMIN or
     /// PROM, and reaches the PCI ROM and the platform ROM only when those
     /// and ACPI give none (`nvbios_shadow`'s `skip`), so its claim does
     /// neither and gives it the VFCT image alone, as before.
@@ -214,9 +215,11 @@ pub struct GpuStack {
     #[cfg(feature = "metal")]
     pub metal: Option<crate::metal::open::Admission>,
     /// The Vulkan driver linked into the image. A stack without one drives
-    /// displays only. This crate's own test binary links no driver archive,
-    /// so its descriptors hold none.
-    #[cfg(all(feature = "metal-linked", not(test)))]
+    /// displays only. Only the UEFI image links the driver archives: this
+    /// crate's own test binary and every host binary that holds it with
+    /// `metal-linked` (a workspace build with every feature) have none, so
+    /// their descriptors name none of the archives' symbols.
+    #[cfg(all(feature = "metal-linked", not(test), target_os = "uefi"))]
     pub vulkan: Option<crate::metal::native::Driver>,
 }
 
@@ -243,6 +246,8 @@ pub static STACKS: &[&GpuStack] = &[
     &NVIDIA,
     #[cfg(feature = "amdgpu-port")]
     &AMD,
+    #[cfg(feature = "i915-port")]
+    &INTEL_I915,
     #[cfg(feature = "xe-port")]
     &INTEL,
 ];
@@ -278,7 +283,7 @@ pub static NVIDIA: GpuStack = GpuStack {
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::nvidia::ADMISSION),
-    #[cfg(all(feature = "metal-linked", not(test)))]
+    #[cfg(all(feature = "metal-linked", not(test), target_os = "uefi"))]
     vulkan: Some(crate::metal::nvidia::DRIVER),
 };
 
@@ -327,7 +332,7 @@ pub static AMD: GpuStack = GpuStack {
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::amd::ADMISSION),
-    #[cfg(all(feature = "metal-linked", not(test)))]
+    #[cfg(all(feature = "metal-linked", not(test), target_os = "uefi"))]
     vulkan: AMD_VULKAN,
 };
 
@@ -336,6 +341,7 @@ pub static AMD: GpuStack = GpuStack {
     feature = "amdgpu-port",
     feature = "metal-linked",
     not(test),
+    target_os = "uefi",
     stela_vulkan_amd
 ))]
 const AMD_VULKAN: Option<crate::metal::native::Driver> = Some(crate::metal::amd::DRIVER);
@@ -344,14 +350,20 @@ const AMD_VULKAN: Option<crate::metal::native::Driver> = Some(crate::metal::amd:
     feature = "amdgpu-port",
     feature = "metal-linked",
     not(test),
+    target_os = "uefi",
     not(stela_vulkan_amd)
 ))]
 const AMD_VULKAN: Option<crate::metal::native::Driver> = None;
 
-/// xe with the display code it shares with i915, and ANV's admission. Its
-/// Vulkan driver is not given yet, even in an image that holds ANV: ANV has
-/// run on no Intel GPU under Stela. Until then its GPU shows the frames
-/// another GPU draws, on the displays wired to it.
+/// xe with the display code it shares with i915, ANV's admission and ANV
+/// as its Vulkan driver when the image holds it. It drives Lunar Lake,
+/// Battlemage, Panther Lake and later, the platforms upstream binds to xe by
+/// default, and is the fallback of the devices i915 is handed first
+/// ([`INTEL_I915`]). Whether its GPU serves the
+/// Metal device is [`metal_devices`]' choice: an integrated GPU does when no
+/// discrete GPU draws, and otherwise shows the frames another GPU draws on
+/// the displays wired to it. An image built without ANV's tools holds no
+/// ANV, and then its GPUs only show frames.
 #[cfg(feature = "xe-port")]
 pub static INTEL: GpuStack = GpuStack {
     vendor: Vendor::Intel,
@@ -373,7 +385,7 @@ pub static INTEL: GpuStack = GpuStack {
         chip: crate::xe::query::chip,
         memory_bytes: crate::xe::query::memory_bytes,
         reset: None,
-        describe: None,
+        describe: Some(crate::xe::query::describe),
         version: versions::XE,
         reads_rom: true,
         unloads_on_boot_cpu: false,
@@ -381,7 +393,19 @@ pub static INTEL: GpuStack = GpuStack {
     },
     #[cfg(feature = "metal")]
     metal: Some(crate::metal::intel::ADMISSION),
-    #[cfg(all(feature = "metal-linked", not(test)))]
+    #[cfg(all(
+        feature = "metal-linked",
+        not(test),
+        target_os = "uefi",
+        stela_vulkan_intel
+    ))]
+    vulkan: Some(crate::metal::intel::DRIVER),
+    #[cfg(all(
+        feature = "metal-linked",
+        not(test),
+        target_os = "uefi",
+        not(stela_vulkan_intel)
+    ))]
     vulkan: None,
 };
 
@@ -404,6 +428,66 @@ impl core::fmt::Display for StartError {
         }
     }
 }
+
+/// i915 with its display code. It registers before xe, so it binds the
+/// devices of its table ANV opens that upstream Linux binds to i915 by
+/// default, Skylake to Meteor Lake, DG1 and DG2 (`crate::i915::admits`); xe
+/// binds one of them whose i915 probe fails, and the boot then takes xe's
+/// stack for it ([`GpuStack::bound`]). ANV, over i915's uAPI, is its Vulkan
+/// driver when the image holds it, and the Metal device admits its GPUs as
+/// it admits xe's. Whether a GPU serves the Metal device is
+/// [`metal_devices`]' choice, as for xe's.
+#[cfg(feature = "i915-port")]
+pub static INTEL_I915: GpuStack = GpuStack {
+    vendor: Vendor::Intel,
+    kernel: Kernel {
+        driver: "i915",
+        admits: crate::i915::admits,
+        // GTTMMADR (`i915_reg.h` `GTTMMADR_BAR`), BAR 0 from Gen3 on.
+        registers: |_| 0,
+        // `i915_ggtt_init_hw`'s `io_mapping_init_wc` of the GGTT aperture,
+        // or DG1's and DG2's LMEM, BAR 2: mapped whole, as the build has no
+        // CONFIG_HAVE_ATOMIC_IOMAP.
+        aperture: Some(2),
+        resets_itself: false,
+        // The platform's `dma_mask_size` (`i915_pci.c`), which
+        // `i915_set_dma_info` sets as the mask.
+        dma_bits: crate::i915::dma_bits,
+        // The platform's `is_dgfx`.
+        integrated: crate::i915::integrated,
+        probed_integrated: None,
+        discovered_integrated: None,
+        chip: crate::i915::query::chip,
+        memory_bytes: crate::i915::query::memory_bytes,
+        reset: None,
+        describe: Some(crate::i915::query::describe),
+        version: versions::I915,
+        // The display code's VBT falls back to the PCI ROM through
+        // `intel_rom_pci` (`intel_bios.c`), as xe's does.
+        reads_rom: true,
+        // i915's unload waits on its GuC and engines; it was never run
+        // beside a stopped processor's own state.
+        unloads_on_boot_cpu: false,
+        // The heap's need beside i915 and ANV was not measured.
+        pages_bounded: false,
+    },
+    #[cfg(feature = "metal")]
+    metal: Some(crate::metal::intel::I915_ADMISSION),
+    #[cfg(all(
+        feature = "metal-linked",
+        not(test),
+        target_os = "uefi",
+        stela_vulkan_intel
+    ))]
+    vulkan: Some(crate::metal::intel::DRIVER),
+    #[cfg(all(
+        feature = "metal-linked",
+        not(test),
+        target_os = "uefi",
+        not(stela_vulkan_intel)
+    ))]
+    vulkan: None,
+};
 
 /// Brings Linux up and registers every kernel driver built into the image,
 /// stopping at the first stage that fails. Linux then matches each presented
@@ -461,9 +545,9 @@ impl GpuStack {
     /// the Metal device's frames. Otherwise its kernel driver only shows
     /// frames another GPU drew, on the displays wired to it.
     pub fn draws(&self) -> bool {
-        #[cfg(all(feature = "metal-linked", not(test)))]
+        #[cfg(all(feature = "metal-linked", not(test), target_os = "uefi"))]
         return self.vulkan.is_some();
-        #[cfg(not(all(feature = "metal-linked", not(test))))]
+        #[cfg(not(all(feature = "metal-linked", not(test), target_os = "uefi")))]
         false
     }
 
@@ -478,16 +562,33 @@ impl GpuStack {
         claim_rank(self.draws(), self.kernel.table_integrated(adapter))
     }
 
-    /// The stack for `adapter`: its vendor's, when that stack's kernel
-    /// driver holds the device. Otherwise why Stela drives it with none.
-    pub fn select(adapter: &Adapter) -> Result<&'static GpuStack, &'static str> {
-        let stack = STACKS
+    /// The stack of the kernel driver Linux bound a GPU of `vendor` to, named
+    /// as Linux names the driver: the claimed stack's, or another of its
+    /// vendor's whose driver registered later and bound the device after the
+    /// first one's probe failed (i915's devices, which xe binds then).
+    pub fn bound(vendor: Vendor, driver: &str) -> Option<&'static GpuStack> {
+        STACKS
             .iter()
             .copied()
-            .find(|stack| stack.vendor == adapter.vendor)
-            .ok_or_else(|| adapter.unavailable_reason())?;
-        (stack.kernel.admits)(adapter)?;
-        Ok(stack)
+            .find(|stack| stack.vendor == vendor && stack.kernel.driver == driver)
+    }
+
+    /// The stack for `adapter`: the first of its vendor's, in registration
+    /// order, whose kernel driver holds the device. Otherwise why Stela
+    /// drives it with none: the last of those drivers' answers.
+    pub fn select(adapter: &Adapter) -> Result<&'static GpuStack, &'static str> {
+        let mut refusal = None;
+        for stack in STACKS
+            .iter()
+            .copied()
+            .filter(|stack| stack.vendor == adapter.vendor)
+        {
+            match (stack.kernel.admits)(adapter) {
+                Ok(()) => return Ok(stack),
+                Err(why) => refusal = Some(why),
+            }
+        }
+        Err(refusal.unwrap_or_else(|| adapter.unavailable_reason()))
     }
 }
 
@@ -699,7 +800,7 @@ mod tests {
         for vendor in [
             #[cfg(not(feature = "amdgpu-port"))]
             0x1002,
-            #[cfg(not(feature = "xe-port"))]
+            #[cfg(not(any(feature = "xe-port", feature = "i915-port")))]
             0x8086,
             // ASPEED's BMC display and a vendor no stack names.
             0x1a03,
@@ -737,33 +838,135 @@ mod tests {
 
     #[cfg(feature = "xe-port")]
     #[test]
-    fn intel_is_selected_only_for_a_device_of_xes_table_and_draws_nothing() {
-        // Tiger Lake's UHD Graphics, then an ID no table holds.
-        let mut tiger_lake = adapter(0x8086);
-        tiger_lake.device = 0x9a49;
-        let intel = GpuStack::select(&tiger_lake).unwrap();
+    fn intel_is_selected_only_for_a_device_of_xes_table() {
+        // Lunar Lake's Arc Graphics, then an ID no table holds.
+        let mut lunar_lake = adapter(0x8086);
+        lunar_lake.device = 0x64a0;
+        let intel = GpuStack::select(&lunar_lake).unwrap();
         assert!(core::ptr::eq(intel, &INTEL));
         assert_eq!(intel.kernel.driver, "xe");
-        assert_eq!(intel.kernel.dma_limit(&tiger_lake), (1 << 39) - 1);
-        assert!((intel.kernel.integrated)(&tiger_lake));
+        assert_eq!(intel.kernel.dma_limit(&lunar_lake), (1 << 46) - 1);
+        assert!((intel.kernel.integrated)(&lunar_lake));
+        // This test binary links no Vulkan driver, ANV included.
         assert!(!intel.draws());
         #[cfg(feature = "metal")]
         assert!(intel.metal.is_some());
+        // An Intel GPU no driver is handed has the answer of any GPU
+        // without a driver.
         let unknown = adapter(0x8086);
         assert_eq!(
             GpuStack::select(&unknown).err(),
-            crate::xe::admits(&unknown).err()
+            Some(unknown.unavailable_reason())
         );
-        assert!(crate::xe::admits(&unknown).is_err());
+    }
+
+    /// Upstream Linux's default per platform: i915 binds Skylake to Meteor
+    /// Lake, DG1 and DG2, xe binds Lunar Lake, Battlemage, Panther Lake and
+    /// the Data Center GPU Flex (which i915 binds only by force probe). The
+    /// first registered driver whose table holds a device binds it, and i915
+    /// registers first (`build/i915.rs` ordinal 33, `build/xe.rs` 36), so
+    /// the claimed stack is i915's wherever i915 is handed the device, and
+    /// xe's for the rest of its table. No device either table admits is left
+    /// without a driver.
+    #[cfg(all(feature = "xe-port", feature = "i915-port"))]
+    #[test]
+    fn intel_devices_go_to_i915_where_upstream_binds_it_then_to_xe() {
+        let with = |device| Adapter {
+            device,
+            ..adapter(0x8086)
+        };
+        let (mut i915, mut xe, mut fallback) = (0, 0, 0);
+        for &(device, ..) in crate::i915::DEVICES {
+            let adapter = with(device);
+            match GpuStack::select(&adapter) {
+                Ok(stack) if core::ptr::eq(stack, &INTEL_I915) => {
+                    assert_eq!(crate::i915::admits(&adapter), Ok(()));
+                    i915 += 1;
+                    // xe binds it if i915's probe fails, where its table
+                    // holds it.
+                    if crate::xe::admits(&adapter).is_ok() {
+                        fallback += 1;
+                    }
+                }
+                Ok(stack) => {
+                    // Only a device i915 binds by force probe goes to xe.
+                    assert!(core::ptr::eq(stack, &INTEL), "{device:04x}");
+                    assert!(
+                        crate::i915::platform(device).unwrap().forced,
+                        "{device:04x}"
+                    );
+                }
+                // Every Intel GPU no driver is handed has the one answer.
+                Err(why) => assert_eq!(why, adapter.unavailable_reason(), "{device:04x}"),
+            }
+        }
+        for &(device, ..) in crate::xe::DEVICES {
+            let adapter = with(device);
+            match GpuStack::select(&adapter) {
+                Ok(stack) if core::ptr::eq(stack, &INTEL) => {
+                    assert!(crate::i915::admits(&adapter).is_err(), "{device:04x}");
+                    xe += 1;
+                }
+                Ok(stack) => assert!(core::ptr::eq(stack, &INTEL_I915), "{device:04x}"),
+                Err(why) => {
+                    assert!(crate::xe::admits(&adapter).is_err(), "{device:04x}");
+                    assert!(crate::i915::admits(&adapter).is_err(), "{device:04x}");
+                    assert_eq!(why, adapter.unavailable_reason());
+                }
+            }
+        }
+        // i915: Skylake to Ice Lake (118) and Tiger Lake to Meteor Lake, DG1
+        // and DG2 (105), each of which xe takes if i915's probe fails; xe:
+        // Lunar Lake, Battlemage, Panther Lake, Wildcat Lake and ATS-M.
+        assert_eq!((i915, fallback, xe), (223, 105, 33));
+        for (device, driver) in [
+            (0x1916, "i915"),
+            (0x8a56, "i915"),
+            (0x9a49, "i915"),
+            (0x46a6, "i915"),
+            (0x56a0, "i915"),
+            (0x7d55, "i915"),
+            (0x56c0, "xe"),
+            (0x64a0, "xe"),
+            (0xe20b, "xe"),
+            (0xb080, "xe"),
+        ] {
+            let stack = GpuStack::select(&with(device)).unwrap();
+            assert_eq!(stack.kernel.driver, driver, "{device:04x}");
+        }
+        // The stack follows the driver that bound the device.
+        assert!(core::ptr::eq(
+            GpuStack::bound(Vendor::Intel, "xe").unwrap(),
+            &INTEL
+        ));
+        assert!(core::ptr::eq(
+            GpuStack::bound(Vendor::Intel, "i915").unwrap(),
+            &INTEL_I915
+        ));
+        assert!(GpuStack::bound(Vendor::Intel, "nouveau").is_none());
+        // This test binary links no Vulkan driver, ANV included.
+        assert!(!INTEL_I915.draws());
+        #[cfg(feature = "metal")]
+        assert!(INTEL_I915.metal.is_some());
+        // Broadwell, Haswell, i830, the IDs Mesa leaves out and Nova Lake,
+        // which xe names no GuC image for, are no driver's.
+        for device in [0x1616, 0x0416, 0x3577, 0x8a70, 0x4c80, 0xd750] {
+            let adapter = with(device);
+            assert_eq!(
+                GpuStack::select(&adapter).err(),
+                Some(adapter.unavailable_reason()),
+                "{device:04x}"
+            );
+        }
     }
 
     #[test]
-    fn each_vendor_has_one_stack_and_a_usable_dma_mask() {
+    fn each_driver_has_one_stack_and_a_usable_dma_mask() {
         for (index, stack) in STACKS.iter().enumerate() {
             assert!(
                 STACKS[..index]
                     .iter()
-                    .all(|other| other.vendor != stack.vendor)
+                    .all(|other| other.kernel.driver != stack.kernel.driver)
             );
             let adapter = adapter(stack.vendor.pci_id());
             let bits = (stack.kernel.dma_bits)(&adapter);

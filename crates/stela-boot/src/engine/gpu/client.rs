@@ -161,7 +161,7 @@ pub(super) fn minor(index: usize) -> Option<u32> {
     let minors = match unsafe { MINORS.load(Ordering::Acquire).as_ref() } {
         Some(minors) => minors,
         None => {
-            let found = Box::into_raw(Box::new(find_minors()?));
+            let found = Box::into_raw(Box::new(find_minors(&[])?));
             match MINORS.compare_exchange(
                 ptr::null_mut(),
                 found,
@@ -182,8 +182,26 @@ pub(super) fn minor(index: usize) -> Option<u32> {
     minors.get(index).copied().flatten()
 }
 
-/// Each bound GPU's primary minor, by the PCI function its master names.
-fn find_minors() -> Option<Vec<Option<u32>>> {
+/// Finds the minors of the GPUs a fallback bound after [`minor`] found the
+/// others' ([`super::start_more`]): the nodes found already are not opened
+/// again, as the display may hold one as its master. The minors found
+/// before stay, so a reader keeps them.
+pub(super) fn find_new_minors() {
+    // SAFETY: published below or by `minor`, and leaked.
+    let Some(known) = (unsafe { MINORS.load(Ordering::Acquire).as_ref() }) else {
+        // None found yet: the first `minor` finds every GPU's.
+        return;
+    };
+    if let Some(found) = find_minors(known)
+        && found.len() > known.len()
+    {
+        MINORS.store(Box::into_raw(Box::new(found)), Ordering::Release);
+    }
+}
+
+/// Each bound GPU's primary minor, by the PCI function its master names;
+/// `known` gives the first GPUs', whose nodes are not opened again.
+fn find_minors(known: &[Option<u32>]) -> Option<Vec<Option<u32>>> {
     let bound = &installed()?.start.bound;
     // A function by its bus, slot and function; DRM puts its domain first.
     let functions: Vec<_> = bound
@@ -197,8 +215,12 @@ fn find_minors() -> Option<Vec<Option<u32>>> {
             )
         })
         .collect();
-    let mut minors = alloc::vec![None; bound.len()];
+    let mut minors = known.to_vec();
+    minors.resize(bound.len().max(known.len()), None);
     for minor in 0..PRIMARY_MINORS {
+        if known.contains(&Some(minor)) {
+            continue;
+        }
         let Some(fd) = open_node(minor) else {
             continue;
         };
@@ -214,12 +236,13 @@ fn find_minors() -> Option<Vec<Option<u32>>> {
             continue;
         };
         if let Some(index) = functions.iter().position(|name| name == function)
+            && index >= known.len()
             && minors[index].is_none()
         {
             minors[index] = Some(minor);
         }
     }
-    for (gpu, minor) in bound.iter().zip(&minors) {
+    for (gpu, minor) in bound.iter().zip(&minors).skip(known.len()) {
         if minor.is_none() {
             output::arguments(format_args!(
                 "GPU {}: its driver bound it, but no DRM node of it was found\n",
@@ -648,10 +671,12 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                         "GPU completion waiter still open at the stop\n"
                     ));
                 }
-                gpu.start
-                    ._attached
-                    .iter()
-                    .for_each(|attached| attached.shutdown());
+                // Every bound GPU, those a fallback started after the
+                // start among them, whose attachments the start's list does
+                // not hold.
+                for bound in gpu.start.bound.iter() {
+                    stela_linux::function::shutdown_device(bound.device as *mut c_void);
+                }
                 0
             }
         }
@@ -2041,9 +2066,17 @@ unsafe extern "C" fn stela_libc_fatal(message: *const c_char) -> ! {
     output::fatal(text(message))
 }
 
+/// The system's RAM, as Linux would tell a process (`_SC_PHYS_PAGES`,
+/// `MemTotal`): the RAM Linux sees, which the kernel drivers report as
+/// system memory too. ANV compares the two on xe (`anv_restrict_sys_heap_size`)
+/// and keeps all of xe's system memory for its heap when xe reports at most
+/// 60% of this, which on Linux means an older xe that halved it already; at
+/// the same figure it takes three quarters, as it does on i915. With the
+/// heap's capacity here instead, the share an integrated GPU's Linux sees
+/// against a larger heap fell under 60% and ANV took all of it on xe.
 #[unsafe(no_mangle)]
 extern "C" fn stela_libc_memory_bytes() -> u64 {
-    installed().map_or(0, |gpu| gpu.heap_bytes)
+    installed().map_or(0, |_| stela_linux::pages::ram_bytes())
 }
 
 #[unsafe(no_mangle)]

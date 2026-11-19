@@ -315,7 +315,10 @@ impl Linux {
                 .iter()
                 .map(|source| PathBuf::from(format!("{LINUX}/{source}.c"))),
         );
-        let hosted_upstream = upstream[..4].to_vec();
+        // The hosted tests' units: the first four, and DRM's cache line
+        // write-back, which the image builds with DRM's core.
+        let mut hosted_upstream = upstream[..4].to_vec();
+        hosted_upstream.push(PathBuf::from(format!("{DRM}/drm_cache.c")));
         let mut build = stela_c_build::native::configure();
         environment.apply(&mut build, None, &[], None);
         #[cfg(feature = "linux-drm")]
@@ -466,6 +469,7 @@ impl Linux {
         for (name, source) in [
             ("linux_drm_mm", "drm_mm_test.c"),
             ("linux_drm_vma", "drm_vma_test.c"),
+            ("linux_drm_cache", "drm_cache_test.c"),
         ] {
             tests.add(
                 &build,

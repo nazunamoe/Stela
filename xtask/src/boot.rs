@@ -116,8 +116,9 @@ enum Scenario {
 #[derive(Subcommand)]
 pub enum Command {
     /// Build `stela.efi` with its GPU stacks and guest components: NVK
-    /// over nouveau, and, outside a release, amdgpu, whose GPUs draw on
-    /// RADV where the image's Mesa build holds it ([`linked_features`]).
+    /// over nouveau, and, outside a release, amdgpu and the Intel port,
+    /// whose GPUs draw on RADV and ANV where the image's Mesa build holds
+    /// them ([`linked_features`]).
     Build {
         #[arg(long)]
         release: bool,
@@ -528,12 +529,13 @@ enum Gpu {
 }
 
 /// stela-boot's features for an image with its Mesa drivers: NVK over
-/// nouveau, and, outside a release, amdgpu. Which GPUs draw is then the
-/// image's own detection: AMD's stack gives RADV where `gpu nvk` built it
-/// (`stela_vulkan_amd`), and otherwise its GPUs show frames another GPU
-/// draws. A release leaves the AMD port and its firmware out.
+/// nouveau, and, outside a release, amdgpu and the Intel port. Which GPUs
+/// draw is then the image's own detection: AMD's stack gives RADV and
+/// Intel's ANV where `gpu nvk` built them (`stela_vulkan_amd`,
+/// `stela_vulkan_intel`), and otherwise their GPUs show frames another GPU
+/// draws. A release leaves the AMD and Intel ports and their firmware out.
 pub(crate) fn linked_features(release: bool) -> &'static str {
-    if release { "nvk" } else { "nvk,amdgpu" }
+    if release { "nvk" } else { "nvk,amdgpu,intel" }
 }
 
 fn build_for_boot(release: bool, diagnostics: bool, gpu: Gpu) -> Result<PathBuf> {

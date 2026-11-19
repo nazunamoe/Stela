@@ -89,9 +89,15 @@ pub struct Loader {
     pub refusals: Option<Refusals>,
     /// The device is never released once its GPU may have hung: releasing
     /// it closes the driver's file, whose close waits for the kernel
-    /// driver's recovery from the hang, which may never end. Its open waits
-    /// for a first submission before the device is served.
+    /// driver's recovery from the hang, which may never end. Such a driver
+    /// checks its first submission too ([`Self::check_first_submission`]).
     pub keep_lost: bool,
+    /// The open waits for a first submission to signal before the device is
+    /// served, and a device reopened after a loss serves only once one
+    /// signals: a GPU whose engines do not run after the boot's reset, or
+    /// that hangs again after its kernel driver's recovery, takes no
+    /// client's work.
+    pub check_first_submission: bool,
     /// Waits a moment, as the platform's waits do: a call outside the
     /// service's turn may wait for the boot processor.
     pub relax: fn(),
@@ -115,6 +121,8 @@ pub struct Driver {
     pub refusals: Option<Refusals>,
     /// [`Loader::keep_lost`].
     pub keep_lost: bool,
+    /// [`Loader::check_first_submission`].
+    pub check_first_submission: bool,
 }
 
 impl Driver {
@@ -126,6 +134,7 @@ impl Driver {
             submit_thread: self.submit_thread,
             refusals: self.refusals,
             keep_lost: self.keep_lost,
+            check_first_submission: self.check_first_submission,
             relax,
         }
     }

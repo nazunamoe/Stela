@@ -37,6 +37,11 @@ nvk = ["dep:stela-mesa", "stela-drivers/metal-linked"]
 # with their firmware in the bundle; its GPUs draw on RADV where the image's
 # Mesa build holds it. `cargo xtask boot build` turns it on outside a release.
 amdgpu = ["stela-drivers/amdgpu-port", "stela-loader/amdgpu-port"]
+# xe and i915 in the image's Linux environment, for the Intel GPUs their
+# tables hold and ANV opens, with their firmware in the bundle; their GPUs
+# draw on ANV where the image's Mesa build holds it. `cargo xtask boot build`
+# turns it on outside a release.
+intel = ["stela-drivers/xe-port", "stela-drivers/i915-port", "stela-loader/xe-port", "stela-loader/i915-port"]
 # Test builds only: holds the Metal device to `STELA_VRAM_CAP_MIB` MiB of
 # device memory, which `cargo xtask boot` selects when the variable is set.
 vram-cap = ["stela-drivers/vram-cap"]

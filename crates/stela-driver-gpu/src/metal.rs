@@ -25,7 +25,7 @@ pub mod error;
 pub mod hazard;
 pub mod heap;
 pub mod indirect;
-#[cfg(feature = "xe-port")]
+#[cfg(any(feature = "xe-port", feature = "i915-port"))]
 pub mod intel;
 pub mod kms;
 pub mod library;

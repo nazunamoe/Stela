@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 15:29:10 +0000
+Subject: [PATCH] fix(i915): a kernel built with CONFIG_STELA takes a panel's
+ PWM backlight level that reads 0 at the display code's start as the highest
+ and says in one line what it read, where a level the GPU's reset before the
+ bind cleared came back at the panel's enable as the minimum, a lit but dim
+ panel, for i915 and xe alike
+
+---
+ .../gpu/drm/i915/display/intel_backlight.c    | 23 +++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_backlight.c b/drivers/gpu/drm/i915/display/intel_backlight.c
+index b128896cb1c2de2d04225202da8f877a2319ee66..f289aeb9ce454e870de300f49041524f49bd4b05 100644
+--- a/drivers/gpu/drm/i915/display/intel_backlight.c
++++ b/drivers/gpu/drm/i915/display/intel_backlight.c
+@@ -1644,6 +1644,29 @@ static int intel_pwm_setup_backlight(struct intel_connector *connector, enum pip
+ 	panel->backlight.level = intel_pwm_get_backlight(connector, pipe);
+ 	panel->backlight.enabled = panel->backlight.pwm_enabled;
+ 
++#ifdef CONFIG_STELA
++	/*
++	 * A kernel that resets the GPU before its driver binds it can find the
++	 * level the firmware set cleared, which the panel's enable would raise
++	 * only to the minimum: a lit but dim panel. A level that reads 0 is
++	 * taken as the highest, as the boot's ACPI video brightness takes a
++	 * level that reads 0. One line for each panel says what was read.
++	 */
++	{
++		struct intel_display *display = to_intel_display(connector);
++		u32 read = panel->backlight.level;
++
++		if (!read)
++			panel->backlight.level = panel->backlight.max;
++		drm_info(display->drm,
++			 "[CONNECTOR:%d:%s] backlight by PWM: level %u of %u (minimum %u), %s%s\n",
++			 connector->base.base.id, connector->base.name, read,
++			 panel->backlight.max, panel->backlight.min,
++			 str_enabled_disabled(panel->backlight.enabled),
++			 read ? "" : "; 0 read, so the highest is taken");
++	}
++#endif
++
+ 	return 0;
+ }
+ 

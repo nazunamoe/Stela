@@ -14,8 +14,25 @@ bool stela_linux_pci_devices_present(void);
  * from a successful absent capability (*found == 0). No context ownership moves. */
 int stela_linux_pci_find_capability(struct pci_dev *dev, int cap, u8 *found);
 bool stela_linux_pci_bound(const struct pci_dev *device);
+const char *stela_linux_pci_driver_name(const struct pci_dev *device);
+/* Whether the owner of an attached function routes its MSI-X table, and
+ * how many vectors it has lines for (0 for none or no table). */
+bool stela_linux_pci_routes_msix(const struct pci_dev *device);
+int stela_linux_pci_msix_lines(struct pci_dev *device);
 void stela_linux_pci_shutdown(struct pci_dev *dev);
 void stela_linux_pci_remove_device(struct pci_dev *dev);
+/* After `driver`'s probe of an attached function failed and its managed
+ * resources were released: free the interrupt requests left on its lines,
+ * turn its MSI or MSI-X and its bus mastering off, each said once. Nothing
+ * for a function no owner attached. */
+void stela_linux_pci_quiesce_failed(struct pci_dev *dev, const char *driver);
+/* The same after `driver`'s `after` (its failed probe, its unload). */
+void stela_linux_pci_quiesce(struct pci_dev *dev, const char *driver, const char *after);
+/* Unload the driver bound to the function while Linux runs on, as
+ * device_release_driver does, and stop what its remove left
+ * (stela_linux_pci_quiesce); the function stays published. Whether a driver
+ * held it. */
+bool stela_linux_pci_release(struct pci_dev *dev);
 /* The function's driver ends the picture the firmware left on its outputs:
  * it resets the function, or starts its display engine, which blanks what
  * the firmware lit. `why` names that step and outlives the boot (a string
@@ -85,11 +102,21 @@ struct stela_linux_pci_function {
 	 * which the attach copies: none for a function on a root bus. */
 	const struct stela_linux_pci_port *upstream;
 	size_t upstream_count;
+	/* Optional MSI-X, NULL where the owner routes none: set up to `vectors`
+	 * entries of the function's MSI-X table, each masked until its line is
+	 * enabled, on consecutive lines from *first_irq. Returns how many it set
+	 * up (fewer where its lines run out) or a negative errno. Called again
+	 * while enabled, it writes the same entries back, as after a reset.
+	 * `vectors` 0 sets up nothing and returns how many it could. */
+	int (*enable_msix)(void *context, unsigned int vectors, unsigned int *first_irq);
+	void (*disable_msix)(void *context);
 };
 
-_Static_assert(sizeof(struct stela_linux_pci_function) == 296, "Linux PCI function ABI");
+_Static_assert(sizeof(struct stela_linux_pci_function) == 312, "Linux PCI function ABI");
 _Static_assert(__builtin_offsetof(struct stela_linux_pci_function, upstream) == 280,
 	       "Linux PCI upstream port ABI");
+_Static_assert(__builtin_offsetof(struct stela_linux_pci_function, enable_msix) == 296,
+	       "Linux PCI MSI-X ABI");
 _Static_assert(__builtin_offsetof(struct stela_linux_pci_function, rom_bar) == 256,
 	       "Linux PCI ROM BAR ABI");
 _Static_assert(__builtin_offsetof(struct stela_linux_pci_function, release_context) == 224,
@@ -122,6 +149,12 @@ _Static_assert(sizeof(struct stela_linux_pci_identity) == 20, "Linux PCI identit
  * stela_linux_pci_remove_device drops the registration reference. */
 struct pci_dev *stela_linux_pci_publish_identity(const struct stela_linux_pci_identity *identity,
 						 int *error);
+/* As stela_linux_pci_publish_identity, with a copy of the first length bytes
+ * (at most 256) of the function's configuration as its owner read them:
+ * reads inside the copy answer its bytes, others fail as for an absent
+ * function, and a write is refused and reported once. */
+struct pci_dev *stela_linux_pci_publish_snapshot(const struct stela_linux_pci_identity *identity,
+						 const u8 *config, size_t length, int *error);
 /* Cumulative final releases quarantined outside the original process owner.
  * Atomic observation only; no reset or deferred reclamation is implied. */
 u64 stela_linux_pci_quarantined_functions(void);

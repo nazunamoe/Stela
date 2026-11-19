@@ -11,6 +11,8 @@
 /drivers/gpu/drm/nouveau/
 /drivers/gpu/drm/xe/
 /drivers/gpu/drm/i915/
+/drivers/platform/x86/intel_ips.h
+/arch/x86/kernel/early-quirks.c
 /drivers/gpu/buddy.c
 /drivers/base/auxiliary.c
 /drivers/base/base.h
@@ -45,6 +47,7 @@
 /lib/string_helpers.c
 /lib/string_unescape.c
 /lib/ratelimit.c
+/lib/dec_and_lock.c
 /drivers/i2c/algos/i2c-algo-bit.c
 /lib/bitrev.c
 /lib/find_bit.c

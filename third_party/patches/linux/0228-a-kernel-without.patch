@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 03:37:13 +0000
+Subject: [PATCH] fix(i915): a kernel without the PMC mux driver says once that
+ a Type-C port shows a display only where firmware set its mux, where such a
+ port stayed dark without a word
+
+---
+ drivers/gpu/drm/i915/display/intel_tc.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/display/intel_tc.c b/drivers/gpu/drm/i915/display/intel_tc.c
+index f2d86b29c4154d9d298ba4b097fb2e838e2cf99c..0cd631685b3143387ecc2f79acb7550800fc8650 100644
+--- a/drivers/gpu/drm/i915/display/intel_tc.c
++++ b/drivers/gpu/drm/i915/display/intel_tc.c
+@@ -2011,6 +2011,16 @@ int intel_tc_port_init(struct intel_digital_port *dig_port, bool is_legacy)
+ 
+ 	intel_tc_port_init_mode(dig_port);
+ 
++	/*
++	 * The SoC's PMC routes a Type-C connector to display once something
++	 * sets its mux: firmware, the EC or PD controller, or intel_pmc_mux
++	 * driven by the connector's UCSI events. Without that driver a
++	 * display on the port shows only where one of the others set it.
++	 */
++	if (!IS_REACHABLE(CONFIG_TYPEC_MUX_INTEL_PMC) && !tc->legacy_port)
++		drm_notice_once(display->drm,
++				"Type-C ports: a display shows only where firmware has set the port's PMC mux; no driver here sets it\n");
++
+ 	return 0;
+ }
+ 

@@ -259,6 +259,7 @@ pub fn run(library: &Path, linux: &Path, corpus: &[PathBuf]) -> Result<()> {
         submit_thread: None,
         refusals: None,
         keep_lost: false,
+        check_first_submission: false,
         relax,
     };
     // Every requirement RADV lacks, where the boot names only the first.

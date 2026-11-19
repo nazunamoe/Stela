@@ -15,4 +15,6 @@ struct stela_linux_resource_request {
  * another instance cannot reset these globals. No teardown is provided until
  * complete original kernel-resource and producer shutdown exists. */
 int stela_linux_resources_initialize(const struct stela_linux_resource_request *request);
+/* Sets intel_graphics_stolen_res, before any driver registers. */
+void stela_linux_set_graphics_stolen(u64 base, u64 size);
 #endif

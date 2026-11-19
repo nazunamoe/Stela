@@ -115,7 +115,7 @@ fn admit(
 
 /// NVK as linked into the image, with its driver-internal calls
 /// (`compat/mesa/nir_options.c`, `compat/mesa/submit_thread.c`).
-#[cfg(all(feature = "metal-linked", not(test)))]
+#[cfg(all(feature = "metal-linked", not(test), target_os = "uefi"))]
 pub const DRIVER: super::native::Driver = {
     use super::native::{Driver, Refusals, vk};
     use core::ffi::{c_char, c_void};
@@ -148,6 +148,7 @@ pub const DRIVER: super::native::Driver = {
             count: stela_nvk_count_failures,
         }),
         keep_lost: false,
+        check_first_submission: false,
     }
 };
 

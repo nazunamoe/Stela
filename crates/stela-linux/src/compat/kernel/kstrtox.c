@@ -6,6 +6,8 @@
 #include <linux/errno.h>
 #include <linux/kstrtox.h>
 #include <linux/limits.h>
+#include <linux/minmax.h>
+#include <linux/uaccess.h>
 
 static unsigned int digit(char c)
 {
@@ -104,6 +106,18 @@ int kstrtoint(const char *s, unsigned int base, int *res)
 		return -ERANGE;
 	*res = (int)value;
 	return 0;
+}
+
+/* lib/kstrtox.c's: a number a client wrote, at most 63 characters. */
+int kstrtoint_from_user(const char __user *s, size_t count, unsigned int base, int *res)
+{
+	char buf[64];
+
+	count = min(count, sizeof(buf) - 1);
+	if (copy_from_user(buf, s, count))
+		return -EFAULT;
+	buf[count] = '\0';
+	return kstrtoint(buf, base, res);
 }
 
 int kstrtou16(const char *s, unsigned int base, u16 *res)

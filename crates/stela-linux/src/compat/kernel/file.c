@@ -19,6 +19,10 @@
 #include <linux/mount.h>
 #include <linux/pseudo_fs.h>
 #include <linux/shmem_fs.h>
+#include <linux/pagemap.h>
+#include <linux/uio.h>
+#include <linux/writeback.h>
+#include <linux/xarray.h>
 #include <linux/jiffies.h>
 #include <linux/slab.h>
 #include <linux/wait.h>
@@ -46,6 +50,9 @@ void stela_linux_compat_iput(struct inode *inode)
 	if (inode && atomic_dec_and_test(&inode->i_count)) {
 		if (S_ISCHR(inode->i_mode))
 			cd_forget(inode);
+		/* A shmem file's pages go with its inode. */
+		if (inode->i_data.nrpages)
+			shmem_truncate_range(inode, 0, (uoff_t)-1);
 		kfree(inode);
 	}
 }
@@ -194,9 +201,211 @@ struct file *alloc_file_pseudo(struct inode *inode, struct vfsmount *mount, cons
 	return file;
 }
 
-/* An object with no backing store, as nouveau's GEM objects take one only for
- * their size and mapping offset. Pages for it are what the OPEN list's shmem
- * entries would serve. */
+/* mm/shmem.c's files as Linux without swap keeps them: each page is
+ * zero-filled when first asked for and stays in the file's page cache, held
+ * by the cache, until a truncation or the inode's last reference drops it.
+ * Nothing is written back, as there is no swap to write to. GEM objects of
+ * system memory take their pages from here (i915), or only their size and
+ * mapping offset (nouveau). */
+static struct folio *shmem_folio(struct address_space *mapping, pgoff_t index, gfp_t gfp)
+{
+	struct folio *folio, *cached;
+
+	rcu_read_lock();
+	folio = xa_load(&mapping->i_pages, index);
+	if (folio && !folio_try_get(folio))
+		folio = NULL;
+	rcu_read_unlock();
+	if (folio)
+		return folio;
+	folio = folio_alloc(gfp | __GFP_ZERO, 0);
+	if (!folio)
+		return ERR_PTR(-ENOMEM);
+	folio->mapping = mapping;
+	folio->index = index;
+	folio_mark_uptodate(folio);
+	/* The cache's reference, beside the caller's. */
+	folio_get(folio);
+	/* The page cache's lock is taken with interrupts off (XA_FLAGS_LOCK_IRQ),
+	 * and its nodes take the request's reclaim behaviour only. */
+	xa_lock_irq(&mapping->i_pages);
+	cached = __xa_cmpxchg(&mapping->i_pages, index, NULL, folio,
+			      gfp & (__GFP_RECLAIM | __GFP_IO | __GFP_FS | __GFP_NOWARN |
+				     __GFP_RETRY_MAYFAIL | __GFP_NORETRY));
+	if (!cached)
+		WRITE_ONCE(mapping->nrpages, mapping->nrpages + 1);
+	xa_unlock_irq(&mapping->i_pages);
+	if (!cached)
+		return folio;
+	folio->mapping = NULL;
+	folio_put(folio);
+	folio_put(folio);
+	if (xa_is_err(cached))
+		return ERR_PTR(xa_err(cached));
+	/* Another caller cached the page first. */
+	return shmem_folio(mapping, index, gfp);
+}
+
+/* mm/folio-compat.c's. */
+void unlock_page(struct page *page)
+{
+	folio_unlock(page_folio(page));
+}
+
+/* Linux answers -EINVAL for a page past the end of the file. */
+struct folio *shmem_read_folio_gfp(struct address_space *mapping, pgoff_t index, gfp_t gfp)
+{
+	if (index >= DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE))
+		return ERR_PTR(-EINVAL);
+	return shmem_folio(mapping, index, gfp);
+}
+
+struct page *shmem_read_mapping_page_gfp(struct address_space *mapping, pgoff_t index, gfp_t gfp)
+{
+	struct folio *folio = shmem_read_folio_gfp(mapping, index, gfp);
+
+	return IS_ERR(folio) ? ERR_CAST(folio) : folio_file_page(folio, index);
+}
+
+/* Zeroes bytes [from, to) of a cached page, if it is cached. */
+static void shmem_zero_part(struct address_space *mapping, pgoff_t index, size_t from, size_t to)
+{
+	struct folio *folio = xa_load(&mapping->i_pages, index);
+
+	if (folio && from < to)
+		folio_zero_range(folio, from, to - from);
+}
+
+/* Drops the cached pages of [start, end] (end inclusive) and zeroes the
+ * parts of the pages at either end that the range covers. */
+void shmem_truncate_range(struct inode *inode, loff_t start, uoff_t end)
+{
+	struct address_space *mapping = inode->i_mapping;
+	uoff_t from = (uoff_t)start;
+	pgoff_t first = (pgoff_t)DIV_ROUND_UP(from, PAGE_SIZE);
+	pgoff_t last = end == (uoff_t)-1 ? ULONG_MAX : (pgoff_t)((end + 1) >> PAGE_SHIFT);
+	struct folio *folio;
+	unsigned long index;
+
+	if (from & ~PAGE_MASK)
+		shmem_zero_part(mapping, (pgoff_t)(from >> PAGE_SHIFT), from & ~PAGE_MASK,
+				end >> PAGE_SHIFT == from >> PAGE_SHIFT ? (end & ~PAGE_MASK) + 1 :
+									   PAGE_SIZE);
+	if (end != (uoff_t)-1 && ((end + 1) & ~PAGE_MASK) && end >> PAGE_SHIFT != from >> PAGE_SHIFT)
+		shmem_zero_part(mapping, (pgoff_t)(end >> PAGE_SHIFT), 0, (end & ~PAGE_MASK) + 1);
+	if (last == 0 || first > last - 1)
+		return;
+	xa_for_each_range(&mapping->i_pages, index, folio, first, last - 1) {
+		xa_erase_irq(&mapping->i_pages, index);
+		WRITE_ONCE(mapping->nrpages, mapping->nrpages - 1);
+		folio->mapping = NULL;
+		folio_put(folio);
+	}
+}
+
+/* Without swap, Linux's shmem_writeout marks the folio dirty again and
+ * returns it still locked for activation. */
+struct swap_iocb;
+int shmem_writeout(struct folio *folio, struct swap_iocb **plug, struct list_head *folio_list)
+{
+	(void)plug;
+	(void)folio_list;
+	folio_mark_dirty(folio);
+	return AOP_WRITEPAGE_ACTIVATE;
+}
+
+bool folio_clear_dirty_for_io(struct folio *folio)
+{
+	return folio_test_clear_dirty(folio);
+}
+
+/* A writeback pass over a shmem file: each dirty folio would only be marked
+ * dirty again (shmem_writeout above), so the pass has nothing to give and
+ * ends at once, leaving every page dirty and cached as Linux does. */
+struct folio *writeback_iter(struct address_space *mapping, struct writeback_control *wbc,
+			     struct folio *folio, int *error)
+{
+	(void)mapping;
+	(void)wbc;
+	(void)folio;
+	(void)error;
+	return NULL;
+}
+
+bool folio_redirty_for_writepage(struct writeback_control *wbc, struct folio *folio)
+{
+	wbc->pages_skipped += folio_nr_pages(folio);
+	return folio_mark_dirty(folio);
+}
+
+/* A write into a shmem file's pages, extending the file past its end as
+ * Linux's does. */
+static ssize_t shmem_write_iter(struct kiocb *iocb, struct iov_iter *from)
+{
+	struct address_space *mapping = iocb->ki_filp->f_mapping;
+	struct inode *inode = mapping->host;
+	loff_t position = iocb->ki_pos;
+	ssize_t written = 0;
+
+	while (iov_iter_count(from)) {
+		size_t offset = (size_t)position & ~PAGE_MASK;
+		size_t bytes = min_t(size_t, PAGE_SIZE - offset, iov_iter_count(from));
+		struct folio *folio = shmem_folio(mapping, (pgoff_t)(position >> PAGE_SHIFT),
+						  mapping_gfp_mask(mapping));
+
+		if (IS_ERR(folio)) {
+			if (!written)
+				written = PTR_ERR(folio);
+			break;
+		}
+		size_t copied = copy_folio_from_iter(folio, offset, bytes, from);
+
+		folio_mark_dirty(folio);
+		folio_put(folio);
+		if (!copied) {
+			if (!written)
+				written = -EFAULT;
+			break;
+		}
+		position += (loff_t)copied;
+		written += (ssize_t)copied;
+	}
+	if (position > i_size_read(inode))
+		i_size_write(inode, position);
+	iocb->ki_pos = position;
+	return written;
+}
+
+static const struct file_operations shmem_file_operations = {
+	.write_iter = shmem_write_iter,
+};
+
+/* As mm/shmem.c's: a dirty page is only marked so. */
+static const struct address_space_operations shmem_aops = {
+	.dirty_folio = noop_dirty_folio,
+};
+
+/* fs/read_write.c's, through the file's own write. */
+ssize_t kernel_write(struct file *file, const void *buf, size_t count, loff_t *pos)
+{
+	struct kvec iov = {.iov_base = (void *)buf, .iov_len = count};
+	struct kiocb kiocb;
+	struct iov_iter iter;
+	ssize_t written;
+
+	if (!(file->f_mode & FMODE_WRITE))
+		return -EBADF;
+	if (!file->f_op->write_iter)
+		return -EINVAL;
+	init_sync_kiocb(&kiocb, file);
+	kiocb.ki_pos = *pos;
+	iov_iter_kvec(&iter, ITER_SOURCE, &iov, 1, count);
+	written = file->f_op->write_iter(&kiocb, &iter);
+	if (written > 0)
+		*pos = kiocb.ki_pos;
+	return written;
+}
+
 struct file *shmem_file_setup(const char *name, loff_t size, vma_flags_t flags)
 {
 	(void)name;
@@ -206,7 +415,9 @@ struct file *shmem_file_setup(const char *name, loff_t size, vma_flags_t flags)
 	if (IS_ERR(inode))
 		return ERR_CAST(inode);
 	inode->i_size = size;
-	return new_file(inode, NULL, O_RDWR, NULL);
+	inode->i_mapping->a_ops = &shmem_aops;
+	mapping_set_gfp_mask(inode->i_mapping, GFP_HIGHUSER_MOVABLE);
+	return new_file(inode, &shmem_file_operations, O_RDWR, NULL);
 }
 
 struct file *shmem_file_setup_with_mnt(struct vfsmount *mount, const char *name, loff_t size,
@@ -600,6 +811,32 @@ int main(void)
 
 	struct file *object = shmem_file_setup("test", 8192, EMPTY_VMA_FLAGS);
 	assert(!IS_ERR(object) && file_inode(object)->i_size == 8192);
+	/* Its pages: zeroed when first read, the same page after, none past
+	 * the end; writes land in them and extend the file. */
+	struct address_space *pages = object->f_mapping;
+	struct folio *leading = shmem_read_folio_gfp(pages, 0, GFP_KERNEL);
+	assert(!IS_ERR(leading) && pages->nrpages == 1 && folio_ref_count(leading) == 2);
+	assert(!memchr_inv(folio_address(leading), 0, PAGE_SIZE));
+	assert(shmem_read_folio_gfp(pages, 0, GFP_KERNEL) == leading && folio_ref_count(leading) == 3);
+	folio_put(leading);
+	assert(PTR_ERR(shmem_read_folio_gfp(pages, 2, GFP_KERNEL)) == -EINVAL);
+	loff_t position = PAGE_SIZE - 2;
+	assert(kernel_write(object, "abcd", 4, &position) == 4 && position == PAGE_SIZE + 2);
+	assert(pages->nrpages == 2 && !memcmp((char *)folio_address(leading) + PAGE_SIZE - 2, "ab", 2));
+	struct page *second = shmem_read_mapping_page_gfp(pages, 1, GFP_KERNEL);
+	assert(!IS_ERR(second) && !memcmp(page_address(second), "cd", 2));
+	put_page(second);
+	position = 3 * PAGE_SIZE;
+	assert(kernel_write(object, "e", 1, &position) == 1);
+	assert(file_inode(object)->i_size == 3 * PAGE_SIZE + 1 && pages->nrpages == 3);
+	/* A truncation zeroes the partial pages it covers and drops the rest. */
+	shmem_truncate_range(file_inode(object), PAGE_SIZE - 1, (uoff_t)-1);
+	assert(pages->nrpages == 1 && folio_ref_count(leading) == 2);
+	assert(!memcmp((char *)folio_address(leading) + PAGE_SIZE - 2, "a\0", 2));
+	assert(shmem_writeout(leading, NULL, NULL) == AOP_WRITEPAGE_ACTIVATE && folio_test_dirty(leading));
+	assert(folio_clear_dirty_for_io(leading) && !folio_test_dirty(leading));
+	folio_put(leading);
+	/* The last reference drops the cached page with the inode. */
 	fput(object);
 
 	struct pin_interleave overlap = {};

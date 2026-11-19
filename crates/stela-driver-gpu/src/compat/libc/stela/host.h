@@ -15,9 +15,9 @@ void stela_libc_log(const char *text, size_t size);
 _Noreturn void stela_libc_fatal(const char *message);
 /* Monotonic nanoseconds. */
 uint64_t stela_libc_now_ns(void);
-/* The bytes this image can allocate. */
+/* The system's RAM, as Linux would tell a process: the RAM Linux sees. */
 uint64_t stela_libc_memory_bytes(void);
-/* Of those, the bytes not yet allocated. */
+/* The bytes of the host's heap not yet allocated, at most its capacity. */
 uint64_t stela_libc_available_memory_bytes(void);
 /* This host processor or Mesa thread, below STELA_LIBC_CORES. */
 unsigned int stela_libc_core(void);

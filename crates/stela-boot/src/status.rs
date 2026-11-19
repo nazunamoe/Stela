@@ -283,20 +283,11 @@ impl State {
         };
         let seconds = self.seconds(running.started);
         let millis = self.millis(running.started);
-        let mut text = running.title;
         // A failed step keeps what it was on, such as the PCI function a
         // probe stopped in: before the engine resumes the boot log, the
         // screen shows it whatever becomes of the stop's record.
-        if matches!(mark, Mark::Failed) && !running.detail.is_empty() {
-            text.push_str(" at ");
-            text.push_str(&running.detail);
-        }
-        match (result.is_empty(), seconds) {
-            (true, 0) => {}
-            (true, seconds) => text.push_str(&format!(" ({seconds} s)")),
-            (false, 0) => text.push_str(&format!(" ({result})")),
-            (false, seconds) => text.push_str(&format!(" ({result}, {seconds} s)")),
-        }
+        let at = matches!(mark, Mark::Failed).then_some(running.detail.as_str());
+        let text = stela_boot_core::screen::finished_step(&running.title, at, result, seconds);
         // The log's line carries the exact time, which the screen's rounds.
         output::arguments(format_args!("STEP {} {text} ms={millis}\n", mark.letter()));
         self.line(mark, &text);

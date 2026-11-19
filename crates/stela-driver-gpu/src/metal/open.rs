@@ -106,7 +106,7 @@ pub enum Refusal {
     Nvidia(nvidia::Refusal),
     #[cfg(feature = "amdgpu-port")]
     Amd(crate::metal::amd::Refusal),
-    #[cfg(feature = "xe-port")]
+    #[cfg(any(feature = "xe-port", feature = "i915-port"))]
     Intel(crate::metal::intel::Refusal),
 }
 
@@ -337,7 +337,7 @@ pub unsafe fn open(
     // SAFETY: the caller's guarantees.
     let (mut backend, compiler) = unsafe { stack(loader, gpu.pci, exporter, compiler) }?;
     (loader.log)(&describe(backend.physical_device()));
-    if loader.keep_lost {
+    if loader.check_first_submission {
         let failed = match first_submission(&mut backend) {
             Ok(true) => {
                 (loader.log)("first submission signaled");
@@ -355,8 +355,9 @@ pub unsafe fn open(
             }
         };
         if let Some(error) = failed {
-            // A GPU whose first work hung is one its kernel driver resets,
-            // and releasing the device would wait for that reset's end.
+            // A GPU whose first work hung is one its kernel driver resets:
+            // releasing the device would wait for that reset's end (RADV's
+            // file close) or free memory the GPU may still write.
             core::mem::forget(backend);
             return Err(error.into());
         }

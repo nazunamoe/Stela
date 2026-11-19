@@ -2071,6 +2071,20 @@ int stela_linux_task_yield(void)
 	return finish_prepared(task, result);
 }
 
+/* kernel/sched/core.c: give the processor up under a spinlock by dropping
+ * the lock around the reschedule when one is due. */
+int __cond_resched_lock(spinlock_t *lock)
+{
+	lockdep_assert_held(lock);
+	if (!need_resched() && !spin_needbreak(lock))
+		return 0;
+	spin_unlock(lock);
+	if (!__cond_resched())
+		cpu_relax();
+	spin_lock(lock);
+	return 1;
+}
+
 int __cond_resched(void)
 {
 	struct stela_linux_task *task = current_record();

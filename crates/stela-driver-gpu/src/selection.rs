@@ -26,7 +26,10 @@
 //! - A GPU no stack drives is left with the firmware; its picture, if the
 //!   firmware's is on it, keeps showing macOS by copy.
 //! - When a GPU's claim is refused, the next one takes its place: a GPU left
-//!   out only beside it is started instead.
+//!   out only beside it is started instead. So does a GPU that started and
+//!   cannot draw after all, its driver's probe failed or its Metal device
+//!   did not open ([`fall_back`]): every GPU a stack drives gets its turn,
+//!   in this order, before the boot goes on without one.
 use crate::bus::pci::Address;
 use crate::stack::{drawing_kind, may_only_show_frames_of, only_shows_frames_of};
 use alloc::{format, string::String, vec::Vec};
@@ -140,6 +143,41 @@ pub fn select(found: &[Found], mut claim: impl FnMut(usize) -> bool) -> Selectio
     Selection { choices, claimed }
 }
 
+/// The selection again once the GPUs of `failed`, by census index, could
+/// not draw after all: their drivers did not bind them, or bound them and
+/// opened no Metal device. Each counts as a GPU whose claim was refused, so
+/// the rule picks again with them out: a GPU claimed before stays claimed,
+/// one whose claim was refused before is not asked again, and a GPU left with
+/// the firmware only beside a failed one is claimed now (`claim`, which
+/// answers whether it was), as [`select`] would have claimed it in the failed
+/// one's place. The GPUs newly claimed are [`newly_claimed`]'s.
+pub fn fall_back(
+    found: &[Found],
+    before: &Selection,
+    failed: &[usize],
+    mut claim: impl FnMut(usize) -> bool,
+) -> Selection {
+    select(found, |index| {
+        if failed.contains(&index) || before.choices.get(index) == Some(&Choice::Refused) {
+            false
+        } else if before.claimed.contains(&index) {
+            true
+        } else {
+            claim(index)
+        }
+    })
+}
+
+/// The GPUs `after` claimed that `before` had not, in the claim order.
+pub fn newly_claimed(before: &Selection, after: &Selection) -> Vec<usize> {
+    after
+        .claimed
+        .iter()
+        .copied()
+        .filter(|index| !before.claimed.contains(index))
+        .collect()
+}
+
 /// How the GPUs that start use this PC's RAM, for the memory plan, which
 /// is made before any GPU is claimed ([`memory`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -184,6 +222,22 @@ pub fn memory(found: &[Found]) -> Memory {
     } else {
         Memory::Own
     }
+}
+
+/// Whether an integrated GPU this image draws with may draw in place of the
+/// discrete GPU the plan of `found` ([`memory`]) gives the Metal device,
+/// should that one not start: the plan shares no RAM with a GPU, and a GPU
+/// of `found` whose stack draws is integrated, or of a kind only its probe
+/// tells. The memory plan then keeps room for its pages. A GPU no stack of
+/// this image drives never counts, so an image without an integrated GPU's
+/// driver plans as before.
+pub fn integrated_may_draw_instead(found: &[Found]) -> bool {
+    memory(found) != Memory::Shared
+        && found.iter().any(|found| {
+            found
+                .stack
+                .is_ok_and(|driven| driven.draws && driven.integrated.unwrap_or(true))
+        })
 }
 
 /// What `stack` says of the display controller `adapter` before its start,
@@ -471,6 +525,81 @@ mod tests {
         assert_eq!(chosen.choices, [Choice::Refused, Choice::First]);
     }
 
+    /// A GPU that was started and could not draw (its driver did not bind
+    /// it, or opened no Metal device on it) gives way as a refused one does:
+    /// the GPU left with the firmware beside it is claimed, and each GPU
+    /// gets its chance in the rule's order until none is left.
+    #[test]
+    fn a_gpu_that_fails_after_its_claim_gives_way_to_the_next() {
+        // A desktop's monitor on its card: the integrated GPU was left.
+        let found = [gpu(INTEGRATED, false), gpu(DISCRETE, true)];
+        let first = all(&found);
+        assert_eq!(first.choices, [Choice::Left { beside: 1 }, Choice::First]);
+        let mut asked = Vec::new();
+        let after = fall_back(&found, &first, &[1], |index| {
+            asked.push(index);
+            true
+        });
+        assert_eq!(asked, [0]);
+        assert_eq!(after.choices, [Choice::First, Choice::Refused]);
+        assert_eq!(newly_claimed(&first, &after), [0]);
+        // Its claim refused in turn: nothing is left to start.
+        let refused = fall_back(&found, &first, &[1], |_| false);
+        assert!(newly_claimed(&first, &refused).is_empty());
+        assert_eq!(refused.choices, [Choice::Refused, Choice::Refused]);
+        // Once it failed too, nothing is asked again.
+        let none = fall_back(&found, &after, &[0, 1], |_| panic!("asked again"));
+        assert!(none.claimed.is_empty());
+
+        // The monitor on the motherboard, or a laptop's panel on its
+        // integrated GPU: that one was started already and draws now,
+        // without a claim of its own.
+        let found = [gpu(INTEGRATED, true), gpu(DISCRETE, false)];
+        let first = all(&found);
+        let after = fall_back(&found, &first, &[1], |_| panic!("claimed again"));
+        assert_eq!(after.choices, [Choice::First, Choice::Refused]);
+        assert!(newly_claimed(&first, &after).is_empty());
+
+        // Two cards: the second keeps drawing; an integrated GPU left beside
+        // both stays left while one of them draws.
+        let found = [
+            gpu(INTEGRATED, false),
+            gpu(DISCRETE, true),
+            gpu(DISCRETE, false),
+        ];
+        let first = all(&found);
+        assert_eq!(first.claimed, [1, 2]);
+        let after = fall_back(&found, &first, &[1], |_| panic!("claimed"));
+        assert_eq!(
+            after.choices,
+            [Choice::Left { beside: 2 }, Choice::Refused, Choice::First]
+        );
+        // Both cards failed: the integrated GPU is the last chance.
+        let last = fall_back(&found, &after, &[1, 2], |_| true);
+        assert_eq!(newly_claimed(&after, &last), [0]);
+
+        // A card whose claim was refused at the start is not asked again,
+        // and an adapter no stack drives never starts.
+        let found = [
+            unsupported(true),
+            gpu(INTEGRATED, false),
+            gpu(DISCRETE, false),
+            gpu(DISCRETE, true),
+        ];
+        let first = select(&found, |index| index != 2);
+        assert_eq!(
+            first.choices[1..],
+            [Choice::Left { beside: 3 }, Choice::Refused, Choice::First]
+        );
+        let after = fall_back(&found, &first, &[3], |index| {
+            assert_eq!(index, 1);
+            true
+        });
+        assert_eq!(newly_claimed(&first, &after), [1]);
+        assert!(matches!(after.choices[0], Choice::Unused(_)));
+        assert_eq!(after.choices[2..], [Choice::Refused, Choice::Refused]);
+    }
+
     #[test]
     fn the_claim_order_puts_drawing_discrete_gpus_first() {
         let found = [
@@ -566,6 +695,43 @@ mod tests {
             let serves = crate::stack::metal_devices(&candidates).serve[0];
             assert_eq!(memory(&found) == Memory::Shared, kinds[serves], "{kinds:?}");
         }
+    }
+
+    /// The plan keeps room for an integrated GPU's pages exactly where one
+    /// this image draws with may draw in a discrete GPU's place: an NVIDIA
+    /// or AMD card beside an AMD or Intel integrated GPU, whether the
+    /// monitor is on the card (the integrated GPU left) or the panel on the
+    /// integrated GPU (it shows the display). An image without the
+    /// integrated GPU's driver (a release, NVK alone) sees no stack for it,
+    /// and an integrated GPU that draws already, or two cards, need none.
+    #[test]
+    fn room_is_kept_where_an_integrated_gpu_may_draw_in_a_discrete_ones_place() {
+        for integrated in [INTEGRATED, PROBED] {
+            for card_screen in [true, false] {
+                let pc = [gpu(integrated, !card_screen), gpu(DISCRETE, card_screen)];
+                assert!(
+                    integrated_may_draw_instead(&pc),
+                    "{integrated:?} {card_screen}"
+                );
+                assert_ne!(memory(&pc), Memory::Shared);
+                // The release: no stack drives the integrated GPU.
+                let release = [unsupported(!card_screen), gpu(DISCRETE, card_screen)];
+                assert!(!integrated_may_draw_instead(&release));
+                assert_eq!(memory(&release), Memory::Own);
+            }
+        }
+        // An integrated GPU whose stack does not draw cannot take the
+        // Metal device; one that draws alone has its share already.
+        assert!(!integrated_may_draw_instead(&[
+            gpu(SHOWS, true),
+            gpu(DISCRETE, false)
+        ]));
+        assert!(!integrated_may_draw_instead(&[gpu(INTEGRATED, true)]));
+        assert!(!integrated_may_draw_instead(&[
+            gpu(DISCRETE, true),
+            gpu(DISCRETE, false)
+        ]));
+        assert!(!integrated_may_draw_instead(&[gpu(DISCRETE, true)]));
     }
 
     #[test]
@@ -732,6 +898,66 @@ mod tests {
             let chosen = all(&engine(&census, &planned));
             assert!(chosen.claimed.contains(&1));
             assert_eq!(unplanned(&planned, &addresses(&census), &chosen), [1]);
+        }
+        // Intel's GPUs are told by their driver's table, i915's or xe's,
+        // whichever this image offers the GPU first: an Alder Lake iGPU is
+        // integrated and an Arc A770 (DG2) discrete, for the plan and the
+        // engine alike, whatever the loader passes on.
+        #[cfg(any(feature = "xe-port", feature = "i915-port"))]
+        {
+            let intel = |bus: u8, device: u16| {
+                let adapter = at(bus, crate::Vendor::Intel, device);
+                let stack = GpuStack::select(&adapter).expect("an Intel stack takes it");
+                (adapter, stack)
+            };
+            let (alder_lake, igpu_stack) = intel(0, 0x46a6);
+            let (arc, arc_stack) = intel(3, 0x56a0);
+            assert_eq!(igpu_stack.kernel.table_integrated(&alder_lake), Some(true));
+            assert_eq!(arc_stack.kernel.table_integrated(&arc), Some(false));
+            for told in [None, Some(true), Some(false)] {
+                assert_eq!(driven(igpu_stack, &alder_lake, told).integrated, Some(true));
+                assert_eq!(driven(arc_stack, &arc, told).integrated, Some(false));
+            }
+            // A laptop whose panel is on the Intel iGPU and whose NVIDIA or
+            // AMD card draws: the iGPU shows the card's frames, and the plan
+            // reserves its display memory. The AMD card's kind is told by its
+            // IP discovery table.
+            for card in [(nvidia, &NVIDIA, None), (dgpu, &AMD, Some(false))] {
+                assert_eq!(
+                    alike(&[
+                        (alder_lake, igpu_stack, None, true),
+                        (card.0, card.1, card.2, false)
+                    ]),
+                    (
+                        Memory::Display,
+                        vec![Choice::Later { beside: 1 }, Choice::First]
+                    )
+                );
+            }
+            // The same with an Arc card beside the iGPU.
+            assert_eq!(
+                alike(&[
+                    (alder_lake, igpu_stack, None, true),
+                    (arc, arc_stack, None, false)
+                ]),
+                (
+                    Memory::Display,
+                    vec![Choice::Later { beside: 1 }, Choice::First]
+                )
+            );
+            // A monitor on the Arc card: the iGPU is left, nothing shared.
+            assert_eq!(
+                alike(&[
+                    (alder_lake, igpu_stack, None, false),
+                    (arc, arc_stack, None, true)
+                ]),
+                (Memory::Own, vec![Choice::Left { beside: 1 }, Choice::First])
+            );
+            // The iGPU alone draws in its share.
+            assert_eq!(
+                alike(&[(alder_lake, igpu_stack, None, true)]),
+                (Memory::Shared, vec![Choice::First])
+            );
         }
     }
 }

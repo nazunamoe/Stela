@@ -388,6 +388,86 @@ release:
 	return result;
 }
 
+/* The client faults in progress, each by the task serving it. A driver's
+ * fault handler that fills page table entries itself (apply_to_page_range,
+ * as i915's remap_io_sg does) names only the client mm, which every client
+ * mapping shares; the task's own fault names the mapping it fills. */
+struct fault_in_progress {
+	struct list_head node;
+	struct task_struct *task;
+	struct stela_linux_mapping *mapping;
+};
+
+static LIST_HEAD(faults_in_progress);
+static DEFINE_SPINLOCK(faults_lock);
+
+/* The mapping the current task's fault fills, if [address, address + size)
+ * lies in it. */
+static struct stela_linux_mapping *faulting(struct mm_struct *mm, unsigned long address,
+					    unsigned long size)
+{
+	struct stela_linux_mapping *found = NULL;
+	struct fault_in_progress *fault;
+
+	if (mm != &client_mm || !size || size > ULONG_MAX - address)
+		return NULL;
+	spin_lock(&faults_lock);
+	list_for_each_entry(fault, &faults_in_progress, node) {
+		const struct vm_area_struct *vma = &fault->mapping->vma;
+
+		if (fault->task == current && address >= vma->vm_start &&
+		    address + size <= vma->vm_end) {
+			found = fault->mapping;
+			break;
+		}
+	}
+	spin_unlock(&faults_lock);
+	return found;
+}
+
+/* mm/memory.c's walk over a range's page table entries, for a client
+ * mapping during its fault: each entry the callback fills becomes the
+ * owner's translation, as map_user installs it. Entries it leaves empty stay
+ * unmapped. Linux's own page tables are not walked, as Stela keeps none. */
+int apply_to_page_range(struct mm_struct *mm, unsigned long address, unsigned long size,
+			pte_fn_t fn, void *data)
+{
+	const struct stela_linux_owner *owner = stela_linux_owner();
+	struct stela_linux_mapping *mapping;
+
+	if (!PAGE_ALIGNED(address) || !PAGE_ALIGNED(size))
+		return -EINVAL;
+	mapping = faulting(mm, address, size);
+	if (!mapping) {
+		stela_linux_unsupported("page table entries outside a client mapping's fault");
+		return -EINVAL;
+	}
+	for (unsigned long at = address; at < address + size; at += PAGE_SIZE) {
+		pte_t pte = __pte(0);
+		int error = fn(&pte, at, data);
+
+		if (error)
+			return error;
+		if (!pte_present(pte))
+			continue;
+		error = owner->services->map_user(owner->context, mapping->space, at, pte_pfn(pte),
+						  pte_flags(pte));
+		if (error)
+			return error;
+		mapping->filled = max(mapping->filled, at + PAGE_SIZE);
+	}
+	return 0;
+}
+
+/* Removes the translations of a client mapping's range that its driver
+ * filled itself (apply_to_page_range, vmf_insert_pfn). */
+void zap_special_vma_range(struct vm_area_struct *vma, unsigned long address, unsigned long size)
+{
+	if (vma->vm_mm != &client_mm || !size)
+		return;
+	unmap_client(container_of(vma, struct stela_linux_mapping, vma), address, size);
+}
+
 vm_fault_t stela_linux_fault(struct stela_linux_mapping *mapping, unsigned long address,
 			     bool write)
 {
@@ -406,7 +486,16 @@ vm_fault_t stela_linux_fault(struct stela_linux_mapping *mapping, unsigned long 
 	};
 
 	unsigned long sequence = READ_ONCE(mapping->invalidate_sequence);
+	struct fault_in_progress fault = {.task = current, .mapping = mapping};
+
+	spin_lock(&faults_lock);
+	list_add(&fault.node, &faults_in_progress);
+	spin_unlock(&faults_lock);
 	vm_fault_t result = vma->vm_ops->fault(&vmf);
+
+	spin_lock(&faults_lock);
+	list_del(&fault.node);
+	spin_unlock(&faults_lock);
 
 	if (result & (VM_FAULT_ERROR | VM_FAULT_NOPAGE | VM_FAULT_RETRY | VM_FAULT_COMPLETED))
 		return result;
@@ -508,6 +597,54 @@ bool stela_linux_unmap_writable_folio(struct folio *folio)
 				VM_SHARED | VM_WRITE);
 }
 
+/* A mapping placed in the calling task's own address space (the legacy
+ * GEM_MMAP ioctl). Stela's clients map through their owner
+ * (stela_linux_mmap), so the task has no address space to place it in: it
+ * is refused, said once, as Linux refuses a mapping it cannot place, and the
+ * ioctl fails. Nothing is then found at an address by find_vma. */
+unsigned long vm_mmap(struct file *file, unsigned long addr, unsigned long len, unsigned long prot,
+		      unsigned long flag, unsigned long offset)
+{
+	(void)file, (void)addr, (void)len, (void)prot, (void)flag, (void)offset;
+	stela_linux_unsupported("a mapping in the calling task's address space: clients map "
+				"through their owner");
+	return (unsigned long)-ENODEV;
+}
+
+struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
+{
+	(void)mm, (void)addr;
+	return NULL;
+}
+
+/* A file's mmap_prepare run for a VMA the caller already made (a dma-buf's
+ * mmap of its backing file). Clients map a dma-buf through its owner's
+ * stela_linux_mmap, so the nested mapping is refused, said once. */
+int compat_vma_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	(void)file, (void)vma;
+	stela_linux_unsupported("mapping a file inside another file's mapping");
+	return -ENODEV;
+}
+
+/* A client's own pages pinned for the device (userptr objects). Stela's
+ * clients have no Linux page tables to walk, so none is pinned: it is
+ * refused, said once, as Linux refuses an address with no page, and a
+ * userptr object fails to get its pages. */
+int pin_user_pages_fast(unsigned long start, int nr_pages, unsigned int gup_flags,
+			struct page **pages)
+{
+	(void)start, (void)nr_pages, (void)gup_flags, (void)pages;
+	stela_linux_unsupported("pinning a client's pages: clients have no Linux page tables");
+	return -EFAULT;
+}
+
+/* pin_user_pages_fast pins none, so none comes back here. */
+void unpin_user_pages(struct page **pages, unsigned long npages)
+{
+	(void)pages, (void)npages;
+}
+
 #ifdef STELA_LINUX_MAPPING_TEST
 #include <linux/fdtable.h>
 #include <linux/anon_inodes.h>
@@ -520,6 +657,7 @@ bool stela_linux_unmap_writable_folio(struct folio *folio)
 #define PFN 0x500UL
 
 static unsigned long inserted_address, inserted_pfn, removed_address, removed_size;
+static unsigned int inserted_count, refusals;
 static pgprot_t inserted_prot;
 static unsigned int closes, mmaps;
 static int mmap_error, map_error, unmap_error;
@@ -535,6 +673,7 @@ static int map_user(void *context, void *space, unsigned long address, unsigned 
 	inserted_address = address;
 	inserted_pfn = pfn;
 	inserted_prot = __pgprot(prot);
+	inserted_count++;
 	return map_error;
 }
 
@@ -566,10 +705,18 @@ static void report_unmap_failure(void *context, int level, const char *message)
 	stela_test_witness_passed();
 }
 
+static void count_refusal(void *context, const char *operation)
+{
+	(void)context;
+	assert(!strcmp(operation, "page table entries outside a client mapping's fault"));
+	refusals++;
+}
+
 static const struct stela_linux_services services = {
 	.map_user = map_user,
 	.unmap_user = unmap_user,
 	.log = report_unmap_failure,
+	.unsupported = count_refusal,
 };
 static const struct stela_linux_owner owner = {.services = &services};
 
@@ -633,6 +780,67 @@ static int test_file_mmap_prepare(struct vm_area_desc *desc)
 	assert(desc->vm_file == desc->file && desc->start == BASE && desc->end == BASE + PAGE_SIZE);
 	desc->vm_ops = &page_ops;
 	return 0;
+}
+
+/* As i915's remap_io_sg: the fault fills the whole mapping's entries. */
+static int fill_entry(pte_t *pte, unsigned long address, void *data)
+{
+	struct vm_area_struct *vma = data;
+
+	if (address == vma->vm_start + 3 * PAGE_SIZE)
+		return 0;
+	set_pte_at(vma->vm_mm, address, pte,
+		   pte_mkspecial(pfn_pte(PFN + ((address - vma->vm_start) >> PAGE_SHIFT),
+					 pgprot_writecombine(vma->vm_page_prot))));
+	return 0;
+}
+
+static vm_fault_t fill_mapping(struct vm_fault *vmf)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	int error = apply_to_page_range(vma->vm_mm, vma->vm_start, vma->vm_end - vma->vm_start,
+					fill_entry, vma);
+
+	if (error) {
+		zap_special_vma_range(vma, vma->vm_start, vma->vm_end - vma->vm_start);
+		return VM_FAULT_SIGBUS;
+	}
+	return VM_FAULT_NOPAGE;
+}
+
+static void test_driver_page_table_fill(void)
+{
+	static const struct vm_operations_struct filling = {.fault = fill_mapping,
+							    .close = close_area};
+	struct file *file = anon_inode_getfile("filled", &fops, NULL, O_RDWR);
+	struct stela_linux_mapping *mapping;
+
+	struct file *redirect = exporter;
+
+	assert(!IS_ERR(file));
+	exporter = NULL;
+	area_operations = &filling;
+	assert(!stela_linux_mmap(file, SPACE, BASE, 4 * PAGE_SIZE, 0, true, &mapping));
+	inserted_count = 0;
+	map_error = 0;
+	assert(stela_linux_fault(mapping, BASE + PAGE_SIZE, true) == VM_FAULT_NOPAGE);
+	/* Every entry but the one the callback left empty, each its frame. */
+	assert(inserted_count == 3 && inserted_address == BASE + 2 * PAGE_SIZE);
+	assert(inserted_pfn == PFN + 2 && (pgprot_val(inserted_prot) & _PAGE_PWT));
+	assert((pgprot_val(inserted_prot) & _PAGE_RW) && !(pgprot_val(inserted_prot) & PTE_PFN_MASK));
+	/* A refused entry fails the fault, which removes what it filled. */
+	map_error = -ENOMEM;
+	removed_size = 0;
+	assert(stela_linux_fault(mapping, BASE, true) == VM_FAULT_SIGBUS);
+	assert(removed_address == BASE && removed_size == 4 * PAGE_SIZE);
+	map_error = 0;
+	/* Outside a fault the client's entries are not reachable. */
+	assert(apply_to_page_range(mapping->vma.vm_mm, BASE, PAGE_SIZE, fill_entry,
+				   &mapping->vma) == -EINVAL && refusals == 1);
+	stela_linux_munmap(mapping);
+	area_operations = &operations;
+	exporter = redirect;
+	fput(file);
 }
 
 static void test_file_page_pin(void)
@@ -797,6 +1005,7 @@ int main(void)
 	assert(!close_fd((unsigned int)fd));
 	fput(file);
 	test_file_page_pin();
+	test_driver_page_table_fill();
 	stela_linux_exit();
 	printf("Linux client mappings passed\n");
 	return 0;

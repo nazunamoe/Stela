@@ -2113,6 +2113,7 @@ dependencies = [
  "stela-contracts",
  "stela-crypto",
  "stela-driver-base",
+ "stela-driver-core",
  "stela-drivers",
  "stela-engine",
  "stela-formats",
@@ -2271,6 +2272,7 @@ dependencies = [
  "stela-driver-base",
  "stela-driver-core",
  "stela-linux",
+ "stela-loader",
  "triomphe",
 ]
 

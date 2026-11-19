@@ -149,9 +149,23 @@
 #define CONFIG_DRM_XE 1
 #define CONFIG_DRM_XE_DISPLAY 1
 /* xe's ID table marks Tiger Lake through Meteor Lake and Arc A-series as
- * experimental and binds them only when this names them. Stela has no other
- * driver for them, so it names every device of the table. */
+ * experimental and binds them only when this names them. i915 registers first
+ * and binds those by default, as upstream does; xe is the fallback for one
+ * whose i915 probe fails, which only this lets it bind, so it names every
+ * device of the table. */
 #define CONFIG_DRM_XE_FORCE_PROBE "*"
+
+/* i915 with display, for the Intel GPUs before Xe2. Its entry depends on
+ * X86, which names Linux's x86 arch; Stela's arch compiles for x86-64 with
+ * x86's instructions and port I/O, so the dependency's reason holds, while
+ * X86 itself stays unset. Of what i915 keys to it, the stolen memory the
+ * arch's early quirks find is served; the chipset GTT driver of graphics
+ * before Sandy Bridge and the SoC sideband bus of Bay Trail and Cherry
+ * Trail are not built, as no driver here is handed those GPUs. Linux's
+ * default force probe: none. */
+#define CONFIG_DRM_I915 1
+#define CONFIG_DRM_I915_FORCE_PROBE ""
+#define CONFIG_DRM_I915_USERPTR 1
 
 /* The drivers' parameter and scheduling defaults, as Linux's Kconfig sets them. */
 #define CONFIG_DRM_I915_REQUEST_TIMEOUT 20000

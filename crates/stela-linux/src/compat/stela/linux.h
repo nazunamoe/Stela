@@ -53,8 +53,10 @@ struct stela_linux_services {
 	void *(*map_device)(void *context, u64 physical, size_t size,
 			    bool write_combining);
 	void (*unmap_device)(void *context, void *address);
-	/* Map count write-back pages contiguously, or return NULL. */
-	void *(*map_pages)(void *context, const u64 *physical, size_t count);
+	/* Map count pages contiguously, write-back or write-combining, or
+	 * return NULL. */
+	void *(*map_pages)(void *context, const u64 *physical, size_t count,
+			   bool write_combining);
 	void (*unmap_pages)(void *context, void *address, size_t count);
 	/* Action is already linked before enable. Initialize *unexposed=false;
 	 * set true only with actual no-publication plus exact owner/event cleanup

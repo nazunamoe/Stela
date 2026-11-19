@@ -97,6 +97,12 @@ pub enum Command {
         /// Textures currently must refuse explicitly; no GPU work is submitted.
         #[arg(long, num_args = 2, requires = "llvm_library", value_names = ["TRIANGLE", "TEXTURE"])]
         render_inputs: Vec<PathBuf>,
+        /// Sweep these AIR modules from Apple's `metal -c` through the Metal
+        /// compiler, with NAK's options and with BRW's for each Intel
+        /// compiler generation, and compile each kernel by that compiler: a
+        /// census of the shader corpus. No GPU work is submitted.
+        #[arg(long, num_args = 1.., requires = "llvm_library", value_name = "MODULE")]
+        metal_corpus: Vec<PathBuf>,
     },
     /// Compile NVK, NIR and NAK's C for `stela.efi` against Stela's C library,
     /// with ANV and BRW when this host has the tools their build runs, and
@@ -108,8 +114,9 @@ pub enum Command {
     },
     /// Build ANV for this machine with the image's options and run it on an
     /// xe render node with no GPU behind it: device creation, a BRW compute
-    /// pipeline and one submission per platform xe binds, through Stela's
-    /// libdrm stand-in, each xe ioctl checked against Stela's xe.
+    /// pipeline and one submission for each device xe admits that Mesa's
+    /// Intel table lists, through Stela's libdrm stand-in, each xe ioctl
+    /// checked against Stela's xe.
     AnvTest {
         /// Maximum parallel native compiler processes.
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..))]
@@ -188,6 +195,7 @@ pub fn run(command: Command) -> Result<()> {
             air_fp_profile,
             threadgroup_inputs,
             render_inputs,
+            metal_corpus,
         } => mesa::build(mesa::BuildOptions {
             jobs,
             require_all_targets,
@@ -198,6 +206,7 @@ pub fn run(command: Command) -> Result<()> {
             fp_profile: air_fp_profile.unwrap_or_default(),
             threadgroup_inputs: &threadgroup_inputs,
             render_inputs: &render_inputs,
+            metal_corpus: &metal_corpus,
         }),
         // `stela.efi` carries the kext it links against each boot's kernel.
         Command::Nvk { jobs } => build_nvk(jobs),

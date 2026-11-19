@@ -1246,19 +1246,23 @@ fn service(
     // A driver that loses its device only with a GPU its kernel driver
     // reset, whose release would wait for that reset's end, keeps the lost
     // device unreleased, as an open whose first submission hung leaves it.
-    // Its reopened device serves once an empty submission on it signals
-    // within the bound the first open's check has, looked at without
-    // waiting in a call: one whose GPU hangs again fails the reopen.
     let service = if driver.keep_lost {
-        let service = service.keep_lost_devices();
-        match installed().map(|gpu| gpu.tsc_hz).filter(|&hz| hz != 0) {
-            Some(hz) => service.check_reopened(
-                (u128::from(hz) * u128::from(FIRST_SUBMISSION_NS) / 1_000_000_000) as u64,
-            ),
-            None => service,
-        }
+        service.keep_lost_devices()
     } else {
         service
+    };
+    // A driver whose open checks its first submission has its reopened
+    // device serve once an empty submission on it signals within the bound
+    // the first open's check has, looked at without waiting in a call: one
+    // whose GPU hangs again fails the reopen.
+    let service = match installed()
+        .map(|gpu| gpu.tsc_hz)
+        .filter(|&hz| hz != 0 && driver.check_first_submission)
+    {
+        Some(hz) => service.check_reopened(
+            (u128::from(hz) * u128::from(FIRST_SUBMISSION_NS) / 1_000_000_000) as u64,
+        ),
+        None => service,
     };
     Ok(Arc::new(SharedService::new(
         service,
@@ -1282,28 +1286,42 @@ fn service(
 /// PC's Metal device first. What stops one is reported, and the Mac boots
 /// without Metal on that GPU. When none of them opens, the drawing GPUs it
 /// left display-only serve instead, with one line each; those that stay
-/// display-only are reported once, with the GPU that draws for Metal.
+/// display-only are reported once, with the GPU that draws for Metal. The
+/// drawing GPUs whose service did not open, by bound index, with why.
 ///
 /// [`metal_devices`]: stela_drivers::gpu::stack::metal_devices
-pub(in crate::engine) fn open_service() {
+pub(in crate::engine) fn open_service() -> Vec<(usize, String)> {
+    open_from(0)
+}
+
+/// [`open_service`] for the bound GPUs from index `first` on, GPUs a
+/// fallback started after the others opened none: their services follow
+/// any open already, and are published with them before macOS starts.
+pub(in crate::engine) fn open_from(first: usize) -> Vec<(usize, String)> {
     let Some(gpu) = installed() else {
-        return;
+        return Vec::new();
     };
     let bound = &gpu.start.bound;
     let chosen = metal_choice(bound, super::display::taken_index());
-    let mut constructed = false;
+    let mut failed = Vec::new();
     let mut open = |indices: &[usize]| -> Vec<(usize, Arc<Shared>)> {
         indices
             .iter()
-            .filter_map(|&index| {
-                open_gpu(gpu, index, &bound[index], &mut constructed)
-                    .map(|service| (index, service))
+            .filter(|&&index| index >= first)
+            .filter_map(|&index| match open_gpu(gpu, index, &bound[index]) {
+                Ok(service) => Some((index, service)),
+                Err(why) => {
+                    if bound[index].stack.draws() {
+                        failed.push((index, why));
+                    }
+                    None
+                }
             })
             .collect()
     };
     let mut opened = open(&chosen.serve);
     if let Some(&(serving, _)) = opened.first() {
-        for &index in &chosen.display_only {
+        for &index in chosen.display_only.iter().filter(|&&index| index >= first) {
             output::arguments(format_args!(
                 "GPU {}: shows displays only: GPU {}, a discrete GPU, draws for Metal\n",
                 bound[index].name, bound[serving].name
@@ -1318,9 +1336,17 @@ pub(in crate::engine) fn open_service() {
             ));
         }
     }
-    let (served, services): (Vec<_>, Vec<_>) = opened.into_iter().unzip();
+    let (mut served, mut services): (Vec<_>, Vec<_>) = opened.into_iter().unzip();
+    // SAFETY: published below and leaked, never freed: a reader of the
+    // services before keeps its slice.
+    if let Some(before) = unsafe { SERVED.load(Ordering::Acquire).as_ref() } {
+        served.splice(0..0, before.iter().copied());
+    }
+    let before = shared();
+    services.splice(0..0, before.iter().cloned());
     SERVED.store(Box::into_raw(Box::new(served)), Ordering::Release);
     SERVICES.store(Box::into_raw(Box::new(services)), Ordering::Release);
+    failed
 }
 
 /// The bound GPU, by its index, that service `service` runs on: services
@@ -1328,9 +1354,25 @@ pub(in crate::engine) fn open_service() {
 /// first and leaves out failed GPUs and, while a chosen GPU opened,
 /// display-only ones, so it is not the claims' order.
 pub(super) fn served_gpu(service: usize) -> Option<usize> {
-    // SAFETY: published once, before any service exists, and leaked.
+    // SAFETY: published before macOS starts, and leaked.
     unsafe { SERVED.load(Ordering::Acquire).as_ref() }
         .and_then(|served| served.get(service).copied())
+}
+
+/// Whether a Metal service serves the bound GPU at `index`.
+pub(super) fn served_index(index: usize) -> bool {
+    // SAFETY: published before macOS starts, and leaked.
+    unsafe { SERVED.load(Ordering::Acquire).as_ref() }.is_some_and(|served| served.contains(&index))
+}
+
+/// The bound GPUs, one bit each by index, whose Metal service was kept
+/// unreleased with its driver's file open ([`file_kept`]).
+static FILES_KEPT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the bound GPU at `index` keeps a file of a Metal service that
+/// did not open: its driver's reset during the first submission held it.
+pub(super) fn file_kept(index: usize) -> bool {
+    index >= 64 || FILES_KEPT.load(Ordering::Relaxed) & (1 << index) != 0
 }
 
 /// Which bound GPUs serve Metal devices, given the one whose output took
@@ -1356,7 +1398,7 @@ pub(super) fn metal_choice(
 /// driver that decides during its probe and does not answer leaves the
 /// kind unknown, and the GPU counts as integrated, so a discrete GPU takes
 /// the Metal device first; that is reported once per GPU.
-fn integrated(index: usize, bound: &Bound) -> bool {
+pub(super) fn integrated(index: usize, bound: &Bound) -> bool {
     /// The bound GPUs, by index, whose unanswered query was reported.
     static REPORTED: AtomicU64 = AtomicU64::new(0);
     let Some(query) = bound.stack.kernel.probed_integrated else {
@@ -1379,8 +1421,9 @@ fn integrated(index: usize, bound: &Bound) -> bool {
 }
 
 /// Runs the image's C constructors once, on the stack of whoever opens first.
-fn construct(constructed: &mut bool) {
-    if !core::mem::replace(constructed, true) {
+fn construct() {
+    static CONSTRUCTED: AtomicBool = AtomicBool::new(false);
+    if !CONSTRUCTED.swap(true, Ordering::Relaxed) {
         // SAFETY: the one call, before any other of the C's.
         unsafe { stela_mesa::stela_constructors() };
         // The drivers' pipeline cache UUID is every Stela build's; their
@@ -1391,20 +1434,16 @@ fn construct(constructed: &mut bool) {
     }
 }
 
-/// The service of `bound`, the bound GPU at `index`, whose failure is reported.
-fn open_gpu(
-    gpu: &Installed,
-    index: usize,
-    bound: &Bound,
-    constructed: &mut bool,
-) -> Option<Arc<Shared>> {
+/// The service of `bound`, the bound GPU at `index`, or why it did not
+/// open, which is reported.
+fn open_gpu(gpu: &Installed, index: usize, bound: &Bound) -> Result<Arc<Shared>, String> {
     let refuse = |reason: &str| {
         crate::output::arguments(format_args!("GPU {}: {reason}\n", bound.name));
-        None
+        Err(String::from(reason))
     };
     if !bound.stack.draws() {
         // Its kernel driver shows frames; `display` takes its outputs.
-        return None;
+        return Err(String::from("this image has no Vulkan driver for it"));
     }
     // Read before the GPU's first work, for the guest's `StelaHost`, with
     // what the driver says of the chip, for the summary below: once the GPU
@@ -1455,10 +1494,13 @@ fn open_gpu(
     });
     let mut opened = None;
     run(top, &mut || {
-        construct(constructed);
+        construct();
         opened = Some(service(&target, top, watch));
     });
-    match opened? {
+    let Some(opened) = opened else {
+        return refuse("its service's stack did not run");
+    };
+    match opened {
         Ok(service) => {
             if let Some(state @ (ResetState::Reset | ResetState::Resetting)) =
                 watch.as_ref().and_then(client::ResetWatch::state)
@@ -1479,10 +1521,15 @@ fn open_gpu(
                     },
                 ));
                 core::mem::forget(service);
+                if index < 64 {
+                    FILES_KEPT.fetch_or(1 << index, Ordering::Relaxed);
+                }
                 // The reset unmapped the display's buffers too.
                 super::display::abandon();
                 summarize(bound, &facts, shares_memory, None);
-                return None;
+                return Err(format!(
+                    "{driver_name} reset the GPU during its first submission"
+                ));
             }
             output::arguments(format_args!(
                 "GPU {}: Metal service open at DRM minor {index}\n",
@@ -1529,7 +1576,7 @@ fn open_gpu(
                     bound.name
                 ));
             }
-            Some(service)
+            Ok(service)
         }
         Err(error) => {
             let refused = refuse(&format!("Metal could not open: {error:?}"));

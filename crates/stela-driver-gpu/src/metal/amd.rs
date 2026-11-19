@@ -140,7 +140,12 @@ fn admit(
 /// loses the device, which the service reopens. An image whose build host
 /// lacked the tools RADV's build runs holds no RADV, and then no driver
 /// here.
-#[cfg(all(feature = "metal-linked", not(test), stela_vulkan_amd))]
+#[cfg(all(
+    feature = "metal-linked",
+    not(test),
+    target_os = "uefi",
+    stela_vulkan_amd
+))]
 pub const DRIVER: super::native::Driver = {
     use super::native::{Driver, Refusals, vk};
     use core::ffi::{c_char, c_void};
@@ -175,6 +180,7 @@ pub const DRIVER: super::native::Driver = {
         // amdgpu's recovery from a hung GPU holds back the VM work closing
         // RADV's file waits for.
         keep_lost: true,
+        check_first_submission: true,
     }
 };
 

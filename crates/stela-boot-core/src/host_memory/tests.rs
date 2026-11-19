@@ -746,6 +746,7 @@ fn the_plans_line_states_its_rule() {
         memory,
         aperture: 0,
         bounded: true,
+        fallback: false,
     };
     assert_eq!(
         bounded(GpuMemory::Display).describe(&display),
@@ -794,6 +795,7 @@ fn a_bound_holds_linux_only_where_its_heap_need_was_measured() {
                     memory,
                     aperture: 0,
                     bounded,
+                    fallback: false,
                 };
                 let held = held_bound(&sizes, plan);
                 match (memory, bounded) {
@@ -881,6 +883,7 @@ fn an_apertures_page_tables_grow_the_heap() {
                 memory,
                 aperture: aperture_tables(16 * GIB),
                 bounded: true,
+                fallback: false,
             };
             let grown = sizes(free(installed) + plan.aperture, 8, 8, plan).unwrap();
             assert_eq!(
@@ -925,5 +928,340 @@ fn an_integrated_gpus_share_leaves_the_guest() {
             [4400, 2644, 7272],
             [5232, 5290, 18700],
         ]
+    );
+}
+
+/// The PCs whose integrated GPU may draw in the discrete GPU's place: an
+/// NVIDIA card beside an AMD or an Intel integrated GPU (nouveau's, amdgpu's
+/// and xe's heap need beside them unmeasured: Linux's pages unbounded), and
+/// an AMD card beside an AMD integrated GPU (bounded), each with the monitor
+/// on the card (the integrated GPU left: no share) and with the panel on the
+/// integrated GPU (it shows the display).
+fn fallback_pcs() -> [(&'static str, GpuPlan); 6] {
+    let plan = |memory, bounded| GpuPlan {
+        memory,
+        aperture: 0,
+        bounded,
+        fallback: true,
+    };
+    [
+        (
+            "NVIDIA card + AMD iGPU, monitor on the card",
+            plan(GpuMemory::Own, false),
+        ),
+        (
+            "NVIDIA card + AMD iGPU, panel on the iGPU",
+            plan(GpuMemory::Display, false),
+        ),
+        (
+            "NVIDIA card + Intel iGPU, monitor on the card",
+            plan(GpuMemory::Own, false),
+        ),
+        (
+            "NVIDIA card + Intel iGPU, panel on the iGPU",
+            plan(GpuMemory::Display, false),
+        ),
+        (
+            "AMD card + AMD iGPU, monitor on the card",
+            plan(GpuMemory::Own, true),
+        ),
+        (
+            "AMD card + AMD iGPU, panel on the iGPU",
+            plan(GpuMemory::Display, true),
+        ),
+    ]
+}
+
+/// Free RAM of the 8 GiB and 12 GiB VMs, whose heaps sit on their floor,
+/// and of 8, 16 and 32 GiB PCs.
+fn fallback_hosts() -> [(&'static str, u64); 5] {
+    [
+        ("8 GiB VM", 7354 * MIB),
+        ("8 GiB", free(8)),
+        ("12 GiB VM", 10842 * MIB),
+        ("16 GiB", free(16)),
+        ("32 GiB", free(32)),
+    ]
+}
+
+/// The pages Linux holds once the discrete GPU failed: after a failed
+/// probe, whose pages its devres and the quiesce freed, and after a Metal
+/// device that did not open, its driver bound with its firmware's image.
+const HELD_AFTER_PROBE: u64 = 64 * MIB;
+const HELD_AFTER_METAL: u64 = 160 * MIB;
+const OPEN_HELD: u64 = FALLBACK_OPEN;
+
+/// Where an integrated GPU may draw in a discrete GPU's place, the plan
+/// makes the heap region hold what it needs past the heap's own, from the
+/// guest, as far as its floor allows; once it draws, Linux's pages are held
+/// to that bound, so the heap keeps its own need and the GPU's Metal device
+/// still has room after its driver's first pages, on every PC and host.
+#[test]
+fn an_integrated_gpu_that_draws_in_a_discrete_ones_place_keeps_the_heap_its_own() {
+    for (pc, plan) in fallback_pcs() {
+        for (host, free) in fallback_hosts() {
+            let sizes = sizes(free, 8, 8, plan).unwrap();
+            let before = sizes_of_plan(
+                free,
+                GpuPlan {
+                    fallback: false,
+                    ..plan
+                },
+            );
+            assert!(sizes.guest >= GUEST_FLOOR, "{pc}, {host}");
+            // The heap's region only grows, the guest keeping its floor.
+            assert!(
+                sizes.heap + sizes.fallback >= before.heap && sizes.gpu == before.gpu,
+                "{pc}, {host}"
+            );
+            let bound = page_bound(&sizes, plan.memory);
+            let region = sizes.heap + sizes.gpu + sizes.fallback;
+            match sizes.guest > GUEST_FLOOR + ALIGNMENT {
+                // The guest above its floor gives the whole reserve.
+                true => assert!(bound >= FALLBACK_LEAST, "{pc}, {host}: {bound}"),
+                false => assert!(bound >= PAGES_LEAST, "{pc}, {host}: {bound}"),
+            }
+            // The heap keeps its own need past the bound wherever the region
+            // holds more than the least bound.
+            if region >= HEAP_OWN + PAGES_LEAST {
+                assert!(region - bound >= HEAP_OWN, "{pc}, {host}");
+            }
+            // Linux at the fallback: held to its plan's bound already, or
+            // held to it from now on.
+            let limit = held_bound(&sizes, plan).unwrap_or(0);
+            for held in [HELD_AFTER_PROBE, HELD_AFTER_METAL] {
+                let decided = fallback_pages(bound, held, limit);
+                assert_eq!(decided.limit(), Some(bound), "{pc}, {host}: {decided:?}");
+                match plan.bounded {
+                    true => assert!(matches!(decided, FallbackPages::Held { .. })),
+                    false => assert!(matches!(decided, FallbackPages::Hold { .. })),
+                }
+                // The GPU's Metal device tells the guest a working set past
+                // its driver's first pages, where the reserve was given.
+                let state = stela_drivers::gpu::share::ShareState {
+                    held: held + OPEN_HELD,
+                    limit: bound,
+                };
+                if bound >= FALLBACK_LEAST && held == HELD_AFTER_PROBE {
+                    assert!(
+                        stela_drivers::gpu::share::working_set(state) >= 128 * MIB,
+                        "{pc}, {host}"
+                    );
+                    assert!(!decided.starved(), "{pc}, {host}");
+                }
+            }
+        }
+    }
+}
+
+fn sizes_of_plan(free: u64, plan: GpuPlan) -> Sizes {
+    sizes(free, 8, 8, plan).unwrap()
+}
+
+/// What the room costs the guest, by host: nothing on 16 and 32 GiB PCs,
+/// whose heaps hold it already; on the small hosts the heap's spare past its
+/// own need is brought to 768M, as far as the guest's floor allows. A plan
+/// without such a GPU (a release, NVK alone) is unchanged.
+#[test]
+fn the_room_for_an_integrated_gpu_costs_only_small_hosts_guest_ram() {
+    let cost = |memory, free: u64| {
+        let plan = GpuPlan {
+            memory,
+            aperture: 0,
+            bounded: false,
+            fallback: true,
+        };
+        let with = sizes(free, 8, 8, plan).unwrap();
+        let without = sizes(
+            free,
+            8,
+            8,
+            GpuPlan {
+                fallback: false,
+                ..plan
+            },
+        )
+        .unwrap();
+        assert_eq!(without.fallback, 0);
+        [
+            with.fallback,
+            without.guest - with.guest,
+            page_bound(&with, memory),
+        ]
+        .map(|b| b / MIB)
+    };
+    // Room, the guest's cost and the bound (MiB), the monitor on the card
+    // and the panel on the integrated GPU: the 8 GiB VM, an 8 GiB PC, the
+    // 12 GiB VM, 16 and 32 GiB PCs.
+    let rows = fallback_hosts()
+        .map(|(_, free)| [cost(GpuMemory::Own, free), cost(GpuMemory::Display, free)]);
+    assert_eq!(
+        rows,
+        [
+            [[472, 364, 768], [216, 164, 768]],
+            [[424, 320, 768], [168, 120, 768]],
+            [[0, 0, 876], [0, 0, 892]],
+            [[0, 0, 2152], [0, 0, 2392]],
+            [[0, 0, 3656], [0, 0, 3864]],
+        ]
+    );
+}
+
+/// A plan without an integrated GPU that may draw instead, as a release
+/// with NVK alone makes on any PC, is the plan before the room: no reserve,
+/// the same parts, the same unbounded pages and the same line.
+#[test]
+fn a_plan_without_such_a_gpu_is_unchanged() {
+    for (_, free) in fallback_hosts() {
+        let release = sizes(free, 8, 8, GpuPlan::from(GpuMemory::Own)).unwrap();
+        assert_eq!(release.fallback, 0);
+        assert_eq!(release, sizes(free, 8, 8, GpuMemory::Own).unwrap());
+        assert_eq!(held_bound(&release, GpuPlan::from(GpuMemory::Own)), None);
+        assert_eq!(
+            pack_budget(free, 8, 8, GpuPlan::from(GpuMemory::Own)),
+            pack_budget(free, 8, 8, GpuMemory::Own)
+        );
+    }
+    // The NVIDIA release's numbers on the 12 GiB VM and a 16 GiB PC.
+    let vm = sizes(10842 * MIB, 8, 8, GpuMemory::Own).unwrap();
+    let pc = sizes(free(16), 8, 8, GpuMemory::Own).unwrap();
+    assert_eq!(
+        [
+            vm.heap,
+            vm.guest,
+            pc.heap,
+            pc.guest,
+            page_bound(&vm, GpuMemory::Own)
+        ]
+        .map(|b| b / MIB),
+        [3300, 6144, 4576, 9538, 876]
+    );
+}
+
+/// At the floor heap, where the guest's floor leaves no room: the bound is
+/// the least, an integrated GPU that falls back after a failed probe draws
+/// in it with a small budget, said on the screen; one that would find less
+/// than its driver needs to start is refused, so the heap never stops.
+#[test]
+fn at_the_floor_heap_a_fallback_draws_small_or_is_refused() {
+    let floor = Sizes {
+        heap: HEAP_FLOOR,
+        gpu: 0,
+        fallback: 0,
+        ..sizes(free(32), 8, 8, GpuMemory::Own).unwrap()
+    };
+    let bound = page_bound(&floor, GpuMemory::Own);
+    assert_eq!(bound, 392 * MIB);
+    let probe = fallback_pages(bound, HELD_AFTER_PROBE, 0);
+    assert_eq!(
+        probe,
+        FallbackPages::Hold {
+            limit: bound,
+            room: 328 * MIB
+        }
+    );
+    assert!(probe.starved());
+    assert_eq!(
+        fallback_pages(bound, HELD_AFTER_METAL, 0),
+        FallbackPages::Short {
+            held: HELD_AFTER_METAL,
+            bound
+        }
+    );
+    // A plan that held Linux already: the same rule over its limit.
+    assert_eq!(
+        fallback_pages(bound, HELD_AFTER_PROBE, bound),
+        FallbackPages::Held {
+            limit: bound,
+            room: 328 * MIB
+        }
+    );
+    // With the room the plan keeps where the guest has it.
+    let roomy = Sizes {
+        fallback: 376 * MIB,
+        ..floor
+    };
+    assert_eq!(page_bound(&roomy, GpuMemory::Own), FALLBACK_LEAST);
+    assert!(!fallback_pages(FALLBACK_LEAST, HELD_AFTER_PROBE, 0).starved());
+    // An integrated GPU started already draws whatever is left; Linux is
+    // held where it holds no more than the bound.
+    assert_eq!(
+        drawing_pages(bound, HELD_AFTER_METAL, 0),
+        FallbackPages::Hold {
+            limit: bound,
+            room: 232 * MIB
+        }
+    );
+    assert_eq!(
+        drawing_pages(bound, 400 * MIB, 0),
+        FallbackPages::Over {
+            held: 400 * MIB,
+            bound
+        }
+    );
+    assert_eq!(
+        drawing_pages(bound, 400 * MIB, 512 * MIB).limit(),
+        Some(512 * MIB)
+    );
+    // The lines say each.
+    assert!(
+        probe.describe().ends_with(
+            "328M of them free, little past the 480M its driver holds as its Metal device \
+                 opens, so some windows may not draw"
+        ),
+        "{}",
+        probe.describe()
+    );
+    assert!(
+        fallback_pages(bound, HELD_AFTER_METAL, 0)
+            .describe()
+            .starts_with(
+                "not started in place of a GPU that could not draw: Linux holds 160M of the 392M"
+            )
+    );
+}
+
+/// The plan's line names the bound an integrated GPU drawing in a discrete
+/// GPU's place gets, and what the heap took for it.
+#[test]
+fn the_plans_line_names_the_room_for_an_integrated_gpu() {
+    let plan = GpuPlan {
+        memory: GpuMemory::Own,
+        aperture: 0,
+        bounded: false,
+        fallback: true,
+    };
+    let floor = Sizes {
+        heap: HEAP_FLOOR,
+        gpu: 0,
+        fallback: 376 * MIB,
+        aperture: 0,
+        ..sizes(free(32), 8, 8, GpuMemory::Own).unwrap()
+    };
+    assert!(
+        plan.describe(&floor).ends_with(
+            "; an integrated GPU this image draws with may draw in the discrete GPU's place, \
+             Linux's pages then held to 768M, for which the heap takes 376M more, to hold the \
+             768M it needs"
+        ),
+        "{}",
+        plan.describe(&floor)
+    );
+    let short = Sizes {
+        fallback: 0,
+        ..floor
+    };
+    assert!(plan.describe(&short).ends_with(
+        "Linux's pages then held to 392M, under the 768M it needs, as the heap takes only 0M \
+         more and the guest keeps its floor"
+    ));
+    let roomy = Sizes {
+        heap: 4400 * MIB,
+        fallback: 0,
+        ..floor
+    };
+    assert!(
+        plan.describe(&roomy)
+            .ends_with("Linux's pages then held to 1976M")
     );
 }

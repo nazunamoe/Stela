@@ -1,9 +1,16 @@
 use super::*;
 
-/// amdgpu's recipes whose bytes another holds, and the bundle's files and
-/// bytes with the AMD port: 437 files, 237.6 MiB.
-const AMD_SHARED: usize = 64;
-const AMD_TOTAL: (usize, usize) = (437, 249_100_660);
+/// The bundle without the ports: 88 files, 177.0 MiB.
+const BASE: (usize, usize) = (88, 185_584_904);
+/// What each port adds to the bundle, as files and bytes, and how many of
+/// its recipes hold another's bytes. amdgpu: 349 files, 60.6 MiB; `mec2`
+/// and `mec` of most families and a revision's files that did not change
+/// are one file. xe: 22 files, 5.4 MiB (GuC and display programs, and the
+/// GSC images Meteor Lake's and Lunar Lake's media C6 needs; no HuC). i915:
+/// 5 files, 59.5 KiB.
+const AMD: (usize, usize, usize) = (349, 63_515_756, 62);
+const INTEL: (usize, usize, usize) = (22, 5_687_884, 0);
+const I915: (usize, usize, usize) = (5, 60_900, 0);
 use stela_driver_core::firmware::{Provenance, Resource, Target};
 
 #[test]
@@ -25,18 +32,23 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     let (count, bytes) = size();
     assert_eq!(count, objects.len());
     // The RTL8168H and RTL8168M share a file, as the RTL9151A and RTL9151AS
-    // do, and, with the AMD port, amdgpu's files that hold another's bytes
-    // (`mec2` and `mec` of most families, a revision's files that did not
-    // change).
-    if Ports::BUILT == Ports::ALL {
-        assert_eq!(count + AMD_SHARED, recipes().count());
-        assert_eq!((count, bytes), AMD_TOTAL, "{count} {bytes}");
+    // do; each port adds its own files.
+    let mut expected = (BASE.0, BASE.1, 2);
+    for (built, port) in [
+        (Ports::BUILT.amd, AMD),
+        (Ports::BUILT.intel, INTEL),
+        (Ports::BUILT.i915, I915),
+    ] {
+        if built {
+            expected = (
+                expected.0 + port.0,
+                expected.1 + port.1,
+                expected.2 + port.2,
+            );
+        }
     }
-    if Ports::BUILT == Ports::NONE {
-        assert_eq!(count + 2, recipes().count());
-        // Without the AMD port: 88 files, 177.0 MiB.
-        assert_eq!((count, bytes), (88, 185_584_904), "{count} {bytes}");
-    }
+    assert_eq!((count, bytes), (expected.0, expected.1), "{count} {bytes}");
+    assert_eq!(count + expected.2, recipes().count());
     // The GPU's large images come last, for a volume short of room.
     assert_eq!(objects.last().unwrap().length, 64_116_464);
     let manifest = manifest(&complete()).unwrap();
@@ -182,94 +194,139 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     ]);
     expected.sort_unstable();
     assert_eq!(members(&ax210), expected);
-    // With the AMD port. Ryzen 9000 graphics, which amdgpu identifies by IP
-    // discovery: every file named after an IP version; its HDMI audio
-    // function needs none; a Navi 10 card, which amdgpu's table names: its
-    // family's files; and a Radeon HD 5000 card, which amdgpu leaves to
-    // radeon: none.
-    let ryzen = select_for(
-        &[
-            pci(0x1002, 0x13c0, 0x03),
-            pci(0x1002, 0x1640, 0x04),
-            pci(0x1002, 0x731f, 0x03),
-            pci(0x1002, 0x6898, 0x03),
-        ],
-        Ports::ALL,
-    );
-    let amd: Vec<&Artifact> = recipes::AmdGpu::Discovered
-        .files()
-        .chain(recipes::AmdGpu::of(0x731f).files())
-        .map(|recipe| &recipe.image)
-        .collect();
-    let found = members(&ryzen);
-    for member in ["amdgpu/gc_10_3_6_pfp.bin", "amdgpu/navi10_pfp.bin"] {
-        assert!(found.contains(&member), "{member}");
-    }
-    assert!(found.iter().all(
-        |member| USB.contains(member) || amd.iter().any(|artifact| artifact.member == *member)
-    ));
-    // Files of the same bytes are read once.
-    let mut digests: Vec<&str> = amd.iter().map(|artifact| artifact.sha256).collect();
-    digests.sort_unstable();
-    digests.dedup();
-    assert_eq!(found.len(), USB.len() + digests.len());
-    assert!(ryzen.unknown.is_empty());
-    // The files amdgpu loaded on an RX 9070 XT (Navi 48) and an RX 6800 XT
-    // (Navi 21) under Stela, display core included, are among theirs, but
-    // the video engine's, which Stela now leaves out.
-    for (device, loaded) in [
-        (
-            0x7550,
+    #[cfg(feature = "amdgpu-port")]
+    {
+        // With the AMD port. Ryzen 9000 graphics, which amdgpu identifies by IP
+        // discovery: every file named after an IP version; its HDMI audio
+        // function needs none; a Navi 10 card, which amdgpu's table names: its
+        // family's files; and a Radeon HD 5000 card, which amdgpu leaves to
+        // radeon: none.
+        let ryzen = select_for(
             &[
-                "gc_12_0_1_imu",
-                "gc_12_0_1_me",
-                "gc_12_0_1_mec",
-                "gc_12_0_1_pfp",
-                "gc_12_0_1_rlc",
-                "gc_12_0_1_uni_mes",
-                "psp_14_0_3_sos",
-                "psp_14_0_3_ta",
-                "sdma_7_0_1",
-                "smu_14_0_3",
-                "dcn_4_0_1_dmcub",
+                pci(0x1002, 0x13c0, 0x03),
+                pci(0x1002, 0x1640, 0x04),
+                pci(0x1002, 0x731f, 0x03),
+                pci(0x1002, 0x6898, 0x03),
             ],
-        ),
-        (
-            0x73bf,
-            &[
-                "sienna_cichlid_ce",
-                "sienna_cichlid_me",
-                "sienna_cichlid_mec",
-                "sienna_cichlid_mec2",
-                "sienna_cichlid_pfp",
-                "sienna_cichlid_rlc",
-                "sienna_cichlid_sdma",
-                "sienna_cichlid_smc",
-                "sienna_cichlid_sos",
-                "sienna_cichlid_ta",
-                "sienna_cichlid_dmcub",
-            ],
-        ),
-    ] {
-        let card = select_for(&[pci(0x1002, device, 0x03)], Ports::ALL);
-        let found = members(&card);
-        for file in loaded {
-            let member = format!("amdgpu/{file}.bin");
-            let held = recipes::AMDGPU
-                .iter()
-                .find(|recipe| recipe.image.member == member)
-                .unwrap_or_else(|| panic!("{member}"));
-            // `mec2` may be read as `mec`'s bytes.
-            assert!(
-                found
-                    .iter()
-                    .any(|name| recipes::AMDGPU.iter().any(|recipe| {
-                        recipe.image.member == *name && recipe.image.sha256 == held.image.sha256
-                    })),
-                "{device:04x} {member}"
-            );
+            Ports::ALL,
+        );
+        let amd: Vec<&Artifact> = recipes::AmdGpu::Discovered
+            .files()
+            .chain(recipes::AmdGpu::of(0x731f).files())
+            .map(|recipe| &recipe.image)
+            .collect();
+        let found = members(&ryzen);
+        for member in ["amdgpu/gc_10_3_6_pfp.bin", "amdgpu/navi10_pfp.bin"] {
+            assert!(found.contains(&member), "{member}");
         }
-        assert!(card.unknown.is_empty());
+        assert!(
+            found.iter().all(|member| USB.contains(member)
+                || amd.iter().any(|artifact| artifact.member == *member))
+        );
+        // Files of the same bytes are read once.
+        let mut digests: Vec<&str> = amd.iter().map(|artifact| artifact.sha256).collect();
+        digests.sort_unstable();
+        digests.dedup();
+        assert_eq!(found.len(), USB.len() + digests.len());
+        assert!(ryzen.unknown.is_empty());
+        // The files amdgpu loaded on an RX 9070 XT (Navi 48) and an RX 6800 XT
+        // (Navi 21) under Stela, display core included, are among theirs, but
+        // the video engine's, which Stela now leaves out.
+        for (device, loaded) in [
+            (
+                0x7550,
+                &[
+                    "gc_12_0_1_imu",
+                    "gc_12_0_1_me",
+                    "gc_12_0_1_mec",
+                    "gc_12_0_1_pfp",
+                    "gc_12_0_1_rlc",
+                    "gc_12_0_1_uni_mes",
+                    "psp_14_0_3_sos",
+                    "psp_14_0_3_ta",
+                    "sdma_7_0_1",
+                    "smu_14_0_3",
+                    "dcn_4_0_1_dmcub",
+                ],
+            ),
+            (
+                0x73bf,
+                &[
+                    "sienna_cichlid_ce",
+                    "sienna_cichlid_me",
+                    "sienna_cichlid_mec",
+                    "sienna_cichlid_mec2",
+                    "sienna_cichlid_pfp",
+                    "sienna_cichlid_rlc",
+                    "sienna_cichlid_sdma",
+                    "sienna_cichlid_smc",
+                    "sienna_cichlid_sos",
+                    "sienna_cichlid_ta",
+                    "sienna_cichlid_dmcub",
+                ],
+            ),
+        ] {
+            let card = select_for(&[pci(0x1002, device, 0x03)], Ports::ALL);
+            let found = members(&card);
+            for file in loaded {
+                let member = format!("amdgpu/{file}.bin");
+                let held = recipes::AMDGPU
+                    .iter()
+                    .find(|recipe| recipe.image.member == member)
+                    .unwrap_or_else(|| panic!("{member}"));
+                // `mec2` may be read as `mec`'s bytes.
+                assert!(
+                    found
+                        .iter()
+                        .any(|name| recipes::AMDGPU.iter().any(|recipe| {
+                            recipe.image.member == *name && recipe.image.sha256 == held.image.sha256
+                        })),
+                    "{device:04x} {member}"
+                );
+            }
+            assert!(card.unknown.is_empty());
+        }
+    }
+    #[cfg(any(feature = "xe-port", feature = "i915-port"))]
+    {
+        // With the Intel ports. A Tiger Lake GPU (xe's table): its GuC and DMC,
+        // and no HuC. An Ice Lake GPU, which i915 drives: its display program. A
+        // Broadwell GPU, which no driver here drives, selects nothing and is not
+        // named as lacking files: no driver here would read them.
+        let intel = [
+            pci(0x8086, 0x9a49, 0x03),
+            pci(0x8086, 0x8a56, 0x03),
+            pci(0x8086, 0x1616, 0x03),
+        ];
+        let both = select_for(&intel, Ports::ALL);
+        let mut expected: Vec<&str> = USB.to_vec();
+        expected.extend([
+            "i915/icl_dmc_ver1_09.bin",
+            "i915/tgl_dmc_ver2_12.bin",
+            "i915/tgl_guc_70.bin",
+        ]);
+        expected.sort_unstable();
+        assert_eq!(members(&both), expected);
+        assert!(both.unknown.is_empty());
+        // Each driver's files only with its port.
+        let xe_only = select_for(
+            &intel,
+            Ports {
+                i915: false,
+                ..Ports::ALL
+            },
+        );
+        assert!(!members(&xe_only).contains(&"i915/icl_dmc_ver1_09.bin"));
+        assert!(members(&xe_only).contains(&"i915/tgl_guc_70.bin"));
+        let i915_only = select_for(
+            &intel,
+            Ports {
+                intel: false,
+                ..Ports::ALL
+            },
+        );
+        assert!(members(&i915_only).contains(&"i915/icl_dmc_ver1_09.bin"));
+        assert!(!members(&i915_only).contains(&"i915/tgl_guc_70.bin"));
     }
     // An NVIDIA display chip no recipe covers is named once.
     let old = select(&[pci(0x10de, 0x1b80, 0x03), pci(0x10de, 0x1b80, 0x03)]);
@@ -429,10 +486,12 @@ fn an_exact_binding_wins_over_the_bundle() {
     assert_eq!(image.bytes(), b"abcd");
 }
 
-/// The AMD port named in a Cargo.toml line's feature list.
+/// The ports named in a Cargo.toml line's feature list.
 fn ports_of(line: &str) -> Ports {
     Ports {
         amd: line.contains("amdgpu-port\""),
+        intel: line.contains("xe-port\""),
+        i915: line.contains("i915-port\""),
     }
 }
 
@@ -450,7 +509,7 @@ fn the_boot_images_drivers_and_the_bundle_name_the_same_gpu_ports() {
     let loader = include_str!("../../../Cargo.toml");
     let cli = include_str!("../../../../stela-cli/Cargo.toml");
     let release = include_str!("../../../../../.github/workflows/release.yml");
-    // The boot's drivers and bundle without features: no AMD port in any.
+    // The boot's drivers and bundle without features: no port in any.
     let drivers = ports_of(line(boot, "stela-drivers = "));
     assert_eq!(drivers, Ports::NONE);
     assert_eq!(ports_of(line(boot, "stela-loader = ")), drivers);
@@ -463,6 +522,29 @@ fn the_boot_images_drivers_and_the_bundle_name_the_same_gpu_ports() {
     let port = line(cli, "amdgpu-port = ");
     assert!(port.contains("\"stela-loader/amdgpu-port\""), "{port}");
     assert!(line(cli, "default = ").contains("\"amdgpu-port\""));
+    // The same for the Intel port: the image reads the firmware of each
+    // driver its feature turns on, and `stela` writes it.
+    let intel = line(boot, "intel = ");
+    let of = |entries: &str, owner: &str| {
+        ports_of(
+            &entries
+                .split(',')
+                .filter(|entry| entry.contains(owner))
+                .collect::<String>(),
+        )
+    };
+    let driven = Ports {
+        amd: false,
+        intel: true,
+        i915: true,
+    };
+    assert_eq!(of(intel, "stela-drivers/"), driven, "{intel}");
+    assert_eq!(of(intel, "stela-loader/"), driven, "{intel}");
+    assert_eq!(ports_of(line(cli, "intel-port = ")), driven);
+    assert!(line(cli, "default = ").contains("\"intel-port\""));
+    // The image `xtask boot build` makes outside a release turns both on.
+    let features = include_str!("../../../../../xtask/src/boot.rs");
+    assert!(features.contains("{ \"nvk\" } else { \"nvk,amdgpu,intel\" }"));
     // A release builds its image without the port (`STELA_RELEASE`, which
     // `xtask boot build` reads) and `stela` without its default features.
     assert!(release.contains("STELA_RELEASE: \"1\""));
@@ -474,18 +556,30 @@ fn the_boot_images_drivers_and_the_bundle_name_the_same_gpu_ports() {
 }
 
 #[test]
-fn a_build_without_the_amd_port_bundles_none_of_its_firmware() {
-    let theirs = |member: &str| member.starts_with("amdgpu/");
-    let without_port = objects_for(Ports::NONE);
-    assert!(!without_port.is_empty());
-    assert!(without_port.iter().all(|artifact| !theirs(artifact.member)));
+fn a_build_without_the_ports_bundles_none_of_their_firmware() {
+    let amd = |member: &str| member.starts_with("amdgpu/");
+    let intel = |member: &str| member.starts_with("i915/") || member.starts_with("xe/");
+    let theirs = |member: &str| amd(member) || intel(member);
+    let without_ports = objects_for(Ports::NONE);
+    assert!(!without_ports.is_empty());
+    assert!(
+        without_ports
+            .iter()
+            .all(|artifact| !theirs(artifact.member))
+    );
     assert!(
         families_for(Ports::NONE)
             .flat_map(|(_, recipes)| recipes.iter())
-            .all(|recipe| !recipe.license.member.contains("amdgpu"))
+            .all(|recipe| !recipe.license.member.contains("amdgpu")
+                && !recipe.license.member.ends_with("LICENSE.i915")
+                && !recipe.license.member.ends_with("LICENSE.xe"))
     );
-    // Its GPUs select nothing; the rest is as with the port.
-    let functions = [pci(0x1002, 0x13c0, 3), pci(0x10de, 0x2c02, 3)];
+    // Their GPUs select nothing; the rest is as with the ports.
+    let functions = [
+        pci(0x1002, 0x13c0, 3),
+        pci(0x8086, 0x7d55, 3),
+        pci(0x10de, 0x2c02, 3),
+    ];
     let without = select_for(&functions, Ports::NONE);
     assert!(
         without
@@ -500,16 +594,29 @@ fn a_build_without_the_amd_port_bundles_none_of_its_firmware() {
             .iter()
             .any(|(artifact, _)| artifact.member.starts_with("nvidia/"))
     );
+    // With the ports, as far as this build holds their recipes: a build
+    // without a port has none to select.
     let with = select_for(&functions, Ports::ALL);
-    assert!(
+    assert_eq!(
+        with.wanted.iter().any(|(artifact, _)| amd(artifact.member)),
+        cfg!(feature = "amdgpu-port")
+    );
+    assert_eq!(
         with.wanted
             .iter()
-            .any(|(artifact, _)| theirs(artifact.member))
+            .any(|(artifact, _)| intel(artifact.member)),
+        cfg!(any(feature = "xe-port", feature = "i915-port"))
     );
-    // This build's bundle holds them exactly when it has the port.
+    // This build's bundle holds each port's files exactly when it has the
+    // port.
+    let built = objects();
     assert_eq!(
-        objects().iter().any(|artifact| theirs(artifact.member)),
+        built.iter().any(|artifact| amd(artifact.member)),
         Ports::BUILT.amd
+    );
+    assert_eq!(
+        built.iter().any(|artifact| intel(artifact.member)),
+        Ports::BUILT.intel || Ports::BUILT.i915
     );
 }
 
@@ -617,7 +724,11 @@ fn a_gpu_the_firmware_left_without_power_gets_every_chips_files() {
     // With the AMD port, its files too.
     let amd = select_for(&functions, Ports::ALL);
     let families: Vec<_> = amd.late.iter().map(|late| late.family).collect();
-    assert_eq!(families, ["AMD GPU", "NVIDIA GSP-RM"]);
+    if cfg!(feature = "amdgpu-port") {
+        assert_eq!(families, ["AMD GPU", "NVIDIA GSP-RM"]);
+    } else {
+        assert_eq!(families, ["NVIDIA GSP-RM"]);
+    }
     // Without a census nothing is known: every family is late.
     let unseen = select_without_census(Ports::NONE);
     assert_eq!(members(&unseen), USB);
@@ -696,24 +807,31 @@ fn the_nvidia_notice_claims_no_more_than_the_census_shows() {
 fn late_files_are_read_whole_by_family_within_the_handoffs_room() {
     let functions = [pci(0x8086, 0x46a6, 0x03), port(1)];
     let usb = select(&[]);
-    let mut tight = select_for(&functions, Ports::ALL);
-    let amd = tight.late[0].bytes();
-    let amd_files = tight.late[0].files.len();
-    // Room for the AMD files but not NVIDIA's: AMD's are taken whole and
-    // NVIDIA's left out whole.
-    let left = tight.take_late(Room {
-        images: usb.wanted.len() + amd_files + 1,
-        bytes: usb.bytes() + amd + 1,
-    });
-    assert_eq!(left.len(), 1);
-    assert_eq!(left[0].family, "NVIDIA GSP-RM");
-    assert_eq!(tight.wanted.len(), usb.wanted.len() + amd_files);
-    assert!(
-        tight
-            .wanted
-            .iter()
-            .all(|(artifact, _)| !artifact.member.starts_with("nvidia/"))
-    );
+    // With the AMD port, whose family is the first late one.
+    #[cfg(feature = "amdgpu-port")]
+    {
+        let mut tight = select_for(&functions, Ports::ALL);
+        let amd = tight.late[0].bytes();
+        let amd_files = tight.late[0].files.len();
+        // What the PC's own functions want, the Intel GPU's files with the
+        // Intel port among them, comes before any late family.
+        let (wanted, bytes) = (tight.wanted.len(), tight.bytes());
+        // Room for the AMD files but not NVIDIA's: AMD's are taken whole and
+        // NVIDIA's left out whole.
+        let left = tight.take_late(Room {
+            images: wanted + amd_files + 1,
+            bytes: bytes + amd + 1,
+        });
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].family, "NVIDIA GSP-RM");
+        assert_eq!(tight.wanted.len(), wanted + amd_files);
+        assert!(
+            tight
+                .wanted
+                .iter()
+                .all(|(artifact, _)| !artifact.member.starts_with("nvidia/"))
+        );
+    }
     // One image short: nothing of a family is taken.
     let mut short = select_for(&functions, Ports::NONE);
     let files = short.late[0].files.len();

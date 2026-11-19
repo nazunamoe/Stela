@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 15:33:17 +0000
+Subject: [PATCH] fix(i915): a GSC whose proxy has no MEI component after its
+ firmware load is said at info level, as xe takes the same answer, where a
+ kernel built without the MEI GSC proxy logged an error on every Meteor Lake
+ start that loads the GSC for media C6
+
+---
+ drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c b/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c
+index 3d3191deb0ab9ea9b5cf1b302d719c24664b109f..6de44170d8c834704fd77f384f92136c9eeab7b3 100644
+--- a/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c
++++ b/drivers/gpu/drm/i915/gt/uc/intel_gsc_uc.c
+@@ -66,9 +66,17 @@ static void gsc_work(struct work_struct *work)
+ 			if (actions & GSC_ACTION_FW_LOAD) {
+ 				/*
+ 				 * A proxy failure right after firmware load means the proxy-init
+-				 * step has failed so mark GSC as not usable after this
++				 * step has failed so mark GSC as not usable after this.
++				 * A kernel without the MEI GSC proxy component has
++				 * said so at init (intel_gsc_proxy_init) and gets
++				 * -ENODEV here: the firmware still runs for the media
++				 * GT's power management, as xe's gsc_upload_and_init
++				 * takes the same answer without an error.
+ 				 */
+-				gt_err(gt, "GSC proxy handler failed to init\n");
++				if (ret == -ENODEV)
++					gt_info(gt, "GSC proxy not set up: no MEI GSC proxy component\n");
++				else
++					gt_err(gt, "GSC proxy handler failed to init\n");
+ 				intel_uc_fw_change_status(&gsc->fw, INTEL_UC_FIRMWARE_LOAD_FAIL);
+ 			}
+ 			goto out_put;

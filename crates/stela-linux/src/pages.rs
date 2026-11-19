@@ -34,6 +34,19 @@ const EOPNOTSUPP: c_int = 95;
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static QUARANTINED_CATALOGS: AtomicU64 = AtomicU64::new(0);
 
+/// The bytes of RAM Linux sees (`si_meminfo`'s total, the catalog's managed
+/// pages): what a kernel driver reports as the system's memory, as xe's
+/// system region and i915's do, and so what Linux would answer a process's
+/// `sysconf(_SC_PHYS_PAGES)` with. A plain read from any processor.
+pub fn ram_bytes() -> u64 {
+    unsafe extern "C" {
+        fn stela_linux_ram_pages() -> u64;
+    }
+    // SAFETY: one plain read of Linux's count.
+    let pages = unsafe { stela_linux_ram_pages() };
+    pages * 4096
+}
+
 /// Catalogs whose Drop could not establish exclusive, fully retired ownership.
 /// Their provider and descriptor storage remain held; this is not a count
 /// of reclaimed or reset resources.

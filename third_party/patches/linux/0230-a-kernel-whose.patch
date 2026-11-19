@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 04:48:31 +0000
+Subject: [PATCH] fix(xe): a kernel whose boot finds an integrated GPU's stolen
+ memory gives it to xe before graphics 12.70, as x86's early quirks do, where
+ xe ran Tiger Lake to Raptor Lake without stolen memory and said so only at
+ debug level
+
+---
+ drivers/gpu/drm/xe/xe_ttm_stolen_mgr.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/xe/xe_ttm_stolen_mgr.c b/drivers/gpu/drm/xe/xe_ttm_stolen_mgr.c
+index 5e9070739e65335a25020b3116f11b196825f39c..16604fa01a1bba6daf1630fb08eb7f6f650e249e 100644
+--- a/drivers/gpu/drm/xe/xe_ttm_stolen_mgr.c
++++ b/drivers/gpu/drm/xe/xe_ttm_stolen_mgr.c
+@@ -179,7 +179,12 @@ extern struct resource intel_graphics_stolen_res;
+ 
+ static u64 detect_stolen(struct xe_device *xe, struct xe_ttm_stolen_mgr *mgr)
+ {
+-#ifdef CONFIG_X86
++	/*
++	 * x86's early quirks find the stolen memory of an integrated GPU
++	 * before graphics 12.70; a kernel that finds it otherwise (its boot
++	 * reading the same registers) supplies the same resource.
++	 */
++#if defined(CONFIG_X86) || defined(CONFIG_STELA)
+ 	/* Map into GGTT */
+ 	mgr->io_base = pci_resource_start(to_pci_dev(xe->drm.dev), 2);
+ 
+@@ -288,7 +293,7 @@ static int __xe_ttm_stolen_io_mem_reserve_stolen(struct xe_device *xe,
+ 						 struct xe_ttm_stolen_mgr *mgr,
+ 						 struct ttm_resource *mem)
+ {
+-#ifdef CONFIG_X86
++#if defined(CONFIG_X86) || defined(CONFIG_STELA)
+ 	struct xe_bo *bo = ttm_to_xe_bo(mem->bo);
+ 
+ 	XE_WARN_ON(IS_DGFX(xe));

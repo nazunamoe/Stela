@@ -244,6 +244,7 @@ impl Linux {
             PathBuf::from(format!("{LINUX}/lib/crypto/blake2s.c")),
             PathBuf::from(format!("{LINUX}/lib/iov_iter_copy.c")),
             PathBuf::from(format!("{LINUX}/lib/ratelimit.c")),
+            PathBuf::from(format!("{LINUX}/lib/dec_and_lock.c")),
             PathBuf::from(format!("{LINUX}/drivers/i2c/algos/i2c-algo-bit.c")),
             PathBuf::from(format!("{LINUX}/lib/scatterlist.c")),
             PathBuf::from(format!("{LINUX}/lib/find_bit.c")),
@@ -557,19 +558,43 @@ impl Linux {
                 &format!("{COMPAT}/stela/writeback_init_test.c"),
                 &archives,
             );
+            // A failed probe's leftover interrupt requests take a line's
+            // mutex, so this run of the PCI host fixture wraps current.
+            let mut failed_probe = build.clone();
+            failed_probe
+                .define("STELA_LINUX_PCI_HOST_TEST", None)
+                .define("STELA_LINUX_PCI_HOST_FAILED_PROBE_TEST", None)
+                .flag("-Wl,--wrap=stela_linux_current");
+            tests.add(
+                &failed_probe,
+                "linux_pci_host_failed_probe",
+                &format!("{COMPAT}/kernel/pci_host.c"),
+                &archives,
+            );
         }
         // These component fixtures use init_task credentials without a native
         // task lease. Only their ELF links wrap current.
         if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
             for (name, source, define) in [
-                ("linux_file", "file.c", "STELA_LINUX_FILE_TEST"),
-                ("linux_mapping", "mapping.c", "STELA_LINUX_MAPPING_TEST"),
+                ("linux_file", "kernel/file.c", "STELA_LINUX_FILE_TEST"),
+                (
+                    "linux_mapping",
+                    "kernel/mapping.c",
+                    "STELA_LINUX_MAPPING_TEST",
+                ),
+                // dma-buf.c's sync file ioctls, as ANV asks for them on
+                // i915, through the descriptor table.
+                (
+                    "linux_dma_buf",
+                    "stela/dma_buf_test.c",
+                    "STELA_LINUX_DMA_BUF_TEST",
+                ),
             ] {
                 let mut fixture = build.clone();
                 fixture
                     .define(define, None)
                     .flag("-Wl,--wrap=stela_linux_current");
-                if name == "linux_file" {
+                if name != "linux_mapping" {
                     for symbol in [
                         "__cond_resched",
                         "call_rcu",
@@ -579,12 +604,7 @@ impl Linux {
                         fixture.flag(format!("-Wl,--wrap={symbol}"));
                     }
                 }
-                tests.add(
-                    &fixture,
-                    name,
-                    &format!("{COMPAT}/kernel/{source}"),
-                    &archives,
-                );
+                tests.add(&fixture, name, &format!("{COMPAT}/{source}"), &archives);
             }
         }
         for (name, source, define) in [

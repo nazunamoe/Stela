@@ -300,28 +300,33 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
     // cannot serve the Metal device, is no such GPU.
     let driven = functions
         .iter()
-        .map(crate::pci_io::FunctionObservation::identity)
-        .filter(|identity| identity.vendor != NVIDIA && identity.class[0] == 0x03)
-        .find_map(|identity| {
-            stela_drivers::gpu::stack::GpuStack::select(&stela_drivers::gpu::Adapter {
+        // The revision names an AMD GPU's market name.
+        .map(|function| (function.identity(), function.header[8]))
+        .filter(|(identity, _)| identity.vendor != NVIDIA && identity.class[0] == 0x03)
+        .find_map(|(identity, revision)| {
+            let adapter = stela_drivers::gpu::Adapter {
                 address: identity.address,
                 vendor: stela_drivers::gpu::Vendor::from_pci(identity.vendor),
                 device: identity.device,
                 class: identity.class,
-                revision: 0,
-            })
-            .ok()
-            .filter(|stack| stack.draws())
+                revision,
+            };
+            stela_drivers::gpu::stack::GpuStack::select(&adapter)
+                .ok()
+                .filter(|stack| stack.draws())
+                .map(|stack| (adapter, stack))
         });
     let notice = if driven.is_some() {
         NvidiaNotice::Driven
     } else {
         nvidia_notice(&census)
     };
-    if let Some(stack) = driven {
+    if let Some((adapter, stack)) = driven {
         output::arguments(format_args!(
-            "HOST GPU: a {:?} display controller, which this image drives with {}\n",
-            stack.vendor, stack.kernel.driver
+            "HOST GPU: the {} at {}, which this image drives with {}\n",
+            adapter.name(),
+            adapter.address,
+            stack.kernel.driver
         ));
     } else {
         match notice {
@@ -441,6 +446,10 @@ fn plan_gpu_memory(functions: &[crate::pci_io::FunctionObservation]) {
         ),
         core::sync::atomic::Ordering::Relaxed,
     );
+    GPU_FALLBACK.store(
+        selection::integrated_may_draw_instead(&found),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     let planned_memory = selection::memory(&found);
     let mut planned = Planned::new(planned_memory);
     for (&address, found) in addresses.iter().zip(&found) {
@@ -555,6 +564,10 @@ static GPU_APERTURE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 /// (`GpuPlan::bounded`).
 static GPU_BOUNDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Whether an integrated GPU this image draws with may draw in place of the
+/// discrete GPU the plan gives the Metal device (`GpuPlan::fallback`).
+static GPU_FALLBACK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// What [`plan_gpu_memory`] saw of the display controllers, for the
 /// engine's census (`Handoff::gpu_census`).
 static GPU_CENSUS: stela_boot_core::screen::Exclusive<
@@ -573,6 +586,7 @@ pub fn gpu_plan() -> stela_boot_core::host_memory::GpuPlan {
         memory: gpu_memory(),
         aperture: GPU_APERTURE.load(core::sync::atomic::Ordering::Relaxed),
         bounded: GPU_BOUNDED.load(core::sync::atomic::Ordering::Relaxed),
+        fallback: GPU_FALLBACK.load(core::sync::atomic::Ordering::Relaxed),
     }
 }
 

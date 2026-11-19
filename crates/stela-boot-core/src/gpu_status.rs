@@ -8,6 +8,14 @@ use stela_loader::host_firmware::recipes::nvidia_chip;
 /// Blackwell: every chip `recipes::nvidia_chip` names), as people know them.
 pub const SUPPORTED: &str = "an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU";
 
+/// The AMD GPUs a build with amdgpu's port drives (graphics generation 9 on,
+/// `stela_driver_core::amd_metal`), as people know them.
+const SUPPORTED_AMD: &str = "an AMD Radeon RX Vega or later GPU";
+
+/// The Intel GPUs a build with xe's and i915's ports drives (graphics
+/// version 9 on, as ANV opens them), as people know them.
+const SUPPORTED_INTEL: &str = "an Intel GPU from 6th generation Core processors on";
+
 /// The boot screen's line when the GPU that draws, `gpu` by its name,
 /// started with no screen connected and macOS is shown on the screen the PC
 /// started on, which another display adapter drives (a laptop with no
@@ -39,7 +47,7 @@ pub fn started(drawer: Option<&str>, failed: &[String], shows: Option<&str>) -> 
 /// `drawer` draws, or its image has no Vulkan driver for it.
 pub fn shows_only(gpu: &str, drawer: Option<&str>) -> String {
     match drawer {
-        Some(drawer) => format!("the {gpu} only shows screens wired to it: the {drawer} draws"),
+        Some(_) => format!("the {gpu} shows the picture on the screens wired to it"),
         None => format!(
             "the {gpu} only shows screens wired to it: this Stela has no Vulkan driver for it"
         ),
@@ -47,9 +55,67 @@ pub fn shows_only(gpu: &str, drawer: Option<&str>) -> String {
 }
 
 /// The screen line when the GPU chosen to draw, `wanted`, opened no Metal
-/// device and `instead` draws in its place.
-pub fn draws_instead(wanted: &str, instead: &str) -> String {
-    format!("the {wanted} could not draw for macOS, so the {instead} draws instead")
+/// device and `instead` draws in its place; `error` is why its Metal device
+/// did not open, in one screen line ([`one_line`]).
+pub fn draws_instead(wanted: &str, instead: &str, error: Option<&str>) -> String {
+    let (why, log) = match error {
+        Some(error) => (format!(" ({})", one_line(error)), "more"),
+        None => (String::new(), "why"),
+    };
+    format!(
+        "the {wanted} could not draw for macOS: its Metal device did not open{why}, so the \
+         {instead} draws instead. The boot log on this USB says {log}"
+    )
+}
+
+/// The most characters of a cause the screen shows: one line of the
+/// narrowest console Stela draws on, past the mark's indent.
+pub const CAUSE_COLUMNS: usize = 96;
+
+/// The first line of `text`, its ends trimmed and a final period left
+/// off, at most [`CAUSE_COLUMNS`] characters, cut at a word where one
+/// ends in its last quarter, with an ellipsis where cut.
+pub fn one_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .trim_end_matches('.');
+    if line.chars().count() <= CAUSE_COLUMNS {
+        return String::from(line);
+    }
+    let room = CAUSE_COLUMNS - 3;
+    let cut: String = line.chars().take(room).collect();
+    let cut = match cut.rfind(' ') {
+        Some(space) if cut[..space].chars().count() >= room * 3 / 4 => &cut[..space],
+        _ => cut.as_str(),
+    };
+    format!("{}...", cut.trim_end_matches([' ', ',', ';', ':']))
+}
+
+/// The screen line when the integrated GPU `gpu`, started in place of a GPU
+/// that could not draw, has only `room` bytes of Linux's pages, under what
+/// a desktop needs (`host_memory::FALLBACK_LEAST`).
+pub fn fallback_starved(gpu: &str, room: u64) -> String {
+    let tenths = room / 100_000_000;
+    format!(
+        "the {gpu} draws in place of a GPU that could not with {}.{} GB of this PC's RAM for its \
+         memory; some windows may not draw",
+        tenths / 10,
+        tenths % 10
+    )
+}
+
+/// The screen line when the GPU that draws, `drawer`, has no screen it
+/// knows of and the screen the PC started on went dark with `failed`, the
+/// GPU it is wired to, which did not start: macOS shows on a screen
+/// connected to the GPU that draws, which the boot looks for once a second.
+pub fn no_screen(failed: &str, drawer: &str) -> String {
+    format!(
+        "No screen shows macOS yet: the screen the PC started on is wired to the {failed}, \
+         which did not start. Connect a screen to the {drawer}, and macOS shows on it"
+    )
 }
 
 /// Why an NVIDIA GPU did not start.
@@ -131,29 +197,22 @@ pub fn refused(
     }
 }
 
-/// The screen line for the NVIDIA GPUs among `adapters` that were claimed
-/// but did not start, `error` naming the step that ended the start.
+/// The GPU step's end when every claimed GPU's driver failed on it: the
+/// lines above it, one for each such GPU ([`unbound`]), say why.
+pub const NONE_BOUND: &str = "no GPU started; the lines above say why";
+
+/// The screen line for the GPUs that were claimed, `adapters`, when none of
+/// them started, `error` naming the step that ended the start.
 pub fn failed(adapters: &[Adapter], error: &str) -> String {
     let named: Vec<String> = adapters
         .iter()
-        .filter(|found| found.vendor == Vendor::Nvidia)
-        .map(|found| format!("{} at {}", found.name(), found.address))
+        .map(|found| format!("the {} at {}", found.name(), found.address))
         .collect();
-    // Without an NVIDIA GPU, the other adapters a driver was started for.
-    let others: Vec<String> = adapters
-        .iter()
-        .filter(|found| found.vendor != Vendor::Nvidia)
-        .map(|found| format!("{} at {}", found.name(), found.address))
-        .collect();
-    let gpu = match (named.is_empty(), others.is_empty()) {
-        (false, _) => named.join(" and "),
-        (true, false) => others.join(" and "),
-        (true, true) => String::from("NVIDIA GPU"),
+    let gpu = match named.is_empty() {
+        true => String::from("the GPU"),
+        false => named.join(" and "),
     };
-    format!(
-        "the {gpu} could not start: {error}. macOS starts without it; the boot log on this USB \
-         says why"
-    )
+    format!("{gpu} could not start: {error}. The boot log on this USB says why")
 }
 
 /// What became of the firmware's picture on a claimed GPU no driver bound.
@@ -178,8 +237,16 @@ pub enum Picture<'a> {
 /// `address` that its Linux driver `driver` did not bind, with what became
 /// of the firmware's picture on it. A picture that ended leaves its display
 /// with nothing, so only another adapter's screen, or the log, carries this
-/// line.
-pub fn unbound(gpu: &str, address: &str, driver: &str, picture: Picture<'_>) -> String {
+/// line. Where another GPU takes its place, `cause` says why it could not
+/// draw: Linux's first error in its probe, in one screen line
+/// ([`one_line`]).
+pub fn unbound(
+    gpu: &str,
+    address: &str,
+    driver: &str,
+    picture: Picture<'_>,
+    cause: Option<&str>,
+) -> String {
     let screen = match picture {
         Picture::Elsewhere => String::new(),
         Picture::Kept => String::from(
@@ -199,10 +266,17 @@ pub fn unbound(gpu: &str, address: &str, driver: &str, picture: Picture<'_>) -> 
              probe holds the GPU.",
         ),
     };
-    format!(
-        "the {gpu} at {address} did not start: its Linux driver {driver} did not bind it.{screen} \
-         The boot log on this USB says why"
-    )
+    match cause {
+        Some(cause) => format!(
+            "the {gpu} at {address} did not start: its driver {driver} stopped in its probe: \
+             {}.{screen} The boot log on this USB says more",
+            one_line(cause)
+        ),
+        None => format!(
+            "the {gpu} at {address} did not start: its driver {driver} stopped with an \
+             error.{screen} The boot log on this USB says why"
+        ),
+    }
 }
 
 /// The reason the boot stops when Linux's GPU driver stops for good, `stop`
@@ -233,6 +307,70 @@ pub fn driver_stopped(
         ),
         (None, _) => format!("the GPU driver stopped: {stop}"),
     }
+}
+
+/// The turn of the GPUs' probes a driver's probe ran in ([`Probing`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeTurn {
+    /// The start's first turn: the GPUs that may give the Metal device.
+    First,
+    /// The start's second turn: GPUs that may only show another's frames.
+    Later,
+    /// A turn of GPUs claimed after the start in place of GPUs that could
+    /// not draw.
+    Fallback,
+}
+
+/// A driver's probe running now, which a stop raised inside it names
+/// ([`probe_stop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Probing<'a> {
+    /// The GPU's market name, or its maker alone.
+    pub gpu: &'a str,
+    pub address: &'a str,
+    pub driver: &'a str,
+    pub turn: ProbeTurn,
+    /// Another GPU of this PC whose stack draws, which could have drawn in
+    /// its place had its probe failed with an error rather than stopped.
+    pub beside: Option<&'a str>,
+    /// The processor the probe runs on.
+    pub processor: usize,
+}
+
+/// What a stop raised on `processor` adds to its reason while `probing`
+/// runs there: the GPU, its driver, the turn and, where one was present,
+/// the GPU that could have drawn in its place, with why that one cannot
+/// start after such a stop. None for a stop outside a probe, or on another
+/// processor, whose reason stays as it was.
+///
+/// No stop inside a probe is contained, whatever raised it: Linux's BUG or
+/// panic, a fault in its code, or an assertion of Stela's Linux layer. In
+/// atomic context (a spin lock, interrupts or preemption off, an RCU or
+/// interrupt callback) the processor's interrupt and preemption state is
+/// the stopped code's, and Linux itself panics there. In process context the
+/// stopped task keeps every lock it took, which nothing records (no
+/// lockdep), and Linux's mutexes name their owner task, so neither ending
+/// nor parking the task is sound for the next driver; the timers and work
+/// the driver armed keep running into its half-built state, and the first
+/// turn's GPUs already bound are held by that task until it returns.
+pub fn probe_stop(probing: Option<&Probing<'_>>, processor: usize) -> Option<String> {
+    let probing = probing.filter(|probing| probing.processor == processor)?;
+    let turn = match probing.turn {
+        ProbeTurn::First => "the GPUs' first turn of probes",
+        ProbeTurn::Later => "the turn of GPUs that only show another's frames",
+        ProbeTurn::Fallback => "the turn of GPUs started in place of GPUs that could not draw",
+    };
+    let beside = match probing.beside {
+        Some(other) => format!(
+            "; the {other} of this PC could draw in its place, but cannot start after a stop \
+             inside a driver's probe, which leaves Linux's locks and state as the driver had them"
+        ),
+        None => String::new(),
+    };
+    Some(format!(
+        "it came while {}'s probe of the {} at {} ran, in {turn}{beside}",
+        probing.driver, probing.gpu, probing.address
+    ))
 }
 
 /// The maker of the GPU whose start failed with `error`, the first error
@@ -377,12 +515,6 @@ pub fn bar_sizes(bars: &[(usize, u64)]) -> String {
     named.join(", ")
 }
 
-/// How the screen names a display adapter: its market name, else its
-/// maker and IDs, and its PCI address.
-pub fn adapter(adapter: &Adapter) -> String {
-    format!("the {} at {}", adapter.name(), adapter.address)
-}
-
 fn maker(vendor: Vendor) -> String {
     match vendor {
         Vendor::Nvidia => String::from("NVIDIA"),
@@ -392,30 +524,34 @@ fn maker(vendor: Vendor) -> String {
     }
 }
 
-/// The line for a display adapter Stela's GPU driver does not run, and why.
-pub fn unused(found: &Adapter) -> String {
-    format!(
-        "{} is not used: {}",
-        adapter(found),
-        found.unavailable_reason()
-    )
-}
-
-/// The screen line for a PC without an NVIDIA GPU, naming the display
-/// adapters it has instead.
-pub fn none(adapters: &[Adapter]) -> String {
+/// The screen line for a PC with no GPU this build drives, `ports` being the
+/// makers whose GPUs it drives: the GPUs it has instead, by their market
+/// names, and what Stela needs. A build that drives NVIDIA GPUs alone says
+/// so and names no other maker's port. Display adapters of no GPU maker,
+/// as a server's BMC display, tell a user nothing: the log names them.
+pub fn none(adapters: &[Adapter], ports: &[Vendor]) -> String {
     let found: Vec<String> = adapters
         .iter()
-        .filter(|found| found.vendor != Vendor::Nvidia)
-        .map(adapter)
+        .filter(|found| !matches!(found.vendor, Vendor::Other(_)))
+        .map(|found| format!("the {}", found.name()))
         .collect();
-    match found.is_empty() {
-        true => format!("this PC has no NVIDIA GPU: Stela needs {SUPPORTED}"),
-        false => format!(
-            "this PC has no NVIDIA GPU, only {}: Stela needs {SUPPORTED}",
-            found.join(" and ")
-        ),
+    let only = match found.is_empty() {
+        true => String::new(),
+        false => format!(", only {}", found.join(" and ")),
+    };
+    let amd = ports.contains(&Vendor::Amd);
+    let intel = ports.contains(&Vendor::Intel);
+    if !amd && !intel {
+        return format!("this PC has no NVIDIA GPU{only}: Stela needs {SUPPORTED}");
     }
+    let mut needed = alloc::vec![SUPPORTED];
+    needed.extend(amd.then_some(SUPPORTED_AMD));
+    needed.extend(intel.then_some(SUPPORTED_INTEL));
+    let (last, rest) = needed.split_last().unwrap_or((&SUPPORTED, &[]));
+    format!(
+        "this PC has no GPU Stela drives{only}: Stela needs {}, or {last}",
+        rest.join(", ")
+    )
 }
 
 #[cfg(test)]
@@ -465,25 +601,33 @@ mod tests {
                 "Intel Iris Xe Graphics",
                 "00:02.0",
                 "xe",
-                Picture::Elsewhere
+                Picture::Elsewhere,
+                None
             ),
-            "the Intel Iris Xe Graphics at 00:02.0 did not start: its Linux driver xe did not \
-             bind it. The boot log on this USB says why"
+            "the Intel Iris Xe Graphics at 00:02.0 did not start: its driver xe stopped with an \
+             error. The boot log on this USB says why"
         );
         let reset = unbound(
             "Intel Iris Xe Graphics",
             "00:02.0",
             "xe",
             Picture::ResetForClaim,
+            None,
         );
         assert!(
             reset.contains(
-                "xe did not bind it. The screen the PC started on is wired to it and stays \
-                 dark: the GPU was reset for its driver. The boot log"
+                "xe stopped with an error. The screen the PC started on is wired to it and \
+                 stays dark: the GPU was reset for its driver. The boot log"
             ),
             "{reset}"
         );
-        let kept = unbound("AMD Radeon Graphics", "01:00.0", "amdgpu", Picture::Kept);
+        let kept = unbound(
+            "AMD Radeon Graphics",
+            "01:00.0",
+            "amdgpu",
+            Picture::Kept,
+            None,
+        );
         assert!(
             kept.contains("is wired to it and keeps its picture"),
             "{kept}"
@@ -493,11 +637,142 @@ mod tests {
             "01:00.0",
             "amdgpu",
             Picture::EndedBy("MODE2 reset"),
+            None,
         );
         assert!(
             ended.contains("stays dark: the driver's MODE2 reset ended its picture."),
             "{ended}"
         );
+    }
+
+    /// A stop inside a driver's probe names the GPU, the turn and the GPU
+    /// that could have drawn in its place, for each kind of stop alike: the
+    /// reason it is added to is the stop's own. Only a stop on the probe's
+    /// processor while it runs is named; a stop outside it, or on another
+    /// processor, keeps its reason as it was.
+    #[test]
+    fn a_stop_inside_a_probe_names_the_gpu_and_the_one_beside_it() {
+        let probing = Probing {
+            gpu: "NVIDIA GeForce RTX 5080",
+            address: "0000:01:00.0",
+            driver: "nouveau",
+            turn: ProbeTurn::First,
+            beside: Some("Intel UHD Graphics 770"),
+            processor: 0,
+        };
+        let named = probe_stop(Some(&probing), 0).unwrap();
+        assert_eq!(
+            named,
+            "it came while nouveau's probe of the NVIDIA GeForce RTX 5080 at 0000:01:00.0 ran, \
+             in the GPUs' first turn of probes; the Intel UHD Graphics 770 of this PC could draw in \
+             its place, but cannot start after a stop inside a driver's probe, which leaves \
+             Linux's locks and state as the driver had them"
+        );
+        // Each kind of stop gets the same clause after its own reason: a
+        // Linux BUG through `Host::fatal`, a fault in Linux's code, a stop
+        // of Stela's Linux layer.
+        for reason in [
+            driver_stopped(
+                "kernel BUG at drivers/gpu/drm/nouveau/nvkm/subdev/gsp/r535.c:1290!",
+                None,
+                None,
+                None,
+            ),
+            String::from("page fault at 0x10 in Linux code, rip 0xffff80000123abcd"),
+            String::from("unsupported hrtimer mode; original timer retained"),
+        ] {
+            let stop = format!("{reason}; {named}");
+            assert!(stop.starts_with(&reason) && stop.contains("could draw in its place"));
+        }
+        // A fallback's turn, a later turn, a PC with no other GPU.
+        let fallback = Probing {
+            turn: ProbeTurn::Fallback,
+            beside: None,
+            gpu: "Intel UHD Graphics 770",
+            address: "0000:00:02.0",
+            driver: "i915",
+            ..probing
+        };
+        assert_eq!(
+            probe_stop(Some(&fallback), 0).unwrap(),
+            "it came while i915's probe of the Intel UHD Graphics 770 at 0000:00:02.0 ran, in the \
+             turn of GPUs started in place of GPUs that could not draw"
+        );
+        let later = Probing {
+            turn: ProbeTurn::Later,
+            ..probing
+        };
+        assert!(
+            probe_stop(Some(&later), 0)
+                .unwrap()
+                .contains("in the turn of GPUs that only show another's frames;")
+        );
+        // Outside a probe, or on another processor: as before.
+        assert_eq!(probe_stop(None, 0), None);
+        assert_eq!(probe_stop(Some(&probing), 3), None);
+    }
+
+    /// Where another GPU takes its place, the line says why the GPU did not
+    /// start: its probe and Linux's first error, in one screen line.
+    #[test]
+    fn an_unbound_gpu_another_replaces_says_why_in_one_line() {
+        let error = "nouveau 0000:01:00.0: gsp: init failed, -110";
+        assert_eq!(
+            unbound(
+                "NVIDIA GeForce RTX 5080",
+                "0000:01:00.0",
+                "nouveau",
+                Picture::ResetForClaim,
+                Some(error)
+            ),
+            "the NVIDIA GeForce RTX 5080 at 0000:01:00.0 did not start: its driver nouveau \
+             stopped in its probe: nouveau 0000:01:00.0: gsp: init failed, -110. The screen the \
+             PC started on is wired to it and stays dark: the GPU was reset for its driver. The \
+             boot log on this USB says more"
+        );
+        assert_eq!(
+            draws_instead(
+                "NVIDIA GeForce RTX 5080",
+                "Intel UHD Graphics 770",
+                Some("Metal could not open: DeviceLost")
+            ),
+            "the NVIDIA GeForce RTX 5080 could not draw for macOS: its Metal device did not open \
+             (Metal could not open: DeviceLost), so the Intel UHD Graphics 770 draws instead. \
+             The boot log on this USB says more"
+        );
+        // A short cause is kept whole, its final period and other lines
+        // left off.
+        assert_eq!(
+            one_line("  amdgpu: probe failed.\nmore\n"),
+            "amdgpu: probe failed"
+        );
+        assert_eq!(one_line("\n\nsecond"), "second");
+        // A long one is cut at a word, within one screen line.
+        let long = "amdgpu 0000:65:00.0: amdgpu: PSP load kdb failed! the firmware at \
+                    amdgpu/psp_13_0_4_toc.bin was refused with status 0x0000000a, ret -22, \
+                    while the ring was being created";
+        let cut = one_line(long);
+        assert!(cut.chars().count() <= CAUSE_COLUMNS, "{cut}");
+        assert!(cut.ends_with("..."), "{cut}");
+        assert!(long.starts_with(cut.trim_end_matches("...")), "{cut}");
+        assert!(!cut.trim_end_matches("...").ends_with(' '), "{cut}");
+        // Without a space to cut at, the characters are cut, on a character
+        // boundary.
+        let word = "\u{e9}".repeat(200);
+        assert_eq!(one_line(&word).chars().count(), CAUSE_COLUMNS);
+    }
+
+    /// An integrated GPU left too little of Linux's pages says how much it
+    /// has, in tenths of a gigabyte, and what that costs.
+    #[test]
+    fn a_starved_fallback_says_how_little_ram_it_has() {
+        assert_eq!(
+            fallback_starved("AMD Radeon Graphics", 328 << 20),
+            "the AMD Radeon Graphics draws in place of a GPU that could not with 0.3 GB of this \
+             PC's RAM for its memory; some windows may not draw"
+        );
+        assert!(fallback_starved("Intel UHD Graphics 770", 0).contains("with 0.0 GB"));
+        assert!(fallback_starved("Intel UHD Graphics 770", 1 << 30).contains("with 1.0 GB"));
     }
 
     #[test]
@@ -605,7 +880,7 @@ mod tests {
             "the NVIDIA GeForce GTX 1080 at 01:00.0 is not supported: Stela needs an NVIDIA \
              GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU"
         );
-        assert!(none(&[]).starts_with("this PC has no NVIDIA GPU: Stela needs"));
+        assert!(none(&[], &[Vendor::Nvidia]).starts_with("this PC has no NVIDIA GPU: Stela needs"));
     }
 
     #[test]
@@ -625,21 +900,31 @@ mod tests {
         };
         let amd = at(3, Vendor::Amd, 0x744c, 0xc8);
         let intel = at(0, Vendor::Intel, 0xa780, 4);
+        // QEMU's virtio GPU or a server's BMC display: no maker's name.
+        let other = at(1, Vendor::Other(0x1af4), 0x1050, 1);
+        // A build that drives NVIDIA GPUs alone names no other port.
         assert_eq!(
-            none(&[amd, intel]),
-            "this PC has no NVIDIA GPU, only the AMD Radeon RX 7900 XTX at 0000:03:00.0 and the \
-             Intel UHD Graphics 770 at 0000:00:00.0: Stela needs an NVIDIA GeForce GTX 16 or RTX \
-             20, 30, 40 or 50 series GPU"
+            none(&[amd, intel, other], &[Vendor::Nvidia]),
+            "this PC has no NVIDIA GPU, only the AMD Radeon RX 7900 XTX and the Intel UHD \
+             Graphics 770: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 or 50 series \
+             GPU"
         );
         assert_eq!(
-            unused(&amd),
-            "the AMD Radeon RX 7900 XTX at 0000:03:00.0 is not used: AMDGPU is not ported to \
-             Stela"
+            none(&[other], &[Vendor::Nvidia]),
+            "this PC has no NVIDIA GPU: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, 30, 40 \
+             or 50 series GPU"
         );
-        // QEMU's virtio GPU: no maker's name.
+        // One with the AMD and Intel ports says what else it drives.
         assert_eq!(
-            adapter(&at(1, Vendor::Other(0x1af4), 0x1050, 1)),
-            "the display adapter at 0000:01:00.0"
+            none(&[other], &[Vendor::Nvidia, Vendor::Amd, Vendor::Intel]),
+            "this PC has no GPU Stela drives: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, \
+             30, 40 or 50 series GPU, an AMD Radeon RX Vega or later GPU, or an Intel GPU from \
+             6th generation Core processors on"
+        );
+        assert_eq!(
+            none(&[], &[Vendor::Nvidia, Vendor::Amd]),
+            "this PC has no GPU Stela drives: Stela needs an NVIDIA GeForce GTX 16 or RTX 20, \
+             30, 40 or 50 series GPU, or an AMD Radeon RX Vega or later GPU"
         );
     }
 
@@ -660,14 +945,19 @@ mod tests {
         assert_eq!(started(None, &[], None), "started");
         assert_eq!(
             shows_only(amd, Some(nvidia)),
-            "the AMD Radeon Graphics only shows screens wired to it: the NVIDIA GeForce RTX 5080 \
-             draws"
+            "the AMD Radeon Graphics shows the picture on the screens wired to it"
         );
         assert!(shows_only("Intel Arc A770", None).ends_with("no Vulkan driver for it"));
         assert_eq!(
-            draws_instead(nvidia, amd),
-            "the NVIDIA GeForce RTX 5080 could not draw for macOS, so the AMD Radeon Graphics \
-             draws instead"
+            draws_instead(nvidia, amd, None),
+            "the NVIDIA GeForce RTX 5080 could not draw for macOS: its Metal device did not \
+             open, so the AMD Radeon Graphics draws instead. The boot log on this USB says why"
+        );
+        assert_eq!(
+            no_screen(nvidia, amd),
+            "No screen shows macOS yet: the screen the PC started on is wired to the NVIDIA \
+             GeForce RTX 5080, which did not start. Connect a screen to the AMD Radeon \
+             Graphics, and macOS shows on it"
         );
         assert_eq!(
             shown_by_copy(amd),
@@ -814,18 +1104,19 @@ mod tests {
             class: [3, 0, 0],
             revision: 0,
         };
-        // An RTX 4060 beside an Intel iGPU.
-        let found = [at(0, Vendor::Intel, 0xa780), at(1, Vendor::Nvidia, 0x2882)];
+        // An RTX 4060 claimed beside an Intel iGPU left with the firmware.
+        let claimed = [at(1, Vendor::Nvidia, 0x2882)];
         assert_eq!(
-            failed(&found, "GPU startup exceeded its deadline"),
+            failed(&claimed, "GPU startup exceeded its deadline"),
             "the NVIDIA GeForce RTX 4060 at 0000:01:00.0 could not start: GPU startup exceeded \
-             its deadline. macOS starts without it; the boot log on this USB says why"
+             its deadline. The boot log on this USB says why"
         );
-        assert!(failed(&[], "x").starts_with("the NVIDIA GPU could not start: x."));
-        // Without an NVIDIA GPU, the adapters a driver was started for.
-        assert!(
-            failed(&found[..1], "x")
-                .starts_with("the Intel UHD Graphics 770 at 0000:00:00.0 could not start: x."),
-        );
+        assert!(failed(&[], "x").starts_with("the GPU could not start: x."));
+        // Both, where both were claimed.
+        let both = [at(0, Vendor::Intel, 0xa780), claimed[0]];
+        assert!(failed(&both, "x").starts_with(
+            "the Intel UHD Graphics 770 at 0000:00:00.0 and the NVIDIA GeForce RTX 4060 at \
+                 0000:01:00.0 could not start: x."
+        ),);
     }
 }

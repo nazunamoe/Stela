@@ -38,10 +38,23 @@ pub fn bound(pages: usize) -> String {
     format!("ttm.pages_limit={pages}")
 }
 
-/// The firmware file xe's display code asks for the video BIOS table before
-/// it looks anywhere else (`intel_bios.c`).
-pub fn video_bios_table(file: &str) -> String {
-    format!("xe.vbt_firmware={file}")
+/// The firmware file the Intel display code of `driver` (`xe` or `i915`,
+/// each of which builds it as its own module's) asks for the video BIOS
+/// table before it looks anywhere else (`intel_bios.c`).
+pub fn video_bios_table(driver: &str, file: &str) -> String {
+    format!("{driver}.vbt_firmware={file}")
+}
+
+/// An empty path for the HuC image of Intel `driver` (`xe` or `i915`),
+/// which turns its media controller off (`xe_uc_fw.c`, `intel_uc_fw.c`).
+pub fn without_huc(driver: &str) -> String {
+    format!("{driver}.huc_firmware_path=")
+}
+
+/// An empty path for the GSC image of Intel `driver`, which turns its
+/// security controller off.
+pub fn without_gsc(driver: &str) -> String {
+    format!("{driver}.gsc_firmware_path=")
 }
 
 /// Whether a parameter the image registers takes `word`. Linux matches
@@ -72,9 +85,20 @@ mod tests {
     #[test]
     fn every_word_the_boot_builds_is_registered() {
         let mut words = vec![page_limit(655_360), bound(224_256)];
-        // Only an image with xe holds xe's parameters.
-        if cfg!(feature = "xe-port") {
-            words.push(video_bios_table("intel/vbt.bin"));
+        // Only an image with an Intel driver holds its parameters: its own
+        // (i915's in `i915_params.c`, xe's in `xe_module.c`) and those of the
+        // display code it builds.
+        for (driver, built) in [
+            ("xe", cfg!(feature = "xe-port")),
+            ("i915", cfg!(feature = "i915-port")),
+        ] {
+            if built {
+                words.extend([
+                    video_bios_table(driver, "intel/vbt.bin"),
+                    without_huc(driver),
+                    without_gsc(driver),
+                ]);
+            }
         }
         let (line, left_out) = compose(words.clone());
         assert!(

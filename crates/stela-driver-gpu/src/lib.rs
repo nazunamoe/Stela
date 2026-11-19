@@ -13,8 +13,14 @@ pub mod metal;
 
 #[cfg(feature = "amdgpu-port")]
 pub mod amdgpu;
+#[cfg(any(feature = "xe-port", feature = "i915-port"))]
+pub mod anv;
 #[cfg(feature = "linux-drm")]
 pub mod command_line;
+#[cfg(feature = "i915-port")]
+pub mod i915;
+#[cfg(any(feature = "xe-port", feature = "i915-port"))]
+pub mod intel_stolen;
 #[cfg(feature = "xe-port")]
 pub mod xe;
 
@@ -24,6 +30,7 @@ pub mod gsp_perf;
 pub mod names;
 pub mod nouveau_chip;
 pub mod selection;
+pub mod share;
 pub mod stack;
 
 #[cfg(feature = "linux-kernel")]
@@ -112,7 +119,7 @@ impl Adapter {
         })
     }
 
-    /// Its market name, or its maker and IDs ([`names::name`]).
+    /// Its market name, or its maker alone ([`names::name`]).
     pub fn name(&self) -> alloc::string::String {
         names::name(self.vendor, self.device, self.revision)
     }
@@ -122,10 +129,7 @@ impl Adapter {
         match self.vendor {
             Vendor::Nvidia => "NVIDIA requires nouveau/GSP binding and an NVK-enabled image",
             Vendor::Amd => "AMDGPU is not ported to Stela",
-            Vendor::Intel => {
-                "it needs Linux's i915 driver, which Stela does not have: its xe driver runs \
-                 Tiger Lake and later"
-            }
+            Vendor::Intel => "no driver here runs Stela's Metal device on this Intel GPU",
             Vendor::Other(_) => "no Stela GPU backend for this PCI vendor",
         }
     }

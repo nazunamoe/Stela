@@ -173,6 +173,25 @@ pub const HEAP_OWN: u64 = 2424 * MIB;
 /// code window).
 pub const PAGES_LEAST: u64 = 384 * MIB;
 
+/// What an integrated GPU's Linux driver and RADV held of Linux's pages at
+/// its Metal device's first allocation (AMD, with a 2 to 2.5 GiB share).
+pub const FALLBACK_OPEN: u64 = 480 * MIB;
+
+/// Linux's pages an integrated GPU needs to draw a desktop in place of a
+/// discrete GPU that did not start: [`FALLBACK_OPEN`], and the least share
+/// Stela boots an integrated GPU's Metal device with ([`GPU_LEAST`]), in
+/// whole 256 MiB. Where such a GPU may draw
+/// instead ([`GpuPlan::fallback`]), the plan makes the heap region hold this
+/// past [`HEAP_OWN`] ([`Sizes::fallback`]), as far as the guest's floor
+/// allows.
+pub const FALLBACK_LEAST: u64 = 768 * MIB;
+
+/// The least of Linux's pages an integrated GPU needs free under their bound
+/// for its driver to bind it at all: what one that only shows the display
+/// takes ([`DISPLAY_SHARE`]). With less, a fallback to it is refused
+/// ([`fallback_pages`]).
+pub const FALLBACK_START: u64 = DISPLAY_SHARE;
+
 /// The page tables a driver's mapping of a whole device-memory aperture of
 /// `bytes` takes from the heap: Stela's page window maps device memory in
 /// 4 KiB pages, an 8-byte entry each (`bytes / 512`, 32 MiB for 16 GiB),
@@ -200,6 +219,15 @@ pub struct GpuPlan {
     /// bound: a bound measured beside another driver could fail a session
     /// that ran.
     pub bounded: bool,
+    /// An integrated GPU this image draws with stands beside the discrete
+    /// GPU the plan gives the Metal device, and draws in its place should it
+    /// not start (`selection::integrated_may_draw_instead`): where no share
+    /// is planned, the heap region is made to hold [`FALLBACK_LEAST`] of
+    /// Linux's pages past [`HEAP_OWN`] ([`Sizes::fallback`]), and the engine
+    /// holds Linux's pages to [`page_bound`] once it draws
+    /// ([`fallback_pages`]). False in an image without such a GPU's driver,
+    /// which plans as before.
+    pub fallback: bool,
 }
 
 impl From<GpuMemory> for GpuPlan {
@@ -208,6 +236,7 @@ impl From<GpuMemory> for GpuPlan {
             memory,
             aperture: 0,
             bounded: false,
+            fallback: false,
         }
     }
 }
@@ -224,13 +253,159 @@ pub fn page_bound(sizes: &Sizes, memory: GpuMemory) -> u64 {
     match memory {
         GpuMemory::Shared => sizes.gpu,
         GpuMemory::Own | GpuMemory::Display => {
-            (sizes.heap + sizes.gpu)
-                .saturating_sub(HEAP_OWN)
-                .max(PAGES_LEAST)
-                .min(sizes.heap + sizes.gpu)
-                / ALIGNMENT
-                * ALIGNMENT
+            let region = sizes.heap + sizes.gpu + sizes.fallback;
+            region.saturating_sub(HEAP_OWN).max(PAGES_LEAST).min(region) / ALIGNMENT * ALIGNMENT
         }
+    }
+}
+
+/// What the engine does with Linux's pages once an integrated GPU is to
+/// draw in place of a GPU that could not ([`fallback_pages`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackPages {
+    /// Linux's pages are held to `limit` bytes already (an integrated GPU's
+    /// share, or a plan that holds them), with `room` of it free.
+    Held { limit: u64, room: u64 },
+    /// The plan held Linux's pages to no bound: they are held to `limit`
+    /// bytes from now on, before the integrated GPU's driver sizes its
+    /// memory from the RAM Linux reports, with `room` of it free.
+    Hold { limit: u64, room: u64 },
+    /// Linux holds `held` bytes of the `bound` already, which leaves less
+    /// than [`FALLBACK_START`] for the integrated GPU's driver: the fallback
+    /// to it is refused, as its start could only fail.
+    Short { held: u64, bound: u64 },
+    /// An integrated GPU started already draws, and Linux holds `held`
+    /// bytes, past the `bound`: its pages stay unbounded, and the GPU's
+    /// Metal device alone budgets its allocations to the bound
+    /// ([`drawing_pages`]).
+    Over { held: u64, bound: u64 },
+}
+
+impl FallbackPages {
+    /// The bytes Linux's pages are held to from now on, where the fallback
+    /// goes on.
+    pub fn limit(self) -> Option<u64> {
+        match self {
+            Self::Held { limit, .. } | Self::Hold { limit, .. } => Some(limit),
+            Self::Short { .. } | Self::Over { .. } => None,
+        }
+    }
+
+    /// The bytes of the limit free for the integrated GPU, where the
+    /// fallback goes on.
+    pub fn room(self) -> Option<u64> {
+        match self {
+            Self::Held { room, .. } | Self::Hold { room, .. } => Some(room),
+            Self::Short { .. } | Self::Over { .. } => None,
+        }
+    }
+
+    /// Whether the integrated GPU's Metal device, once its driver holds
+    /// [`FALLBACK_OPEN`] more, tells the guest a working set under half of
+    /// [`GPU_LEAST`] (`share::working_set`): it draws, and some windows may
+    /// not.
+    pub fn starved(self) -> bool {
+        use stela_drivers::gpu::share::{ShareState, working_set};
+        match self {
+            Self::Held { limit, room } | Self::Hold { limit, room } => {
+                let held = limit - room + FALLBACK_OPEN;
+                working_set(ShareState { held, limit }) < GPU_LEAST / 2
+            }
+            Self::Short { .. } | Self::Over { .. } => false,
+        }
+    }
+
+    /// The `GPU MEMORY` line's words, after the GPU's address.
+    pub fn describe(self) -> alloc::string::String {
+        let mib = |bytes: u64| bytes >> 20;
+        let desktop = match self.starved() {
+            true => alloc::format!(
+                ", little past the {}M its driver holds as its Metal device opens, so some \
+                 windows may not draw",
+                mib(FALLBACK_OPEN)
+            ),
+            false => alloc::string::String::new(),
+        };
+        match self {
+            Self::Held { limit, room } => alloc::format!(
+                "draws in place of a GPU that could not, in Linux's pages, held to {}M as \
+                 planned: {}M of them free{desktop}",
+                mib(limit),
+                mib(room)
+            ),
+            Self::Hold { limit, room } => alloc::format!(
+                "draws in place of a GPU that could not: Linux's pages, which the plan left \
+                 unbounded for the discrete GPU, are held from now on to {}M, what the heap \
+                 holds past its own {}M, so the integrated GPU cannot take the heap's own: {}M \
+                 of them free{desktop}",
+                mib(limit),
+                mib(HEAP_OWN),
+                mib(room)
+            ),
+            Self::Short { held, bound } => alloc::format!(
+                "not started in place of a GPU that could not draw: Linux holds {}M of the {}M \
+                 of pages the heap holds past its own {}M, which leaves under the {}M its \
+                 driver needs to start",
+                mib(held),
+                mib(bound),
+                mib(HEAP_OWN),
+                mib(FALLBACK_START)
+            ),
+            Self::Over { held, bound } => alloc::format!(
+                "draws in place of a GPU that could not, while Linux holds {}M of pages, past \
+                 the {}M the heap holds past its own {}M: they stay unbounded, and its Metal \
+                 device alone budgets its allocations to them",
+                mib(held),
+                mib(bound),
+                mib(HEAP_OWN)
+            ),
+        }
+    }
+}
+
+/// Linux's pages once an integrated GPU is to draw in place of a GPU that
+/// could not, with `bound` the plan's [`page_bound`] (or the share), `held`
+/// the bytes Linux holds now and `limit` the bytes it is held to now, zero
+/// for none: a plan that held Linux to no bound (beside nouveau, whose
+/// heap need was not measured) holds it to `bound` from now on, so that the
+/// integrated GPU's pages, which its driver sizes from the RAM Linux
+/// reports, never take the heap's own and the worst is its Metal device's
+/// out-of-memory answer; where too little is left for its driver to start,
+/// the fallback is refused ([`FallbackPages::Short`]).
+pub fn fallback_pages(bound: u64, held: u64, limit: u64) -> FallbackPages {
+    let limit_now = match limit {
+        0 => bound,
+        limit => limit,
+    };
+    let room = limit_now.saturating_sub(held);
+    if room < FALLBACK_START {
+        return FallbackPages::Short {
+            held,
+            bound: limit_now,
+        };
+    }
+    match limit {
+        0 => FallbackPages::Hold { limit: bound, room },
+        limit => FallbackPages::Held { limit, room },
+    }
+}
+
+/// [`fallback_pages`] for an integrated GPU started already, which draws
+/// now in place of a GPU that could not: its driver bound it, so nothing is
+/// refused; a plan that held Linux to no bound holds it to `bound` from now
+/// on wherever Linux holds no more than that ([`FallbackPages::Over`]
+/// otherwise).
+pub fn drawing_pages(bound: u64, held: u64, limit: u64) -> FallbackPages {
+    match limit {
+        0 if held > bound => FallbackPages::Over { held, bound },
+        0 => FallbackPages::Hold {
+            limit: bound,
+            room: bound - held,
+        },
+        limit => FallbackPages::Held {
+            limit,
+            room: limit.saturating_sub(held),
+        },
     }
 }
 
@@ -323,6 +498,28 @@ impl GpuPlan {
                 mib(bound)
             ),
         };
+        let rule = match (self.fallback, self.memory) {
+            (false, _) | (true, GpuMemory::Shared) => rule,
+            (true, _) => alloc::format!(
+                "{rule}; an integrated GPU this image draws with may draw in the discrete GPU's \
+                 place, Linux's pages then held to {}M{}",
+                mib(bound),
+                match (sizes.fallback, bound >= FALLBACK_LEAST) {
+                    (0, true) => alloc::string::String::new(),
+                    (more, true) => alloc::format!(
+                        ", for which the heap takes {}M more, to hold the {}M it needs",
+                        mib(more),
+                        mib(FALLBACK_LEAST)
+                    ),
+                    (more, false) => alloc::format!(
+                        ", under the {}M it needs, as the heap takes only {}M more and the guest \
+                         keeps its floor",
+                        mib(FALLBACK_LEAST),
+                        mib(more)
+                    ),
+                }
+            ),
+        };
         if sizes.aperture == 0 {
             return rule;
         }
@@ -353,6 +550,13 @@ pub struct Sizes {
     /// ([`GpuPlan::aperture`]), reserved beside the heap and taken from the
     /// same region.
     pub aperture: u64,
+    /// What the heap region takes beyond the heap and `gpu` so that it
+    /// holds [`FALLBACK_LEAST`] of Linux's pages past [`HEAP_OWN`], for an
+    /// integrated GPU that may draw in a discrete GPU's place
+    /// ([`GpuPlan::fallback`]), as much as the guest's floor allows; part of
+    /// the heap's region, which the heap uses while no such GPU draws. Zero
+    /// without such a GPU, and where the heap holds it already.
+    pub fallback: u64,
 }
 
 /// The DRAM the guest Mac reports and the host RAM it does not see.
@@ -468,17 +672,26 @@ pub fn sizes(free: u64, cores: usize, runners: usize, gpu: impl Into<GpuPlan>) -
 /// [`sizes`], or `None` where the guest's floor (and the GPU's least
 /// share) does not fit.
 fn plan(free: u64, cores: usize, runners: usize, gpu: GpuPlan) -> Result<Option<Sizes>> {
-    let with_share = |share: u64| -> Result<Option<Sizes>> {
+    let with_room = |share: u64, fallback: u64| -> Result<Option<Sizes>> {
         let sizes = estimate(
-            free.saturating_sub(share).saturating_sub(gpu.aperture),
+            free.saturating_sub(share)
+                .saturating_sub(gpu.aperture)
+                .saturating_sub(fallback),
             cores,
             runners,
         )?;
         Ok((sizes.guest >= GUEST_FLOOR).then_some(Sizes {
             gpu: share,
             aperture: gpu.aperture,
+            fallback,
             ..sizes
         }))
+    };
+    let with_share = |share: u64| -> Result<Option<Sizes>> {
+        match gpu.fallback {
+            false => with_room(share, 0),
+            true => with_fallback(share, &with_room),
+        }
     };
     let target = match gpu.memory {
         GpuMemory::Own => return with_share(0),
@@ -490,6 +703,7 @@ fn plan(free: u64, cores: usize, runners: usize, gpu: GpuPlan) -> Result<Option<
             return Ok(with_share(DISPLAY_SHARE)?.or(with_share(0)?));
         }
     };
+    let with_share = |share: u64| with_room(share, 0);
     // The most share up to the target that leaves the guest its floor, in
     // whole alignments; the guest grows with the RAM the parts are sized
     // for, so the first found from the top is the most.
@@ -501,6 +715,51 @@ fn plan(free: u64, cores: usize, runners: usize, gpu: GpuPlan) -> Result<Option<
         share -= ALIGNMENT;
     }
     Ok(None)
+}
+
+/// What the heap region lacks of [`HEAP_OWN`] and [`FALLBACK_LEAST`] beside
+/// `share` for sizes `sizes`, in whole alignments.
+fn fallback_lack(sizes: &Sizes, share: u64) -> u64 {
+    (HEAP_OWN + FALLBACK_LEAST)
+        .saturating_sub(sizes.heap + share)
+        .next_multiple_of(ALIGNMENT)
+}
+
+/// The plan with `share` beside the heap and room in the heap's region for
+/// an integrated GPU that may draw in a discrete GPU's place: what the heap
+/// and the share lack of [`HEAP_OWN`] and [`FALLBACK_LEAST`], found as the
+/// heap shrinks with the RAM the reserve takes, or the most of it that
+/// leaves the guest its floor; `with_room` plans a share and a reserve.
+fn with_fallback(
+    share: u64,
+    with_room: &dyn Fn(u64, u64) -> Result<Option<Sizes>>,
+) -> Result<Option<Sizes>> {
+    let Some(mut sizes) = with_room(share, 0)? else {
+        return Ok(None);
+    };
+    // The heap shrinks, or stays, as the reserve grows, so the lack grows
+    // to a fixed point from below, at most the whole of it.
+    let mut reserve = 0;
+    for _ in 0..=(HEAP_OWN + FALLBACK_LEAST) / ALIGNMENT {
+        let lack = fallback_lack(&sizes, share);
+        if lack <= reserve {
+            return Ok(Some(sizes));
+        }
+        reserve = lack;
+        match with_room(share, reserve)? {
+            Some(next) => sizes = next,
+            None => break,
+        }
+    }
+    // The whole reserve leaves the guest under its floor: the most that
+    // does not.
+    while reserve > ALIGNMENT {
+        reserve -= ALIGNMENT;
+        if let Some(sizes) = with_room(share, reserve)? {
+            return Ok(Some(sizes));
+        }
+    }
+    with_room(share, 0)
 }
 
 /// The bytes of persistent translation pack the loader may read for
@@ -518,10 +777,18 @@ pub fn pack_budget(free: u64, cores: usize, runners: usize, gpu: impl Into<GpuPl
     let mut budget = free / PACK_SHARE / ALIGNMENT * ALIGNMENT;
     while budget >= PACK_FLOOR {
         let mut left = free.saturating_sub(budget + PACK_MARGIN + gpu.aperture);
-        match gpu.memory {
-            GpuMemory::Shared => left = left.saturating_sub(gpu_target(left)),
-            GpuMemory::Display => left = left.saturating_sub(DISPLAY_SHARE),
-            GpuMemory::Own => {}
+        let share = match gpu.memory {
+            GpuMemory::Shared => gpu_target(left),
+            GpuMemory::Display => DISPLAY_SHARE,
+            GpuMemory::Own => 0,
+        };
+        left = left.saturating_sub(share);
+        // The room for an integrated GPU that may draw in a discrete one's
+        // place comes before the pack too.
+        if gpu.fallback && gpu.memory != GpuMemory::Shared {
+            let lack =
+                estimate(left, cores, runners).map_or(0, |sizes| fallback_lack(&sizes, share));
+            left = left.saturating_sub(lack);
         }
         if estimate_guest(left, cores, runners).is_ok_and(|guest| guest >= GUEST_FLOOR) {
             return budget;
@@ -645,6 +912,7 @@ fn split(free: u64, heap: u64, code: CodeReservation, cores: usize, runners: usi
         guest: rest.saturating_sub(pool),
         gpu: 0,
         aperture: 0,
+        fallback: 0,
     }
 }
 

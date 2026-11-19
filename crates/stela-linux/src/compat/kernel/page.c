@@ -11,6 +11,9 @@
 #include <linux/irqflags.h>
 #include <linux/limits.h>
 #include <linux/mm.h>
+#include <linux/mutex.h>
+#include <linux/notifier.h>
+#include <linux/oom.h>
 #include <linux/poison.h>
 #include <linux/printk.h>
 #include <linux/preempt.h>
@@ -158,6 +161,13 @@ static void publish_memory_inventory(unsigned long start_pfn, unsigned long end_
 void si_meminfo(struct sysinfo *info)
 {
 	*info = (struct sysinfo){.totalram = totalram_pages(), .mem_unit = PAGE_SIZE};
+}
+
+/* The RAM Linux sees, in pages, as si_meminfo reports it: a plain read for
+ * any processor. */
+u64 stela_linux_ram_pages(void)
+{
+	return totalram_pages();
 }
 
 #ifdef STELA_LINUX_PAGE_TEST
@@ -1314,7 +1324,59 @@ int stela_linux_page_stack_retire(const struct stela_linux_stack_ticket *ticket,
     return stack_remove(ticket, record);
 }
 
-static bool reclaim_catalog_pages(gfp_t gfp)
+/* mm/oom_kill.c's out-of-memory notifiers. Linux calls them from
+ * out_of_memory after reclaim found nothing and before it would kill a task;
+ * Stela kills no task, so a failed allocation then returns NULL. */
+static struct notifier_block *oom_notifiers;
+static DEFINE_MUTEX(oom_notifiers_mutex);
+
+int register_oom_notifier(struct notifier_block *nb)
+{
+	struct notifier_block **link = &oom_notifiers;
+
+	mutex_lock(&oom_notifiers_mutex);
+	while (*link && (*link)->priority >= nb->priority)
+		link = &(*link)->next;
+	nb->next = *link;
+	*link = nb;
+	mutex_unlock(&oom_notifiers_mutex);
+	return 0;
+}
+
+int unregister_oom_notifier(struct notifier_block *nb)
+{
+	struct notifier_block **link = &oom_notifiers;
+	int error = -ENOENT;
+
+	mutex_lock(&oom_notifiers_mutex);
+	for (; *link; link = &(*link)->next)
+		if (*link == nb) {
+			*link = nb->next;
+			error = 0;
+			break;
+		}
+	mutex_unlock(&oom_notifiers_mutex);
+	return error;
+}
+
+/* __alloc_pages_may_oom's rule: costly orders and requests that may fail
+ * without retrying do not reach out_of_memory. */
+static unsigned long notify_oom(gfp_t gfp, unsigned int order)
+{
+	unsigned long freed = 0;
+
+	if (order > PAGE_ALLOC_COSTLY_ORDER ||
+	    (gfp & (__GFP_NORETRY | __GFP_RETRY_MAYFAIL | __GFP_THISNODE)))
+		return 0;
+	mutex_lock(&oom_notifiers_mutex);
+	for (struct notifier_block *nb = oom_notifiers; nb; nb = nb->next)
+		if (nb->notifier_call(nb, 0, &freed) & NOTIFY_STOP_MASK)
+			break;
+	mutex_unlock(&oom_notifiers_mutex);
+	return freed;
+}
+
+static bool reclaim_catalog_pages(gfp_t gfp, unsigned int order)
 {
 	if (!catalog.kernel_roots || !gfpflags_allow_blocking(gfp) ||
 	    !stela_linux_quiescent())
@@ -1335,6 +1397,8 @@ static bool reclaim_catalog_pages(gfp_t gfp)
 	/* Only slab reclaim is available here. Make one pressure pass using
 	 * the original shrinker budgets, outside provider and record custody. */
 	unsigned long reclaimed = shrink_slab(gfp, 0, NULL, 0);
+	if (!reclaimed)
+		reclaimed = notify_oom(gfp, order);
 	if (!stela_linux_quiescent() || !stela_linux_lease_matches(&lease) ||
 	    current != task)
 		__builtin_trap();
@@ -1473,7 +1537,7 @@ retry:
 	return page;
 
 exhausted:
-	if (!retried && reclaim_catalog_pages(gfp)) {
+	if (!retried && reclaim_catalog_pages(gfp, order)) {
 		retried = true;
 		goto retry;
 	}

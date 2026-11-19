@@ -138,6 +138,25 @@ pub fn window(selected: usize, count: usize, fits: usize) -> usize {
         .min(count.saturating_sub(fits))
 }
 
+/// A finished step's text, as the screen and the log's `STEP` line give it:
+/// its title, where a failed step was (`at`, as the PCI function a probe
+/// stopped in), then its result, which may be empty, and its whole seconds
+/// when there are any: "Starting the GPU (NVIDIA GeForce RTX 5080, 9 s)".
+pub fn finished_step(title: &str, at: Option<&str>, result: &str, seconds: u64) -> String {
+    let mut text = String::from(title);
+    if let Some(at) = at.filter(|at| !at.is_empty()) {
+        text.push_str(" at ");
+        text.push_str(at);
+    }
+    match (result.is_empty(), seconds) {
+        (true, 0) => {}
+        (true, seconds) => text.push_str(&format!(" ({seconds} s)")),
+        (false, 0) => text.push_str(&format!(" ({result})")),
+        (false, seconds) => text.push_str(&format!(" ({result}, {seconds} s)")),
+    }
+    text
+}
+
 /// `completed` of `total` as a percentage rounded down, so 100 needs
 /// completion; `None` for an unknown or inconsistent total. Wide
 /// intermediates keep full-width byte counts exact.
@@ -394,6 +413,30 @@ mod tests {
         assert_eq!(window(5, 10, 4), 2);
         assert_eq!(window(9, 10, 4), 6);
         assert_eq!(window(1, 2, 4), 0);
+    }
+
+    #[test]
+    fn a_finished_step_carries_its_result_and_seconds() {
+        assert_eq!(
+            finished_step("Starting the GPU", None, "", 0),
+            "Starting the GPU"
+        );
+        assert_eq!(
+            finished_step("Starting the GPU", None, "", 9),
+            "Starting the GPU (9 s)"
+        );
+        assert_eq!(
+            finished_step("Starting the GPU", None, "NVIDIA GeForce RTX 5080", 0),
+            "Starting the GPU (NVIDIA GeForce RTX 5080)"
+        );
+        assert_eq!(
+            finished_step("Starting the GPU", Some(""), "NVIDIA GeForce RTX 5080", 9),
+            "Starting the GPU (NVIDIA GeForce RTX 5080, 9 s)"
+        );
+        assert_eq!(
+            finished_step("Probing PCI", Some("0000:03:00.0"), "stopped", 2),
+            "Probing PCI at 0000:03:00.0 (stopped, 2 s)"
+        );
     }
 
     #[test]

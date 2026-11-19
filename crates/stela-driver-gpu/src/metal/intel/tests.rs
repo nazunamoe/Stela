@@ -28,6 +28,7 @@ fn attachment(external: bool) -> Attachment {
     }
 }
 
+#[cfg(feature = "xe-port")]
 #[test]
 fn an_integrated_gpu_is_built_in_with_xes_platform_name() {
     let platform = admit_device(&tiger_lake(), 0x9a49, attachment(false)).unwrap();
@@ -47,6 +48,7 @@ fn an_integrated_gpu_is_built_in_with_xes_platform_name() {
     assert_eq!(platform.sparse_page_bytes, 64 << 10);
 }
 
+#[cfg(feature = "xe-port")]
 #[test]
 fn a_discrete_gpu_is_in_a_slot_or_external_with_its_link() {
     let mut arc = tiger_lake();
@@ -71,6 +73,7 @@ fn a_discrete_gpu_is_in_a_slot_or_external_with_its_link() {
     );
 }
 
+#[cfg(feature = "xe-port")]
 #[test]
 fn other_devices_and_drivers_are_refused_with_the_reason() {
     let identity = tiger_lake();
@@ -111,5 +114,52 @@ fn other_devices_and_drivers_are_refused_with_the_reason() {
         Some(open::Refusal::Intel(Refusal::NotGpu(
             PhysicalDeviceType::Cpu
         )))
+    );
+}
+
+#[cfg(feature = "i915-port")]
+#[test]
+fn the_gpus_i915_is_handed_are_admitted_with_i915s_platform_name() {
+    // Ice Lake's Iris Plus Graphics G7, as ANV reports it over i915.
+    let mut ice_lake = tiger_lake();
+    ice_lake.device_id = 0x8a52;
+    let platform = admit_i915_device(&ice_lake, 0x8a52, attachment(false)).unwrap();
+    assert_eq!(platform.architecture, "ICELAKE");
+    assert_eq!(platform.location, DeviceLocation::BuiltIn);
+    assert!(!platform.headless && platform.max_transfer_rate == 0);
+    // Skylake's HD Graphics 520.
+    let mut skylake = tiger_lake();
+    skylake.device_id = 0x1916;
+    assert_eq!(
+        admit_i915_device(&skylake, 0x1916, attachment(false))
+            .unwrap()
+            .architecture,
+        "SKYLAKE"
+    );
+    // Tiger Lake, which i915 is offered first.
+    assert_eq!(
+        admit_i915_device(&tiger_lake(), 0x9a49, attachment(false))
+            .unwrap()
+            .architecture,
+        "TIGERLAKE"
+    );
+    // Broadwell, which no driver is handed, and an ID of no table are no
+    // devices of i915's here.
+    for device in [0x1616, 0x0001] {
+        let mut other = tiger_lake();
+        other.device_id = device;
+        assert_eq!(
+            admit_i915_device(&other, device, attachment(false)).err(),
+            Some(Refusal::UnknownDevice { device }),
+            "{device:04x}"
+        );
+    }
+    let mut broadwell = tiger_lake();
+    broadwell.device_id = 0x1616;
+    assert_eq!(
+        (I915_ADMISSION.admit)(&broadwell, 0x1616, attachment(false)).err(),
+        Some(open::Refusal::Intel(Refusal::UnknownDevice {
+            device: 0x1616
+        }))
     );
 }

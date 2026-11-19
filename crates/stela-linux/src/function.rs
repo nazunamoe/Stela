@@ -32,6 +32,7 @@ const PAGE_BYTES: u64 = 1 << PAGE_SHIFT;
 const PCIBIOS_BAD_REGISTER_NUMBER: c_int = 0x87;
 const PCIBIOS_SET_FAILED: c_int = 0x88;
 const EIO: Errno = -5;
+const EOPNOTSUPP: Errno = -95;
 
 static QUARANTINED_MAPPINGS: AtomicU64 = AtomicU64::new(0);
 static QUARANTINED_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -77,6 +78,22 @@ pub trait Host {
     /// Move the function's interrupt from its line to a message.
     fn enable_msi(&mut self) -> Result<(), MsiError>;
     fn disable_msi(&mut self) -> Result<(), MsiError>;
+    /// Whether the owner routes the function's MSI-X table; one that does
+    /// not leaves Linux to see the function without the capability.
+    fn routes_msix(&self) -> bool {
+        false
+    }
+    /// Set up to `vectors` entries of the MSI-X table, each masked until its
+    /// line is enabled, on consecutive lines: the first line and how many it
+    /// set up, fewer where its lines run out. Called again while enabled,
+    /// it writes the same entries back, as after a reset. `vectors` 0 sets
+    /// up nothing and answers how many it could, with any first line.
+    fn enable_msix(&mut self, _vectors: u32) -> Result<(u32, u32), MsiError> {
+        Err(MsiError::Native(EOPNOTSUPP))
+    }
+    fn disable_msix(&mut self) -> Result<(), MsiError> {
+        Ok(())
+    }
 }
 
 /// A memory BAR where its owner placed it. `flags` holds Linux's `IORESOURCE_*`.
@@ -216,10 +233,13 @@ struct RawFunction {
     rom_bar: Region,
     upstream: *const Port,
     upstream_count: usize,
+    enable_msix: Option<unsafe extern "C" fn(*mut c_void, c_uint, *mut c_uint) -> c_int>,
+    disable_msix: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
-const _: () = assert!(size_of::<RawFunction>() == 296);
+const _: () = assert!(size_of::<RawFunction>() == 312);
 const _: () = assert!(core::mem::offset_of!(RawFunction, upstream) == 280);
+const _: () = assert!(core::mem::offset_of!(RawFunction, enable_msix) == 296);
 const _: () = assert!(core::mem::offset_of!(RawFunction, rom_bar) == 256);
 const _: () = assert!(core::mem::offset_of!(RawFunction, rom_length) == 248);
 const _: () = assert!(core::mem::offset_of!(RawFunction, enroll) == 232);
@@ -244,7 +264,8 @@ pub struct Identity {
 const _: () = assert!(size_of::<Identity>() == 20);
 
 /// A function presented to Linux for other drivers' searches only: no
-/// driver binds it and it has no configuration, resources, interrupt or DMA.
+/// driver binds it and it has no resources, interrupt or DMA. Its
+/// configuration is at most a copy its owner read ([`Published::snapshot`]).
 pub struct Published {
     device: NonNull<c_void>,
 }
@@ -260,6 +281,26 @@ impl Published {
             .map(|device| Self { device })
             .ok_or(error)
     }
+
+    /// As [`Self::new`], with a copy of the first bytes of the function's
+    /// configuration (at most 256), which a driver's reads then answer.
+    ///
+    /// # Safety
+    /// As [`Self::new`].
+    pub unsafe fn snapshot(identity: Identity, configuration: &[u8]) -> Result<Self, Errno> {
+        let mut error: c_int = 0;
+        // SAFETY: the caller's contract; C copies the identity and bytes.
+        NonNull::new(unsafe {
+            stela_linux_pci_publish_snapshot(
+                &identity,
+                configuration.as_ptr(),
+                configuration.len(),
+                &raw mut error,
+            )
+        })
+        .map(|device| Self { device })
+        .ok_or(error)
+    }
 }
 
 impl Drop for Published {
@@ -270,15 +311,36 @@ impl Drop for Published {
     }
 }
 
+/// Sets the graphics memory the firmware reserved for an integrated Intel
+/// GPU (`intel_graphics_stolen_res`), as Linux's x86 early quirks would
+/// have found it, for i915, or xe before graphics 12.70, to read during its
+/// probe.
+///
+/// # Safety
+/// In an entered Linux owner, before any driver registers.
+pub unsafe fn set_graphics_stolen(base: u64, size: u64) {
+    // SAFETY: the caller's contract; nothing reads the resource yet.
+    unsafe { stela_linux_set_graphics_stolen(base, size) }
+}
+
 unsafe extern "C" {
+    fn stela_linux_set_graphics_stolen(base: u64, size: u64);
     fn stela_linux_pci_attach(function: *const RawFunction, error: *mut c_int) -> *mut c_void;
     fn stela_linux_pci_publish_identity(
         identity: *const Identity,
         error: *mut c_int,
     ) -> *mut c_void;
+    fn stela_linux_pci_publish_snapshot(
+        identity: *const Identity,
+        config: *const u8,
+        length: usize,
+        error: *mut c_int,
+    ) -> *mut c_void;
     fn stela_linux_owner() -> *const super::owner::RawOwner;
     fn stela_linux_pci_bound(device: *const c_void) -> bool;
+    fn stela_linux_pci_driver_name(device: *const c_void) -> *const c_char;
     fn stela_linux_pci_shutdown(device: *mut c_void);
+    fn stela_linux_pci_release(device: *mut c_void) -> bool;
     fn stela_linux_pci_remove_device(device: *mut c_void);
     fn stela_linux_pci_quarantined_functions() -> u64;
     fn stela_linux_pci_screen_ended_at(bus: c_uint, devfn: c_uint) -> *const c_char;
@@ -695,6 +757,54 @@ unsafe extern "C" fn enable_msi<H: Host>(context: *mut c_void) -> c_int {
         }
     }
 }
+unsafe extern "C" fn enable_msix<H: Host>(
+    context: *mut c_void,
+    vectors: c_uint,
+    first: *mut c_uint,
+) -> c_int {
+    // SAFETY: exact live callback state in its entered owner.
+    let state = unsafe { state::<H>(context) };
+    // SAFETY: prevent further endpoint effects after an uncertain access.
+    unsafe { state.require_admission() };
+    match state.host.enable_msix(vectors) {
+        Ok((line, count)) if vectors == 0 || count <= vectors => {
+            // SAFETY: C passes its own output word for this call.
+            unsafe { first.write(line) };
+            count as c_int
+        }
+        Ok(_) => EIO,
+        Err(error) => {
+            state.configuration.msi.get_or_insert(error);
+            match error {
+                MsiError::Config(error) => {
+                    // SAFETY: record exact cause, trapping first if write uncertain.
+                    unsafe { state.config_failed(error) };
+                    EIO
+                }
+                MsiError::Native(error) if error < 0 => error,
+                MsiError::Native(_) => EIO,
+            }
+        }
+    }
+}
+unsafe extern "C" fn disable_msix<H: Host>(context: *mut c_void) {
+    // SAFETY: exact live callback state in its entered owner.
+    let state = unsafe { state::<H>(context) };
+    // SAFETY: void C completion cannot retire an uncertain source.
+    unsafe { state.require_admission() };
+    if let Err(error) = state.host.disable_msix() {
+        state.configuration.msi.get_or_insert(error);
+        state.configuration.msi_retirement_refused = true;
+        if let MsiError::Config(error) = error {
+            state.configuration.first.get_or_insert(error);
+            if matches!(error.effect, ConfigEffect::WriteMayHaveApplied { .. }) {
+                state.configuration.uncertain.get_or_insert(error);
+            }
+        }
+        // SAFETY: exact cause and entire Host graph retained before terminal report.
+        unsafe { state.require_admission() };
+    }
+}
 unsafe extern "C" fn disable_msi<H: Host>(context: *mut c_void) {
     // SAFETY: exact live callback state in its entered owner.
     let state = unsafe { state::<H>(context) };
@@ -884,6 +994,7 @@ impl<H: Host> Attached<H> {
         H: 'static,
     {
         let catalogued = enrollment.is_some();
+        let routes_msix = host.routes_msix();
         let state = Box::into_raw(Box::new(State {
             host,
             mappings: Mappings {
@@ -914,6 +1025,8 @@ impl<H: Host> Attached<H> {
             rom_bar: placement.rom_bar,
             upstream: placement.upstream.as_ptr(),
             upstream_count: placement.upstream.len(),
+            enable_msix: routes_msix.then_some(enable_msix::<H>),
+            disable_msix: routes_msix.then_some(disable_msix::<H>),
         };
         let mut error = 0;
         // SAFETY: caller's attach contract; C copies the table and returns a
@@ -974,6 +1087,45 @@ impl<H: Host> Attached<H> {
         // SAFETY: the caller's contract, over this function's live device.
         unsafe { stela_linux_pci_bound(self.device.as_ptr()) }
     }
+
+    /// The name of the driver that took the function, as Linux names it:
+    /// the first registered driver whose table holds the function and whose
+    /// probe succeeded, which is a later one when an earlier one's failed.
+    ///
+    /// # Safety
+    /// In an entered Linux owner.
+    pub unsafe fn driver(&self) -> Option<&core::ffi::CStr> {
+        // SAFETY: the caller's contract, over this function's live device.
+        let name = unsafe { stela_linux_pci_driver_name(self.device.as_ptr()) };
+        // SAFETY: a bound driver's name is its registered `pci_driver`'s,
+        // which lives as long as the image that registered it.
+        (!name.is_null()).then(|| unsafe { core::ffi::CStr::from_ptr(name) })
+    }
+}
+
+/// Unloads the driver of the function whose `struct pci_dev` is at
+/// `device` ([`Attached::device`]) while Linux runs on, as Linux's
+/// `device_release_driver` does, and stops what its remove left: its
+/// interrupt requests, MSI and bus mastering. The function stays published,
+/// with no driver. Whether a driver held it.
+///
+/// # Safety
+/// In an entered Linux owner, on a task that may sleep, with an attachment
+/// that keeps `device` alive and nothing outside Linux still using the
+/// driver's device (its DRM files closed).
+pub unsafe fn release_device(device: *mut c_void) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe { stela_linux_pci_release(device) }
+}
+
+/// [`Attached::shutdown`] for the function whose `struct pci_dev` is at
+/// `device` ([`Attached::device`]).
+///
+/// # Safety
+/// As [`Attached::shutdown`], with an attachment that keeps `device` alive.
+pub unsafe fn shutdown_device(device: *mut c_void) {
+    // SAFETY: the caller's contract.
+    unsafe { stela_linux_pci_shutdown(device) }
 }
 
 impl<H> Drop for Attached<H> {
@@ -993,6 +1145,8 @@ impl<H> Drop for Attached<H> {
         unsafe { stela_linux_pci_remove_device(self.device.as_ptr()) };
     }
 }
+
+pub mod msix;
 
 #[cfg(test)]
 mod tests;

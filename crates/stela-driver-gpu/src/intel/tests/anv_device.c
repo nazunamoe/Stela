@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* ANV on xe with no GPU: the image's route to a device, run on the host.
+/* ANV on xe or i915 with no GPU: the image's route to a device, run on the host.
  * The program links ANV's objects as Mesa links its driver, Stela's libdrm
  * stand-in (compat/mesa/drm.c) in place of libdrm, and Stela's NIR options
- * hook (compat/mesa/anv_nir_options.c), and runs over the xe no-op shim
- * (intel/hosted/xe_noop_drm_shim.c) preloaded. It creates the instance and
+ * hook (compat/mesa/anv_nir_options.c), and runs over the kernel driver's
+ * no-op shim (intel/hosted/xe_noop_drm_shim.c or i915_noop_drm_shim.c)
+ * preloaded. It creates the instance and
  * the device of the one GPU the shim shows, checks what Vulkan reports of it
  * against the expected device, asks the hook for each stage's NIR options,
  * builds a compute pipeline from SPIR-V (BRW compiles it; its statistics count
@@ -19,9 +20,11 @@
  * test: the Metal device refuses such a device, or reports the tier absent,
  * when it opens.
  *
- * Usage: anv_device DEVICE-ID integrated|discrete
+ * Usage: anv_device DEVICE-ID integrated|discrete|none xe|i915
  * Prints a "Metal device: ..." line, a "Metal read-write textures: ..." line
- * and a line "ANV on xe: ..." and exits 0, or names the failed check. */
+ * and a line "ANV on <driver>: ..." and exits 0, or names the failed check.
+ * With "none" (a device Stela hands to no driver) it checks that ANV gives no
+ * Vulkan device and prints "no Vulkan device from ANV". */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -107,7 +110,6 @@ static int has_extension(VkInstance instance, VkPhysicalDevice physical, const c
 static void report_metal_requirements(VkInstance instance, VkPhysicalDevice physical)
 {
 	LOAD(instance, vkGetPhysicalDeviceFeatures2);
-	LOAD(instance, vkGetPhysicalDeviceProperties2);
 	VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT unused = {
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT,
 	};
@@ -144,14 +146,6 @@ static void report_metal_requirements(VkInstance instance, VkPhysicalDevice phys
 		.pNext = &v12,
 	};
 	vkGetPhysicalDeviceFeatures2(physical, &features);
-	VkPhysicalDeviceExtendedDynamicState3PropertiesEXT dynamic3 = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT,
-	};
-	VkPhysicalDeviceProperties2 properties = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-		.pNext = &dynamic3,
-	};
-	vkGetPhysicalDeviceProperties2(physical, &properties);
 	const VkPhysicalDeviceFeatures *core = &features.features;
 	const struct {
 		const char *name;
@@ -183,7 +177,6 @@ static void report_metal_requirements(VkInstance instance, VkPhysicalDevice phys
 		{"nullDescriptor", robustness.nullDescriptor},
 		{"conditionalRendering", conditional.conditionalRendering},
 		{"dynamicRenderingUnusedAttachments", unused.dynamicRenderingUnusedAttachments},
-		{"dynamicPrimitiveTopologyUnrestricted", dynamic3.dynamicPrimitiveTopologyUnrestricted},
 		{"hostQueryReset", v12.hostQueryReset},
 		{"VK_EXT_external_memory_dma_buf",
 		 has_extension(instance, physical, "VK_KHR_external_memory_fd") &&
@@ -296,7 +289,7 @@ static void brw_statistics(VkDevice device,
 
 int main(int argc, char **argv)
 {
-	CHECK(argc == 3);
+	CHECK(argc == 4);
 	expected_device = (uint16_t)strtoul(argv[1], NULL, 16);
 	VkPhysicalDeviceType expected_type = !strcmp(argv[2], "discrete")
 						     ? VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
@@ -324,6 +317,13 @@ int main(int argc, char **argv)
 
 	uint32_t count = 0;
 	VK(vkEnumeratePhysicalDevices(instance, &count, NULL));
+	if (!strcmp(argv[2], "none")) {
+		/* A device Stela hands to no driver: ANV gives it no Vulkan
+		 * device. */
+		CHECK(count == 0);
+		puts("no Vulkan device from ANV");
+		return 0;
+	}
 	CHECK(count == 1);
 	VkPhysicalDevice physical;
 	VK(vkEnumeratePhysicalDevices(instance, &count, &physical));
@@ -667,10 +667,10 @@ int main(int argc, char **argv)
 	vkDestroyShaderModule(device, module, NULL);
 	vkDestroyDevice(device, NULL);
 	vkDestroyInstance(instance, NULL);
-	printf("ANV on xe: %s (0x%04x, %s), NIR options for %u stages, compute pipeline of %llu "
+	printf("ANV on %s: %s (0x%04x, %s), NIR options for %u stages, compute pipeline of %llu "
 	       "instructions in %llu bytes from SPIR-V and of %llu instructions in %llu bytes "
 	       "from NIR, one dispatch submitted\n",
-	       properties.properties.deviceName, expected_device, argv[2], STAGES,
+	       argv[3], properties.properties.deviceName, expected_device, argv[2], STAGES,
 	       (unsigned long long)instructions, (unsigned long long)code_bytes,
 	       (unsigned long long)nir_instructions, (unsigned long long)nir_code_bytes);
 	return 0;

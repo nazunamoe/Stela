@@ -88,9 +88,9 @@ const INITCALLS: UnitSpec = UnitSpec {
     scope: stela_c_build::linux_capture::Scope {
         slice: "gpu",
         group: "amdgpu",
-        group_ordinal: 35,
+        group_ordinal: 38,
         unit_ordinal: 1,
-        global_ordinal: 35,
+        global_ordinal: 38,
     },
     source: "drivers/gpu/drm/amd/amdgpu/amdgpu_drv",
     module: MODULE.name,

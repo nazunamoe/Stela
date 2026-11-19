@@ -107,8 +107,10 @@ pub trait Platform {
     /// # Safety
     /// `address` came from [`Self::map_device`] and nothing uses it any more.
     unsafe fn unmap_device(&self, address: *mut c_void);
-    /// Map `physical` pages contiguously, write-back.
-    fn map_pages(&self, physical: &[u64]) -> Option<*mut c_void>;
+    /// Map `physical` pages contiguously, write-back, or write-combining
+    /// where the driver asks its stores to merge (`vmap` with
+    /// `pgprot_writecombine`).
+    fn map_pages(&self, physical: &[u64], write_combining: bool) -> Option<*mut c_void>;
     /// # Safety
     /// `address` came from [`Self::map_pages`] for `count` pages and nothing
     /// uses it any more.
@@ -170,7 +172,7 @@ struct Services {
     shutdown: unsafe extern "C" fn(*mut c_void, bool),
     map_device: unsafe extern "C" fn(*mut c_void, u64, usize, bool) -> *mut c_void,
     unmap_device: unsafe extern "C" fn(*mut c_void, *mut c_void),
-    map_pages: unsafe extern "C" fn(*mut c_void, *const u64, usize) -> *mut c_void,
+    map_pages: unsafe extern "C" fn(*mut c_void, *const u64, usize, bool) -> *mut c_void,
     unmap_pages: unsafe extern "C" fn(*mut c_void, *mut c_void, usize),
     irq_enable: unsafe extern "C" fn(*mut c_void, c_uint, *mut bool) -> c_int,
     irq_disable: unsafe extern "C" fn(*mut c_void, c_uint) -> c_int,
@@ -414,11 +416,12 @@ mod trampolines {
         context: *mut c_void,
         physical: *const u64,
         count: usize,
+        write_combining: bool,
     ) -> *mut c_void {
         // SAFETY: see the module; `physical` holds `count` addresses.
         unsafe {
             platform::<P>(context)
-                .map_pages(slice::from_raw_parts(physical, count))
+                .map_pages(slice::from_raw_parts(physical, count), write_combining)
                 .unwrap_or(ptr::null_mut())
         }
     }
@@ -705,8 +708,10 @@ mod tests {
         unsafe fn unmap_device(&self, address: *mut c_void) {
             self.note(std::format!("unmap device {:#x}", address as usize));
         }
-        fn map_pages(&self, physical: &[u64]) -> Option<*mut c_void> {
-            physical.first().map(|&page| page as *mut c_void)
+        fn map_pages(&self, physical: &[u64], write_combining: bool) -> Option<*mut c_void> {
+            physical
+                .first()
+                .map(|&page| (page | u64::from(write_combining)) as *mut c_void)
         }
         unsafe fn unmap_pages(&self, address: *mut c_void, count: usize) {
             self.note(std::format!("unmap pages {:#x} {count}", address as usize));
@@ -890,8 +895,16 @@ mod tests {
             let device = (s.map_device)(context, 0x1000, 4096, false);
             assert_eq!(device as usize, 0x1000);
             (s.unmap_device)(context, device);
-            assert_eq!((s.map_pages)(context, [].as_ptr(), 0), ptr::null_mut());
-            let pages = (s.map_pages)(context, [0x2000u64, 0x9000].as_ptr(), 2);
+            assert_eq!(
+                (s.map_pages)(context, [].as_ptr(), 0, false),
+                ptr::null_mut()
+            );
+            // The platform sees the cache the driver asked for.
+            assert_eq!(
+                (s.map_pages)(context, [0x4000u64].as_ptr(), 1, true),
+                0x4001 as *mut c_void
+            );
+            let pages = (s.map_pages)(context, [0x2000u64, 0x9000].as_ptr(), 2, false);
             assert_eq!(pages as usize, 0x2000);
             (s.unmap_pages)(context, pages, 2);
 

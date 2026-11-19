@@ -3,8 +3,8 @@
 //! the kernel services it imports that the environment does not yet supply.
 use super::kbuild::{Config, Kbuild, Rule};
 use super::native::{self, Linux};
+use super::xe_tables::{devices, display_firmware, uc_firmware};
 use std::{
-    collections::{BTreeMap, BTreeSet},
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -106,14 +106,16 @@ const OPEN: super::image::Open = &[
     ),
 ];
 
-/// The unit of xe's own `module_init`.
+/// The unit of xe's own `module_init`. It registers after i915's (33), so
+/// xe binds a device both tables hold only when i915's probe fails.
+/// Ordinal 37 is xe's display parameters' ([`DISPLAY_PARAMETERS`]).
 const INITCALLS: UnitSpec = UnitSpec {
     scope: stela_c_build::linux_capture::Scope {
         slice: "gpu",
         group: "xe",
-        group_ordinal: 33,
+        group_ordinal: 36,
         unit_ordinal: 1,
-        global_ordinal: 33,
+        global_ordinal: 36,
     },
     source: "drivers/gpu/drm/xe/xe_module",
     module: MODULE.name,
@@ -130,9 +132,9 @@ const DISPLAY_PARAMETERS: UnitSpec = UnitSpec {
     scope: stela_c_build::linux_capture::Scope {
         slice: "gpu",
         group: "xe",
-        group_ordinal: 33,
+        group_ordinal: 36,
         unit_ordinal: 2,
-        global_ordinal: 34,
+        global_ordinal: 37,
     },
     source: "drivers/gpu/drm/i915/display/intel_display_params",
     module: MODULE.name,
@@ -357,160 +359,50 @@ pub fn tables() {
          /// and `require_force_probe`.\n\
          pub(crate) const DEVICES: &[(u16, u8, bool)] = &[\n",
     );
-    for (device, (bits, forced, _, _, _)) in &devices {
+    for (device, (bits, forced, ..)) in &devices {
         text.push_str(&format!("    ({device:#06x}, {bits}, {forced}),\n"));
     }
     text.push_str(
-        "];\n/// Each device ID's platform name (`PLATFORM()`), `has_display` and\n\
-         /// `is_dgfx`.\n\
-         pub(crate) const PLATFORMS: &[(u16, &str, bool, bool)] = &[\n",
+        "];\n/// Each device ID's platform name (`PLATFORM()`), `has_display`,\n\
+         /// `is_dgfx` and whether the descriptor fixes its graphics IP\n\
+         /// (`pre_gmdid_graphics_ip`).\n\
+         pub(crate) const PLATFORMS: &[(u16, &str, bool, bool, bool)] = &[\n",
     );
-    for (device, (_, _, platform, display, discrete)) in &devices {
+    for (device, (_, _, platform, display, discrete, fixed)) in &devices {
         text.push_str(&format!(
-            "    ({device:#06x}, {platform:?}, {display}, {discrete}),\n"
+            "    ({device:#06x}, {platform:?}, {display}, {discrete}, {fixed}),\n"
         ));
+    }
+    text.push_str("];\n");
+    let uc_table = Path::new(XE).join("xe_uc_fw.c");
+    let dmc_table = Path::new(native::LINUX).join(DMC);
+    for watched in [uc_table.as_path(), dmc_table.as_path()] {
+        println!("cargo:rerun-if-changed={}", watched.display());
+    }
+    let firmware = uc_firmware(&fs::read_to_string(&uc_table).expect("read xe's firmware table"))
+        .unwrap_or_else(|error| panic!("xe's firmware table: {error}"));
+    text.push_str(
+        "/// `xe_uc_fw.c`: each platform's GuC, HuC and GSC file, as xe names\n\
+         /// them in its `MODULE_FIRMWARE` declarations and asks for them.\n\
+         pub(crate) const FIRMWARE: &[(&str, [Option<&str>; 3])] = &[\n",
+    );
+    for (platform, files) in &firmware {
+        text.push_str(&format!("    ({platform:?}, {files:?}),\n"));
+    }
+    let display = display_firmware(&fs::read_to_string(&dmc_table).expect("read intel_dmc.c"))
+        .unwrap_or_else(|error| panic!("the display code's firmware table: {error}"));
+    text.push_str(
+        "];\n/// `intel_dmc.c`: the display microcontroller programs it declares\n\
+         /// for display version 12 and later, the displays of xe's platforms.\n\
+         pub(crate) const DISPLAY_FIRMWARE: &[&str] = &[\n",
+    );
+    for name in &display {
+        text.push_str(&format!("    {name:?},\n"));
     }
     text.push_str("];\n");
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo supplies OUT_DIR"));
     fs::write(output.join("xe_devices.rs"), text).expect("write xe's device table");
 }
 
-/// Each device ID of `pciidlist` in `table` with the mask bits, the
-/// force-probe requirement, the platform name, whether it has a display
-/// engine and whether it is a discrete GPU (`is_dgfx`), of the descriptor
-/// its entry names, the ID lists expanded from `ids`.
-type Described = (u8, bool, String, bool, bool);
-fn devices(table: &str, ids: &str) -> Result<BTreeMap<u16, Described>, String> {
-    // Each list macro's own IDs and the list macros it includes.
-    let mut lists = BTreeMap::new();
-    for definition in ids.replace("\\\n", " ").lines() {
-        let Some(rest) = definition.strip_prefix("#define ") else {
-            continue;
-        };
-        let Some((name, body)) = rest.split_once("(MACRO__, ...)") else {
-            continue;
-        };
-        let (mut own, mut included) = (Vec::new(), Vec::new());
-        // Each call in the body: `MACRO__(0x1234, ...)` is an ID of this
-        // list, `OTHER_IDS(MACRO__, ...)` includes another list.
-        let pieces = body.split('(').collect::<Vec<_>>();
-        for call in pieces.windows(2) {
-            let callee = call[0]
-                .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .next()
-                .unwrap_or("");
-            let argument = call[1].split([',', ')']).next().unwrap_or("").trim();
-            if callee == "MACRO__" {
-                let id = argument
-                    .strip_prefix("0x")
-                    .or_else(|| argument.strip_prefix("0X"))
-                    .and_then(|digits| u16::from_str_radix(digits, 16).ok())
-                    .ok_or_else(|| format!("{name} lists {argument:?}"))?;
-                own.push(id);
-            } else if argument == "MACRO__" {
-                included.push(callee.to_owned());
-            }
-        }
-        lists.insert(name.trim().to_owned(), (own, included));
-    }
-    // The table's object-like macros, which descriptors include whole
-    // (`DG2_FEATURES`).
-    let joined = table.replace("\\\n", " ");
-    let macros: BTreeMap<&str, &str> = joined
-        .lines()
-        .filter_map(|line| line.trim_start().strip_prefix("#define "))
-        .filter_map(|rest| rest.split_once(|c: char| c.is_whitespace()))
-        .filter(|(name, _)| name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-        .collect();
-    // Each descriptor's mask.
-    let mut masks = BTreeMap::new();
-    for descriptor in table.split("struct xe_device_desc ").skip(1) {
-        let Some((name, body)) = descriptor.split_once(" = {") else {
-            continue;
-        };
-        // A descriptor's definition, not a pointer to one in a signature.
-        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            continue;
-        }
-        let mut body = body.split("};").next().unwrap_or("").to_owned();
-        // Included macros may include others (`DG2_FEATURES` names
-        // `DGFX_FEATURES`); each is expanded once.
-        let mut expanded = BTreeSet::new();
-        loop {
-            let included: Vec<(&str, &str)> = body
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .filter_map(|word| macros.get_key_value(word).map(|(n, d)| (*n, *d)))
-                .filter(|(name, _)| !expanded.contains(name))
-                .collect();
-            if included.is_empty() {
-                break;
-            }
-            for (name, definition) in included {
-                if expanded.insert(name) {
-                    body.push_str(",\n");
-                    body.push_str(definition);
-                }
-            }
-        }
-        if let Some(bits) = body.split(".dma_mask_size = ").nth(1) {
-            let bits = bits.split(',').next().unwrap_or("").trim();
-            let platform = body
-                .split("PLATFORM(")
-                .nth(1)
-                .and_then(|rest| rest.split(')').next())
-                .map(str::trim)
-                .filter(|platform| !platform.is_empty())
-                .ok_or_else(|| format!("{name} names no platform"))?;
-            masks.insert(
-                name.trim().to_owned(),
-                (
-                    bits.parse::<u8>()
-                        .map_err(|_| format!("{name} has mask {bits:?}"))?,
-                    body.contains(".require_force_probe = true"),
-                    platform.to_owned(),
-                    body.contains(".has_display = true"),
-                    [".is_dgfx = 1", ".is_dgfx = true"]
-                        .iter()
-                        .any(|mark| body.contains(mark)),
-                ),
-            );
-        }
-    }
-    let entries = table
-        .split("pciidlist[] = {")
-        .nth(1)
-        .and_then(|rest| rest.split("{ }").next())
-        .ok_or("no pciidlist")?;
-    let mut devices = BTreeMap::new();
-    for entry in entries
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        let (list, descriptor) = entry
-            .split_once('(')
-            .and_then(|(list, rest)| Some((list, rest.split_once('&')?.1)))
-            .ok_or_else(|| format!("entry {entry:?}"))?;
-        let descriptor = descriptor.trim_end_matches("),");
-        let described = masks
-            .get(descriptor)
-            .ok_or_else(|| format!("{descriptor} has no dma_mask_size"))?;
-        let mut pending = vec![list.to_owned()];
-        while let Some(list) = pending.pop() {
-            let (own, included) = lists.get(&list).ok_or_else(|| format!("no list {list}"))?;
-            pending.extend(included.iter().cloned());
-            for id in own {
-                if devices
-                    .insert(*id, described.clone())
-                    .is_some_and(|other| other != *described)
-                {
-                    return Err(format!("{id:#06x} has two descriptors"));
-                }
-            }
-        }
-    }
-    if devices.is_empty() {
-        return Err("pciidlist is empty".into());
-    }
-    Ok(devices)
-}
+/// The display code's firmware selection, in i915's tree.
+const DMC: &str = "drivers/gpu/drm/i915/display/intel_dmc.c";

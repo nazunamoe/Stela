@@ -51,7 +51,12 @@ static inline bool pgtable_l5_enabled(void)
 #define _PAGE_ACCESSED	(_AT(pteval_t, 1) << 5)
 #define _PAGE_DIRTY	(_AT(pteval_t, 1) << 6)
 #define _PAGE_PSE	(_AT(pteval_t, 1) << 7)
+/* A 4 KiB entry's PAT bit is where a large entry's PSE bit is. */
+#define _PAGE_PAT	(_AT(pteval_t, 1) << 7)
 #define _PAGE_NX	(_AT(pteval_t, 1) << 63)
+/* The bits that select an entry's memory type through the PAT, which a
+ * remap keeps from the mapping it copies (i915's remap_io_mapping). */
+#define _PAGE_CACHE_MASK	(_PAGE_PWT | _PAGE_PCD | _PAGE_PAT)
 
 /* Original x86-64 pure value encodings, not page-table access authority.
  * pgtable_types.h selects this KNL mask for its 64-bit entry format. */
@@ -60,7 +65,9 @@ static inline bool pgtable_l5_enabled(void)
 #define _PAGE_KNL_ERRATUM_MASK (_PAGE_DIRTY | _PAGE_ACCESSED)
 #define _PAGE_SWP_EXCLUSIVE _PAGE_PWT
 
-/* Linux's default PAT programs index 1 write-combining and index 2 UC-. */
+/* Linux's default PAT programs index 1 write-combining and index 2 UC-, and
+ * so does Stela's arch (paging::take_over), so x86's pat_enabled() holds. */
+static inline bool pat_enabled(void) { return true; }
 #define pgprot_writecombine(prot) __pgprot(pgprot_val(prot) | _PAGE_PWT)
 #define pgprot_noncached(prot) __pgprot(pgprot_val(prot) | _PAGE_PCD)
 
@@ -229,4 +236,6 @@ static inline pud_t *p4d_pgtable(p4d_t p4d)
 #define PAGE_NONE	__pgprot(0)
 #define PAGE_KERNEL	__pgprot(_PAGE_PRESENT | _PAGE_RW | _PAGE_ACCESSED | \
 				 _PAGE_DIRTY | _PAGE_NX)
+/* x86's kernel mapping of device memory: no memory encryption here. */
+#define PAGE_KERNEL_IO	PAGE_KERNEL
 #endif

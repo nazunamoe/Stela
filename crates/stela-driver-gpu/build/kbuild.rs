@@ -7,15 +7,18 @@
 //! `ifeq ($(CONFIG_<X>),y)`, `ifneq ($(CONFIG_<X>),y)` and `endif`;
 //! `ccflags-y` and `subdir-ccflags-y` (or `-$(CONFIG_<X>)`) appended with
 //! include directories below `$(src)`, `$(srctree)` or at `$(obj)`, with
-//! `-Werror` or with one `$(call cc-option, -W<name>)`; and `<name>-y` or
-//! `<name>-$(CONFIG_<X>)` assigned with `:=` or `+=` from object paths and
-//! `$(<name>-y)` references. A `:=` variable expands its references when
-//! assigned, as Make's simply expanded variables do; a reference in a
-//! recursively expanded variable is refused.
+//! `-Werror`, with `-D<NAME>` or with one `$(call cc-option, -W<name>)`; and
+//! `<name>-y` or `<name>-$(CONFIG_<X>)` assigned with `:=` or `+=` from object
+//! paths and `$(<name>-y)` references. A `:=` variable expands its references
+//! when assigned, as Make's simply expanded variables do. A recursively
+//! expanded variable expands them when it is read, so its reference is
+//! expanded at the assignment only on the condition that what it names does
+//! not change afterwards; a later change of it is refused.
 //!
-//! A variable without a selector and a rule with its recipe are not
-//! evaluated: they are kept as written in [`Kbuild::definitions`] and
-//! [`Kbuild::rules`], and the driver's build refuses any it does not carry out.
+//! A variable without a selector (or with a suffix that is no selector, as
+//! `no-header-test`) and a rule with its recipe are not evaluated: they are
+//! kept as written in [`Kbuild::definitions`] and [`Kbuild::rules`], and the
+//! driver's build refuses any it does not carry out.
 use std::{
     collections::BTreeMap,
     fs,
@@ -89,6 +92,11 @@ pub struct Kbuild {
     pub generated_include: bool,
     /// Warning flags the compiler takes when it knows them (`cc-option`).
     pub optional_flags: Vec<String>,
+    /// Macros defined for every object (`-D<NAME>`), in order.
+    pub defines: Vec<String>,
+    /// Variables a recursively expanded variable refers to, which may then
+    /// not change.
+    read_late: std::collections::BTreeSet<String>,
     /// Whether an enabled option turns warnings into errors.
     pub werror: bool,
     /// Variables without a selector, as written, each `+=` joined by a space.
@@ -258,6 +266,17 @@ impl Kbuild {
                 self.werror = true;
                 continue;
             }
+            if let Some(name) = word.strip_prefix("-D") {
+                if name.is_empty()
+                    || !name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                {
+                    return Err(format!("unsupported flag {word}"));
+                }
+                self.defines.push(name.to_owned());
+                continue;
+            }
             let directory = match word.strip_prefix("-I") {
                 Some("") => words.next().ok_or("-I names no directory")?,
                 Some(directory) => directory,
@@ -290,6 +309,11 @@ impl Kbuild {
 
     fn assign(&mut self, name: &str, simple: bool, words: &[&str]) -> Result<(), String> {
         let key = format!("{name}-y");
+        if self.read_late.contains(&key) {
+            return Err(format!(
+                "{key} changes after a recursively expanded variable refers to it"
+            ));
+        }
         let flavor = match (simple, self.variables.get(&key)) {
             (true, _) => Flavor::Simple,
             (false, Some((flavor, _))) => *flavor,
@@ -302,7 +326,7 @@ impl Kbuild {
                 .and_then(|word| word.strip_suffix(')'))
             {
                 if flavor == Flavor::Recursive {
-                    return Err(format!("{key} refers to {reference} without :="));
+                    self.read_late.insert(reference.to_owned());
                 }
                 let (_, referenced) = self
                     .variables
@@ -434,6 +458,21 @@ impl<'a> Statement<'a> {
         };
         let condition = match selector {
             "y" => None,
+            // A name with a dash and no selector (`no-header-test`); a
+            // composite's other lists (`-objs`, `-m`, `-n`) are not that.
+            selector
+                if !selector.starts_with("$(")
+                    && !matches!(selector, "objs" | "m" | "n")
+                    && target
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte)) =>
+            {
+                return Ok(Statement::Define {
+                    name: target,
+                    append: matches!(operator, Operator::Append),
+                    value,
+                });
+            }
             selector => Some(
                 selector
                     .strip_prefix("$(")

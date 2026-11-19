@@ -2,6 +2,9 @@
 #ifndef ASM_STELA_MMU_CONTEXT_H
 #define ASM_STELA_MMU_CONTEXT_H
 
+#include <linux/types.h>
+#include <asm/current.h>
+
 struct mm_struct;
 struct task_struct;
 

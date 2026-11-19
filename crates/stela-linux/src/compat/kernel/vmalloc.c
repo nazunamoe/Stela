@@ -3,11 +3,15 @@
  * cc9de5d4b5ab6459f5774946aa3195ad51236fa8 mm/vmalloc.c. Linux code under
  * Stela owns no address space, so the owner maps the pages (map_pages); this
  * keeps which pages back each mapping, for vmalloc_to_page and vfree. */
+#include <linux/io.h>
 #include <linux/llist.h>
 #include <linux/mm.h>
+#include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/overflow.h>
 #include <linux/rbtree.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/vmalloc.h>
 #include <linux/workqueue.h>
 #include <stela/catalogue.h>
@@ -47,7 +51,54 @@ static struct area *area_of(const void *address)
 }
 
 /* Maps area's pages and records the mapping, or leaves nothing mapped. */
-static void *map_area(struct area *area)
+/* mm/vmalloc.c's purge notifiers, kept in priority order: when no mapping
+ * space is left, Linux asks them to release mappings they cache and tries
+ * once more if they freed any. */
+static struct notifier_block *purge_notifiers;
+static DEFINE_MUTEX(purge_notifiers_mutex);
+
+int register_vmap_purge_notifier(struct notifier_block *nb)
+{
+	struct notifier_block **link = &purge_notifiers;
+
+	mutex_lock(&purge_notifiers_mutex);
+	while (*link && (*link)->priority >= nb->priority)
+		link = &(*link)->next;
+	nb->next = *link;
+	*link = nb;
+	mutex_unlock(&purge_notifiers_mutex);
+	return 0;
+}
+
+int unregister_vmap_purge_notifier(struct notifier_block *nb)
+{
+	struct notifier_block **link = &purge_notifiers;
+	int error = -ENOENT;
+
+	mutex_lock(&purge_notifiers_mutex);
+	for (; *link; link = &(*link)->next)
+		if (*link == nb) {
+			*link = nb->next;
+			error = 0;
+			break;
+		}
+	mutex_unlock(&purge_notifiers_mutex);
+	return error;
+}
+
+static unsigned long purge_cached_mappings(void)
+{
+	unsigned long freed = 0;
+
+	mutex_lock(&purge_notifiers_mutex);
+	for (struct notifier_block *nb = purge_notifiers; nb; nb = nb->next)
+		if (nb->notifier_call(nb, 0, &freed) & NOTIFY_STOP_MASK)
+			break;
+	mutex_unlock(&purge_notifiers_mutex);
+	return freed;
+}
+
+static void *map_area(struct area *area, bool write_combining)
 {
 	const struct stela_linux_owner *owner = stela_linux_owner();
 	if (stela_linux_kernel_hosted() || !owner->services->map_pages) {
@@ -59,7 +110,11 @@ static void *map_area(struct area *area)
 		return NULL;
 	for (unsigned int i = 0; i < area->count; i++)
 		physical[i] = page_to_phys(area->pages[i]);
-	void *address = owner->services->map_pages(owner->context, physical, area->count);
+	void *address = owner->services->map_pages(owner->context, physical, area->count,
+						    write_combining);
+	if (!address && purge_cached_mappings())
+		address = owner->services->map_pages(owner->context, physical, area->count,
+						     write_combining);
 	kfree(physical);
 	if (address) {
 		area->address = address;
@@ -104,7 +159,7 @@ void *__vmalloc_noprof(unsigned long size, gfp_t gfp_mask)
 			return NULL;
 		}
 	}
-	void *address = map_area(area);
+	void *address = map_area(area, false);
 	if (!address) {
 		free_pages_of(area, area->count);
 		kfree(area);
@@ -122,10 +177,15 @@ void *vzalloc_noprof(unsigned long size)
 	return __vmalloc_noprof(size, GFP_KERNEL | __GFP_ZERO);
 }
 
+/* Pages mapped write-back (PAGE_KERNEL) or write-combining
+ * (pgprot_writecombine(PAGE_KERNEL)), as drivers map buffers the CPU fills
+ * for the GPU; another protection is refused, said once. */
 void *vmap(struct page **pages, unsigned int count, unsigned long flags, pgprot_t prot)
 {
+	bool write_combining = pgprot_val(prot) == pgprot_val(pgprot_writecombine(PAGE_KERNEL));
+
 	(void)flags;
-	if (pgprot_val(prot) != pgprot_val(PAGE_KERNEL)) {
+	if (pgprot_val(prot) != pgprot_val(PAGE_KERNEL) && !write_combining) {
 		stela_linux_unsupported("vmap with another protection");
 		return NULL;
 	}
@@ -133,10 +193,71 @@ void *vmap(struct page **pages, unsigned int count, unsigned long flags, pgprot_
 	if (!area)
 		return NULL;
 	memcpy(area->pages, pages, count * sizeof(*pages));
-	void *address = map_area(area);
+	void *address = map_area(area, write_combining);
 	if (!address)
 		kfree(area);
 	return address;
+}
+
+/* Frames without pages of their own (a GPU's stolen memory), which the owner
+ * maps as device memory it gave the driver: write-combining or uncached as
+ * prot asks, contiguous frames only, as the owner maps one physical range.
+ * Each is unmapped by vunmap. */
+struct frames {
+	struct list_head node;
+	const void *address;
+};
+
+static LIST_HEAD(frame_mappings);
+static DEFINE_SPINLOCK(frame_mappings_lock);
+
+void *vmap_pfn(unsigned long *pfns, unsigned int count, pgprot_t prot)
+{
+	bool write_combining = (pgprot_val(prot) & _PAGE_PWT) && !(pgprot_val(prot) & _PAGE_PCD);
+	struct frames *frames;
+	void __iomem *address;
+
+	if (!count)
+		return NULL;
+	for (unsigned int i = 1; i < count; i++)
+		if (pfns[i] != pfns[0] + i) {
+			stela_linux_unsupported("vmap_pfn of frames that are not contiguous");
+			return NULL;
+		}
+	frames = kmalloc_obj(*frames);
+	if (!frames)
+		return NULL;
+	address = write_combining ? ioremap_wc(PFN_PHYS(pfns[0]), (size_t)count << PAGE_SHIFT) :
+				    ioremap(PFN_PHYS(pfns[0]), (size_t)count << PAGE_SHIFT);
+	if (!address) {
+		kfree(frames);
+		return NULL;
+	}
+	frames->address = (const void __force *)address;
+	spin_lock(&frame_mappings_lock);
+	list_add(&frames->node, &frame_mappings);
+	spin_unlock(&frame_mappings_lock);
+	return (void __force *)address;
+}
+
+/* Whether address is a vmap_pfn mapping, which it then forgets. */
+static bool unmap_frames(const void *address)
+{
+	struct frames *frames, *found = NULL;
+
+	spin_lock(&frame_mappings_lock);
+	list_for_each_entry(frames, &frame_mappings, node)
+		if (frames->address == address) {
+			list_del(&frames->node);
+			found = frames;
+			break;
+		}
+	spin_unlock(&frame_mappings_lock);
+	if (!found)
+		return false;
+	iounmap((void __iomem __force *)address);
+	kfree(found);
+	return true;
 }
 
 static void unmap(const void *address, bool owns_pages)
@@ -189,6 +310,8 @@ void vfree_atomic(const void *address)
 
 void vunmap(const void *address)
 {
+	if (address && unmap_frames(address))
+		return;
 	unmap(address, false);
 }
 
@@ -308,9 +431,12 @@ static bool aliasing;
 
 /* The pages are contiguous here, so the window already maps them; a second
  * mapping of them lies elsewhere, as the owner's would. */
-static void *map_pages(void *context, const u64 *physical, size_t count)
+static bool combined;
+
+static void *map_pages(void *context, const u64 *physical, size_t count, bool write_combining)
 {
 	(void)context;
+	combined = write_combining;
 	for (size_t i = 1; i < count; i++)
 		assert(physical[i] == physical[0] + i * PAGE_SIZE);
 	return aliasing ? alias : memory + (physical[0] - PHYSICAL);
@@ -325,15 +451,44 @@ static void unmap_pages(void *context, void *address, size_t count)
 	unmapped += (unsigned int)count;
 }
 
+static unsigned int refusals;
+
 static void unsupported(void *context, const char *operation)
 {
 	(void)context;
-	assert(!strcmp(operation, "vmap with another protection"));
+	assert(!strcmp(operation, "vmap with another protection") ||
+	       !strcmp(operation, "vmap_pfn of frames that are not contiguous"));
+	refusals++;
+}
+
+static u8 device[3 * PAGE_SIZE] __aligned(PAGE_SIZE);
+static u64 device_physical;
+static size_t device_size;
+static bool device_combined;
+
+static void *map_device(void *context, u64 physical, size_t size, bool write_combining)
+{
+	(void)context;
+	device_physical = physical;
+	device_size = size;
+	device_combined = write_combining;
+	return device;
+}
+
+static unsigned int device_unmaps;
+
+static void unmap_device(void *context, void *address)
+{
+	(void)context;
+	assert(address == device);
+	device_unmaps++;
 }
 
 static const struct stela_linux_services services = {
 	.map_pages = map_pages,
 	.unmap_pages = unmap_pages,
+	.map_device = map_device,
+	.unmap_device = unmap_device,
 	.unsupported = unsupported,
 };
 static const struct stela_linux_owner owner = {.services = &services};
@@ -358,8 +513,28 @@ int main(void)
 	aliasing = false;
 	assert(again == alias && vmalloc_to_page(again + PAGE_SIZE) == second);
 	vunmap(again);
-	assert(unmapped == 2 && is_vmalloc_addr(zeroed));
-	assert(!vmap(pages, 2, VM_MAP, PAGE_NONE));
+	assert(unmapped == 2 && is_vmalloc_addr(zeroed) && !combined);
+	/* Write-combining, as a driver maps what the CPU fills for its GPU. */
+	aliasing = true;
+	again = vmap(pages, 2, VM_MAP, pgprot_writecombine(PAGE_KERNEL));
+	aliasing = false;
+	assert(again == alias && combined);
+	vunmap(again);
+	assert(unmapped == 4);
+	assert(!vmap(pages, 2, VM_MAP, PAGE_NONE) && refusals == 1);
+	unmapped = 2;
+
+	/* Contiguous frames without pages map as the owner's device memory. */
+	unsigned long frames[] = {0x9000, 0x9001, 0x9002};
+	u8 *stolen = vmap_pfn(frames, 3, pgprot_writecombine(PAGE_KERNEL_IO));
+	assert(stolen == device && device_physical == 0x9000ULL << PAGE_SHIFT);
+	assert(device_size == 3 * PAGE_SIZE && device_combined);
+	vunmap(stolen);
+	assert(device_unmaps == 1 && unmapped == 2);
+	assert(vmap_pfn(frames, 2, pgprot_noncached(PAGE_KERNEL_IO)) == device && !device_combined);
+	vunmap(device);
+	frames[1] = 0x9005;
+	assert(!vmap_pfn(frames, 3, pgprot_writecombine(PAGE_KERNEL_IO)) && refusals == 2);
 
 	/* A request the pages cannot cover undoes what it allocated. */
 	exhausted = false;

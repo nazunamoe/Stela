@@ -467,6 +467,19 @@ void device_remove_file(struct device *dev, const struct device_attribute *attr)
 	(void)attr;
 }
 
+int device_create_bin_file(struct device *dev, const struct bin_attribute *attr)
+{
+	(void)dev;
+	(void)attr;
+	return 0;
+}
+
+void device_remove_bin_file(struct device *dev, const struct bin_attribute *attr)
+{
+	(void)dev;
+	(void)attr;
+}
+
 int devm_device_add_group(struct device *dev, const struct attribute_group *group)
 {
 	(void)dev;

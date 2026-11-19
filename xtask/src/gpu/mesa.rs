@@ -24,6 +24,7 @@ use std::{
     time::SystemTime,
 };
 
+mod corpus;
 mod library;
 mod meson;
 mod record;
@@ -353,6 +354,7 @@ pub struct BuildOptions<'a> {
     pub fp_profile: super::AirFpProfile,
     pub threadgroup_inputs: &'a [PathBuf],
     pub render_inputs: &'a [PathBuf],
+    pub metal_corpus: &'a [PathBuf],
 }
 
 pub fn build(options: BuildOptions<'_>) -> Result<()> {
@@ -366,6 +368,7 @@ pub fn build(options: BuildOptions<'_>) -> Result<()> {
         fp_profile,
         threadgroup_inputs,
         render_inputs,
+        metal_corpus,
     } = options;
     ensure!(
         air_inputs.is_empty() || (llvm_library.is_some() && entry.is_some()),
@@ -506,6 +509,7 @@ pub fn build(options: BuildOptions<'_>) -> Result<()> {
     )?;
     let render = render::verify(&stela, &mut probes, &evidence, &render_snapshots)?;
     let threadgroup = threadgroup::verify(&stela, &mut probes, &evidence, &threadgroup_snapshots)?;
+    let corpus = corpus::verify(&stela, &evidence, metal_corpus)?;
     let libraries = inputs
         .archives
         .iter()
@@ -573,6 +577,7 @@ pub fn build(options: BuildOptions<'_>) -> Result<()> {
         "render_artifacts": render,
         "threadgroup_inputs": threadgroup_snapshots,
         "threadgroup_artifacts": threadgroup,
+        "metal_corpus": corpus,
         "probes": probes.runs,
         "unsupported_targets": probes.unsupported,
         "stderr_logs": stderr_logs,

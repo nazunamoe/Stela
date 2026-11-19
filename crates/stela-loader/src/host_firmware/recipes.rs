@@ -254,7 +254,11 @@ enum Consumer {
     IntelRsa,
     Wifi,
     Nouveau,
+    #[cfg(any(feature = "xe-port", feature = "i915-port"))]
     Xe,
+    #[cfg(any(feature = "xe-port", feature = "i915-port"))]
+    I915,
+    #[cfg(feature = "amdgpu-port")]
     Amdgpu,
 }
 
@@ -1102,436 +1106,37 @@ pub const GSP: &[Recipe] = &[
     ),
 ];
 
+/// amdgpu's files, in an image or a stick with the AMD port.
+#[cfg(feature = "amdgpu-port")]
 mod amdgpu;
+#[cfg(feature = "amdgpu-port")]
 pub use amdgpu::{
     AMDGPU, AmdGpu, DiscoveredIp, UNPUBLISHED as AMDGPU_UNPUBLISHED, amd_gpu_family,
     discovered_lacks, discovered_may_load, require_amdgpu, require_amdgpu_discovered,
 };
 
-/// The Intel GPU files and their notices: linux-firmware 20261019, whose
-/// GuC releases are at or above what the pinned xe asks of each platform.
-pub const XE_REVISION: &str = "a2dcb924f0897368b0b4f305cbf9808cdda90ce0";
-
-const I915_LICENSE: Artifact = Artifact {
-    source: LINUX_FIRMWARE,
-    revision: XE_REVISION,
-    member: "LICENSES/LICENSE.i915",
-    length: 2080,
-    sha256: "8542aeabf2761935122d693561e16766ce1bcc2b0d003204f9040b7d6d929f2e",
+/// xe's and i915's files, in an image or a stick with the Intel port.
+#[cfg(any(feature = "xe-port", feature = "i915-port"))]
+mod intel;
+#[cfg(any(feature = "xe-port", feature = "i915-port"))]
+pub use intel::{
+    I915, I915_PLATFORMS, I915_TARGET, XE, XE_REVISION, i915_platform, intel_gpu_platform,
+    intel_gsc, require_i915, require_xe,
 };
 
-const XE_LICENSE: Artifact = Artifact {
-    source: LINUX_FIRMWARE,
-    revision: XE_REVISION,
-    member: "LICENSES/LICENSE.xe",
-    length: 2041,
-    sha256: "26b3c946f1f378ff25bb3bb7c365d108a2bc0bf08619e5e08bc0e4f9aaa6ee1e",
-};
-
-const fn xe_file(
-    member: &'static str,
-    length: usize,
-    sha256: &'static str,
-    license: &'static Artifact,
-) -> Recipe {
-    Recipe {
-        image: Artifact {
-            source: LINUX_FIRMWARE,
-            revision: XE_REVISION,
-            member,
-            length,
-            sha256,
-        },
-        license,
-        consumer: Consumer::Xe,
-    }
-}
-
-/// A file of linux-firmware's `i915` directory, under its notice.
-const fn xe_i915(member: &'static str, length: usize, sha256: &'static str) -> Recipe {
-    xe_file(member, length, sha256, &I915_LICENSE)
-}
-
-/// A file of linux-firmware's `xe` directory, under its notice.
-const fn xe_xe(member: &'static str, length: usize, sha256: &'static str) -> Recipe {
-    xe_file(member, length, sha256, &XE_LICENSE)
-}
-
-/// What xe and the display code it shares with i915 load on the platforms
-/// xe's PCI ID table admits, Tiger Lake through Panther Lake: the GuC, HuC
-/// and GSC images of `xe_uc_fw.c` and the display microcontroller programs of
-/// `intel_dmc.c`, named as the drivers name them.
-pub const XE: &[Recipe] = &[
-    xe_i915(
-        "i915/tgl_guc_70.bin",
-        335360,
-        "2f1f57a1b23d186f2592318d1e07a1365968932841ccb3e7177c516ba006e2f6",
-    ),
-    xe_i915(
-        "i915/adlp_guc_70.bin",
-        347904,
-        "b7a800cbdcdf687e7b1c81f3316d040ab75fa3e5c698ebc356f077af17462ef8",
-    ),
-    xe_i915(
-        "i915/dg1_guc_70.bin",
-        321472,
-        "967e94b887024351aa363f882d3cbd0bf5fc4f5f47fd113faf8c19fb565c21a9",
-    ),
-    xe_i915(
-        "i915/dg2_guc_70.bin",
-        381760,
-        "e6e3f8b4480ba976c89c491ac736d6ce41fa82e0cf5726d0763142da3fe8a63b",
-    ),
-    xe_i915(
-        "i915/mtl_guc_70.bin",
-        320320,
-        "7794f0b6abe5fcd9c6f47035dafe2199f30a6e7d230bd5a53fbf8005a60e5911",
-    ),
-    xe_xe(
-        "xe/lnl_guc_70.bin",
-        348992,
-        "0583117763d2721b1b3a96c84d610229c18e644dce3a624b4e0ccc32952f5eaa",
-    ),
-    xe_xe(
-        "xe/bmg_guc_70.bin",
-        385856,
-        "de81c75f46a127c33cd59f604d800e9ffc7ed3495967ba0d8767cd6985ab398b",
-    ),
-    xe_xe(
-        "xe/ptl_guc_70.bin",
-        365376,
-        "ac42861c62b69f19923d9a69d971fb849921585a01924e14c0e8ac679d7cde81",
-    ),
-    xe_i915(
-        "i915/tgl_huc.bin",
-        589888,
-        "dbb1316bac13a76427ffa7827e52b5b9affe8a4cadd23dc22e2a54e35c53bdad",
-    ),
-    xe_i915(
-        "i915/dg1_huc.bin",
-        589888,
-        "ee9a00ca754931ab045e2e3e862e7b33c9ba87f6ae90aa18335b7a7a7ee87d16",
-    ),
-    xe_i915(
-        "i915/mtl_huc_gsc.bin",
-        561152,
-        "3ea23f39e946122d1446565d1a07c0866bf3e3c8819b43134925371d877ca4cd",
-    ),
-    xe_xe(
-        "xe/lnl_huc.bin",
-        643072,
-        "320e765cbe42b0f5f95333794a6a00a4e67246d6ad8393b59b64efdc3506cfe9",
-    ),
-    xe_xe(
-        "xe/bmg_huc.bin",
-        585728,
-        "747452aa8c4ed7760c68a80f3d913eafde9304d6f4db481e3f2aebb0a818bf15",
-    ),
-    xe_xe(
-        "xe/ptl_huc.bin",
-        651264,
-        "93e9aaf15362630441042a31fe864f9e4df76b401ada91de6df64e0f6b8adbca",
-    ),
-    xe_i915(
-        "i915/mtl_gsc_1.bin",
-        1142784,
-        "01e8e2bb0eae90e3b4471703bb04d1bd13adb43373480fb10be6f101b877e0f3",
-    ),
-    xe_xe(
-        "xe/lnl_gsc_1.bin",
-        1163264,
-        "b9a28846de2df43e8464cb783f965efe3a20df54da26392576583a4e0f4bbef1",
-    ),
-    xe_xe(
-        "xe/ptl_gsc_1.bin",
-        1171456,
-        "76e77660fa1a492aeef256eba65078a76f6801a8827cfd0758e8669d7462a465",
-    ),
-    xe_i915(
-        "i915/tgl_dmc_ver2_12.bin",
-        19760,
-        "3c013ef0ad96ba73aee8e5bd04a8e27cc9b1c6e9183b1a83ce124485f325afca",
-    ),
-    xe_i915(
-        "i915/rkl_dmc_ver2_03.bin",
-        18476,
-        "139ce0eb873a13679a4685463cdacf6d247073ce286c8a5bca443ef1d17ee2ac",
-    ),
-    xe_i915(
-        "i915/adls_dmc_ver2_01.bin",
-        18704,
-        "96e426ed7e80f0cc6644ada1928f4d02b163ff59b14b2339aa28a374d65a5b19",
-    ),
-    xe_i915(
-        "i915/adlp_dmc.bin",
-        79088,
-        "3516de2e134ddcf3b319c75d2e437779fecbd58cbb77234bd6f297c544e92ccb",
-    ),
-    xe_i915(
-        "i915/dg1_dmc_ver2_02.bin",
-        16624,
-        "89576b82489737ae1b4cd057f471363a75baeb7590d76a15e17895ad38e6c09d",
-    ),
-    xe_i915(
-        "i915/dg2_dmc_ver2_08.bin",
-        22540,
-        "cac5204087bba70a81c53778846340e57a4e35e5959b7b42006969f6e5f45466",
-    ),
-    xe_i915(
-        "i915/mtl_dmc.bin",
-        52712,
-        "1b3b826195d50fae6611d29e0eb348e641a3ada3e0436ee0b987124f47a0e0db",
-    ),
-    xe_i915(
-        "i915/bmg_dmc.bin",
-        45964,
-        "76e3ec6ea3a53ce727e43b84f5ea14c55400a2d118dac356d4e12a3cfac06b4d",
-    ),
-    xe_i915(
-        "i915/xe2lpd_dmc.bin",
-        60448,
-        "eb6f1283f714b9a8af3492802d1478e774e7795e09d75b56865ddaca3ae07abc",
-    ),
-    xe_i915(
-        "i915/xe3lpd_dmc.bin",
-        95624,
-        "be1d24f6262aef0a4b8a69e739d2025df2ba7e924a1697b20f5ab59a7977fc71",
-    ),
-    xe_i915(
-        "i915/xe3lpd_3002_dmc.bin",
-        67772,
-        "dbc2923b62a6fc9663b928719dd0504df6adba85a0f5b49e1482b7afbc4b36b7",
-    ),
-];
-
-/// A platform's name, PCI device IDs and files: GuC, HuC, GSC, DMC.
-type XePlatform = (&'static str, &'static [u16], [Option<&'static str>; 4]);
-
-/// The platforms of xe's PCI ID table that have pinned files, each with the
-/// device IDs Linux's `include/drm/intel/pciids.h` gives it and the files xe
-/// and the display code name for it: GuC, HuC, GSC, DMC. A platform's later
-/// re-releases share its files: Raptor Lake S with Alder Lake S, Raptor Lake
-/// P and U and Alder Lake N with Alder Lake P (N loads Tiger Lake's GuC and
-/// no HuC), Arrow Lake with Meteor Lake, Wildcat Lake with Panther Lake
-/// except for its display.
-const XE_PLATFORMS: &[XePlatform] = &[
-    (
-        "Tiger Lake",
-        &[
-            0x9a60, 0x9a68, 0x9a70, 0x9a40, 0x9a49, 0x9a59, 0x9a78, 0x9ac0, 0x9ac9, 0x9ad9, 0x9af8,
-        ],
-        [
-            Some("i915/tgl_guc_70.bin"),
-            Some("i915/tgl_huc.bin"),
-            None,
-            Some("i915/tgl_dmc_ver2_12.bin"),
-        ],
-    ),
-    (
-        "Rocket Lake",
-        &[0x4c80, 0x4c8a, 0x4c8b, 0x4c8c, 0x4c90, 0x4c9a],
-        [
-            Some("i915/tgl_guc_70.bin"),
-            Some("i915/tgl_huc.bin"),
-            None,
-            Some("i915/rkl_dmc_ver2_03.bin"),
-        ],
-    ),
-    (
-        "Alder Lake S or Raptor Lake S",
-        &[
-            0x4680, 0x4682, 0x4688, 0x468a, 0x468b, 0x4690, 0x4692, 0x4693, 0xa780, 0xa781, 0xa782,
-            0xa783, 0xa788, 0xa789, 0xa78a, 0xa78b,
-        ],
-        [
-            Some("i915/tgl_guc_70.bin"),
-            Some("i915/tgl_huc.bin"),
-            None,
-            Some("i915/adls_dmc_ver2_01.bin"),
-        ],
-    ),
-    (
-        "Alder Lake P or Raptor Lake P or U",
-        &[
-            0x46a0, 0x46a1, 0x46a2, 0x46a3, 0x46a6, 0x46a8, 0x46aa, 0x462a, 0x4626, 0x4628, 0x46b0,
-            0x46b1, 0x46b2, 0x46b3, 0x46c0, 0x46c1, 0x46c2, 0x46c3, 0xa721, 0xa7a1, 0xa7a9, 0xa7ac,
-            0xa7ad, 0xa720, 0xa7a0, 0xa7a8, 0xa7aa, 0xa7ab,
-        ],
-        [
-            Some("i915/adlp_guc_70.bin"),
-            Some("i915/tgl_huc.bin"),
-            None,
-            Some("i915/adlp_dmc.bin"),
-        ],
-    ),
-    (
-        "Alder Lake N",
-        &[0x46d0, 0x46d1, 0x46d2, 0x46d3, 0x46d4],
-        [
-            Some("i915/tgl_guc_70.bin"),
-            None,
-            None,
-            Some("i915/adlp_dmc.bin"),
-        ],
-    ),
-    (
-        "DG1",
-        &[0x4905, 0x4906, 0x4907, 0x4908, 0x4909],
-        [
-            Some("i915/dg1_guc_70.bin"),
-            Some("i915/dg1_huc.bin"),
-            None,
-            Some("i915/dg1_dmc_ver2_02.bin"),
-        ],
-    ),
-    (
-        "Arc A-series (DG2)",
-        &[
-            0x56a0, 0x56a1, 0x56a2, 0x56be, 0x56bf, 0x5690, 0x5691, 0x5692, 0x56a5, 0x56a6, 0x56b0,
-            0x56b1, 0x56ba, 0x56bb, 0x56bc, 0x56bd, 0x5693, 0x5694, 0x5695, 0x56a3, 0x56a4, 0x56b2,
-            0x56b3, 0x5696, 0x5697, 0x56c0, 0x56c2, 0x56c1,
-        ],
-        [
-            Some("i915/dg2_guc_70.bin"),
-            None,
-            None,
-            Some("i915/dg2_dmc_ver2_08.bin"),
-        ],
-    ),
-    (
-        "Meteor Lake or Arrow Lake",
-        &[
-            0x7d40, 0x7d45, 0x7d55, 0x7d60, 0x7dd5, 0x7d51, 0x7dd1, 0x7d41, 0x7d67, 0xb640,
-        ],
-        [
-            Some("i915/mtl_guc_70.bin"),
-            Some("i915/mtl_huc_gsc.bin"),
-            Some("i915/mtl_gsc_1.bin"),
-            Some("i915/mtl_dmc.bin"),
-        ],
-    ),
-    (
-        "Lunar Lake",
-        &[0x6420, 0x64a0, 0x64b0],
-        [
-            Some("xe/lnl_guc_70.bin"),
-            Some("xe/lnl_huc.bin"),
-            Some("xe/lnl_gsc_1.bin"),
-            Some("i915/xe2lpd_dmc.bin"),
-        ],
-    ),
-    (
-        "Arc B-series (Battlemage)",
-        &[
-            0xe202, 0xe209, 0xe20b, 0xe20c, 0xe20d, 0xe210, 0xe211, 0xe212, 0xe216, 0xe220, 0xe221,
-            0xe222, 0xe223,
-        ],
-        [
-            Some("xe/bmg_guc_70.bin"),
-            Some("xe/bmg_huc.bin"),
-            None,
-            Some("i915/bmg_dmc.bin"),
-        ],
-    ),
-    (
-        "Panther Lake",
-        &[
-            0xb080, 0xb081, 0xb082, 0xb083, 0xb084, 0xb085, 0xb086, 0xb087, 0xb08f, 0xb090, 0xb0a0,
-            0xb0b0,
-        ],
-        [
-            Some("xe/ptl_guc_70.bin"),
-            Some("xe/ptl_huc.bin"),
-            Some("xe/ptl_gsc_1.bin"),
-            Some("i915/xe3lpd_dmc.bin"),
-        ],
-    ),
-    (
-        "Wildcat Lake",
-        &[0xfd80, 0xfd81],
-        [
-            Some("xe/ptl_guc_70.bin"),
-            Some("xe/ptl_huc.bin"),
-            Some("xe/ptl_gsc_1.bin"),
-            Some("i915/xe3lpd_3002_dmc.bin"),
-        ],
-    ),
-];
-
-/// The binding xe's files take: Linux's names, as for nouveau's.
-const XE_TARGET: Target<'static> = Target {
-    driver: "xe",
-    hardware: "intel",
-    revision: "linux-firmware",
-    board: None,
-};
-
-/// xe's request for a file, by the name the driver gives it.
-fn select_xe(request: &Request) -> Option<&'static Recipe> {
-    if request.target.hardware != XE_TARGET.hardware
-        || request.target.revision != XE_TARGET.revision
-    {
-        return None;
-    }
-    XE.iter().find(|recipe| recipe.image.member == request.name)
-}
-
-/// The platform of an Intel GPU with PCI device ID `device`, as people know
-/// it, when xe's PCI ID table admits the device and its files are pinned.
-/// Ice Lake and older are i915's and have no entry.
-pub fn intel_gpu_platform(device: u16) -> Option<&'static str> {
-    XE_PLATFORMS
-        .iter()
-        .find(|(_, devices, _)| devices.contains(&device))
-        .map(|(name, ..)| *name)
-}
-
-/// The platforms whose xe loads without their GSC image, Battlemage and
-/// later: `xe_gsc_init` goes on when it is missing, as only content
-/// protection needs it there. Before them a missing GSC fails xe's probe.
-const XE_GSC_OPTIONAL: [&str; 2] = ["Panther Lake", "Wildcat Lake"];
-
-/// Whether xe and the display code start without the file `request` names
-/// when it is missing, on every platform that names it: a display
-/// microcontroller program (`intel_dmc.c` runs the display without its
-/// power states) and the GSC image of Battlemage and later. A GuC or HuC
-/// image is always needed: `xe_uc_init` fails without either. Other drivers'
-/// files are all needed.
+/// Whether the driver starts without the file `request` names when it is
+/// missing: some of xe's and i915's files ([`intel::optional`]). Other
+/// drivers' files are all needed.
 pub fn optional(request: &Request) -> bool {
-    if select_xe(request).is_none() {
-        return false;
+    #[cfg(any(feature = "xe-port", feature = "i915-port"))]
+    {
+        intel::optional(request)
     }
-    let mut named = false;
-    for (platform, _, files) in XE_PLATFORMS {
-        for (column, file) in files.iter().enumerate() {
-            if *file != Some(request.name.as_str()) {
-                continue;
-            }
-            named = true;
-            let tolerated = column == 3 || (column == 2 && XE_GSC_OPTIONAL.contains(platform));
-            if !tolerated {
-                return false;
-            }
-        }
+    #[cfg(not(any(feature = "xe-port", feature = "i915-port")))]
+    {
+        let _ = request;
+        false
     }
-    named
-}
-
-/// Requires the files xe and the display code ask for on the Intel GPU with
-/// PCI device ID `device`.
-pub fn require_xe(inventory: &mut Inventory, device: u16) -> Result<(), Error> {
-    let (_, _, files) = XE_PLATFORMS
-        .iter()
-        .find(|(_, devices, _)| devices.contains(&device))
-        .ok_or_else(|| Error(format!("{device:04x} is no GPU xe has pinned files for")))?;
-    for name in files.iter().flatten() {
-        inventory.observe(Requirement {
-            name,
-            target: XE_TARGET,
-            minimum_bytes: 1,
-        })?;
-    }
-    Ok(())
 }
 
 /// The chip whose `gsp` directory linux-firmware's `WHENCE` links `chip`'s to.
@@ -2043,7 +1648,11 @@ pub fn recipe(request: &Request) -> Option<&'static Recipe> {
         "mediatek-bluetooth-usb-mt79xx-v1" => select_mediatek_bluetooth(request),
         "realtek-wifi" => select_realtek_wifi(request),
         "nouveau" => select_gsp(request),
-        "xe" => select_xe(request),
+        #[cfg(any(feature = "xe-port", feature = "i915-port"))]
+        "xe" => intel::select_xe(request),
+        #[cfg(any(feature = "xe-port", feature = "i915-port"))]
+        "i915" => intel::select_i915(request),
+        #[cfg(feature = "amdgpu-port")]
         "amdgpu" => amdgpu::select(request),
         _ => None,
     }
@@ -2303,146 +1912,6 @@ mod tests {
             );
         }
         assert!(REALTEK_USB_LICENSE.verify(b"changed license").is_err());
-    }
-
-    fn xe_files(device: u16) -> Vec<alloc::string::String> {
-        let mut inventory = Inventory::default();
-        require_xe(&mut inventory, device).unwrap();
-        let requests = inventory.requests().iter();
-        requests.map(|request| request.name.clone()).collect()
-    }
-
-    fn xe_member(name: &str, hardware: &str) -> Option<&'static Recipe> {
-        let request = serde_json::json!({"schema":1,"complete":true,"requirements":[{
-            "name":name,"target":{"driver":"xe","hardware":hardware,
-            "revision":"linux-firmware","board":null},"minimum_bytes":1}]});
-        let inventory = Inventory::parse(&serde_json::to_vec(&request).unwrap()).unwrap();
-        Plan::select(&inventory)
-            .ok()
-            .map(|plan| plan.selections[0].recipe)
-    }
-
-    #[test]
-    fn an_intel_gpu_requires_the_files_xe_names_for_its_platform() {
-        // Tiger Lake, Alder Lake P and Raptor Lake P, U and S, as in laptops.
-        assert_eq!(
-            xe_files(0x9a49),
-            [
-                "i915/tgl_guc_70.bin",
-                "i915/tgl_huc.bin",
-                "i915/tgl_dmc_ver2_12.bin"
-            ]
-        );
-        for device in [0x46a3, 0xa7a0, 0xa7a1] {
-            assert_eq!(
-                xe_files(device),
-                [
-                    "i915/adlp_guc_70.bin",
-                    "i915/tgl_huc.bin",
-                    "i915/adlp_dmc.bin"
-                ]
-            );
-        }
-        for device in [0x468b, 0xa78b] {
-            assert_eq!(
-                xe_files(device),
-                [
-                    "i915/tgl_guc_70.bin",
-                    "i915/tgl_huc.bin",
-                    "i915/adls_dmc_ver2_01.bin"
-                ]
-            );
-        }
-        // A platform with a GSC loads its HuC through it.
-        assert_eq!(
-            xe_files(0x7d55),
-            [
-                "i915/mtl_guc_70.bin",
-                "i915/mtl_huc_gsc.bin",
-                "i915/mtl_gsc_1.bin",
-                "i915/mtl_dmc.bin"
-            ]
-        );
-        assert_eq!(
-            xe_files(0xe20b),
-            ["xe/bmg_guc_70.bin", "xe/bmg_huc.bin", "i915/bmg_dmc.bin"]
-        );
-        assert_eq!(intel_gpu_platform(0x9a49), Some("Tiger Lake"));
-        // Ice Lake and Ivy Bridge are not xe's.
-        for device in [0x8a56, 0x0166] {
-            assert_eq!(intel_gpu_platform(device), None);
-            assert!(require_xe(&mut Inventory::default(), device).is_err());
-        }
-    }
-
-    #[test]
-    fn xe_starts_without_its_display_programs_and_late_gsc_images_only() {
-        let request = |name: &str| {
-            Request::from(Requirement {
-                name,
-                target: XE_TARGET,
-                minimum_bytes: 1,
-            })
-        };
-        for name in [
-            "i915/tgl_dmc_ver2_12.bin",
-            "i915/adlp_dmc.bin",
-            "i915/bmg_dmc.bin",
-            "xe/ptl_gsc_1.bin",
-        ] {
-            assert!(optional(&request(name)), "{name}");
-        }
-        // GuC and HuC images, and GSC images before Battlemage, are needed.
-        for name in [
-            "i915/tgl_guc_70.bin",
-            "i915/tgl_huc.bin",
-            "xe/bmg_huc.bin",
-            "i915/mtl_gsc_1.bin",
-            "xe/lnl_gsc_1.bin",
-        ] {
-            assert!(!optional(&request(name)), "{name}");
-        }
-        for platform in XE_GSC_OPTIONAL {
-            assert!(XE_PLATFORMS.iter().any(|(name, ..)| *name == platform));
-        }
-    }
-
-    #[test]
-    fn xe_files_are_pinned_once_under_their_directorys_notice() {
-        let mut devices = Vec::new();
-        for (platform, ids, files) in XE_PLATFORMS {
-            for device in *ids {
-                assert!(!devices.contains(device), "{platform} {device:04x}");
-                devices.push(*device);
-            }
-            assert!(files[0].is_some() && files[3].is_some(), "{platform}");
-            for file in files.iter().flatten() {
-                assert!(xe_member(file, "intel").is_some(), "{platform} {file}");
-            }
-        }
-        for (index, recipe) in XE.iter().enumerate() {
-            let member = recipe.image.member;
-            assert!(
-                XE[..index].iter().all(|other| other.image.member != member),
-                "{member}"
-            );
-            assert!(
-                XE_PLATFORMS
-                    .iter()
-                    .any(|(_, _, files)| files.contains(&Some(member))),
-                "{member} has no platform"
-            );
-            let notice = if member.starts_with("xe/") {
-                "LICENSES/LICENSE.xe"
-            } else {
-                "LICENSES/LICENSE.i915"
-            };
-            assert_eq!(recipe.license.member, notice, "{member}");
-            assert_eq!(recipe.image.revision, XE_REVISION);
-            assert_eq!(recipe.image.sha256.len(), 64);
-        }
-        assert_eq!(xe_member("i915/tgl_guc_70.bin", "nvidia").map(|_| ()), None);
-        assert_eq!(xe_member("i915/skl_guc_70.bin", "intel").map(|_| ()), None);
     }
 
     /// The `(chip, release)` pairs nouveau's GSP firmware lists name, and

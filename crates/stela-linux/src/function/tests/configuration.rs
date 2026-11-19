@@ -287,3 +287,98 @@ fn host_msi_failure_keeps_typed_cause_before_c_errno_mapping() {
         );
     }
 }
+struct MsixHost {
+    config: FaultConfig,
+    grant: Result<(u32, u32), MsiError>,
+    asked: Vec<u32>,
+    disabled: usize,
+}
+impl Host for MsixHost {
+    type Config = FaultConfig;
+    fn config(&mut self) -> &mut FaultConfig {
+        &mut self.config
+    }
+    fn enable_msi(&mut self) -> Result<(), MsiError> {
+        Ok(())
+    }
+    fn disable_msi(&mut self) -> Result<(), MsiError> {
+        Ok(())
+    }
+    fn routes_msix(&self) -> bool {
+        true
+    }
+    fn enable_msix(&mut self, vectors: u32) -> Result<(u32, u32), MsiError> {
+        self.asked.push(vectors);
+        self.grant
+    }
+    fn disable_msix(&mut self) -> Result<(), MsiError> {
+        self.disabled += 1;
+        Ok(())
+    }
+}
+fn msix_state(grant: Result<(u32, u32), MsiError>) -> State<MsixHost> {
+    State {
+        host: MsixHost {
+            config: FaultConfig::new(0),
+            grant,
+            asked: Vec::new(),
+            disabled: 0,
+        },
+        mappings: mappings(&Arc::new(Identity::default())),
+        enrollment: None,
+        configuration: ConfigurationStatus::default(),
+    }
+}
+#[test]
+fn msix_grants_return_count_and_first_line_or_typed_refusal() {
+    let mut first = 0;
+    let mut state = msix_state(Ok((40, 3)));
+    assert_eq!(
+        // SAFETY: live, exclusively accessed State<MsixHost>; first is a
+        // distinct aligned writable word.
+        unsafe { enable_msix::<MsixHost>((&raw mut state).cast(), 8, &raw mut first) },
+        3
+    );
+    assert_eq!((first, state.host.asked.as_slice()), (40, &[8][..]));
+    // Asked how many it could set up, the host answers with any count.
+    assert_eq!(
+        // SAFETY: as above.
+        unsafe { enable_msix::<MsixHost>((&raw mut state).cast(), 0, &raw mut first) },
+        3
+    );
+    // SAFETY: the same live State<MsixHost>, sequential model callback.
+    unsafe { disable_msix::<MsixHost>((&raw mut state).cast()) };
+    assert_eq!(state.host.disabled, 1);
+    assert_eq!(state.configuration.msi, None);
+
+    // A host that grants more lines than asked is refused.
+    let mut state = msix_state(Ok((40, 9)));
+    first = 7;
+    assert_eq!(
+        // SAFETY: as above.
+        unsafe { enable_msix::<MsixHost>((&raw mut state).cast(), 8, &raw mut first) },
+        EIO
+    );
+    assert_eq!(first, 7);
+
+    for (failure, expected) in [(MsiError::Native(-28), -28), (MsiError::Native(1), EIO)] {
+        let mut state = msix_state(Err(failure));
+        assert_eq!(
+            // SAFETY: as above.
+            unsafe { enable_msix::<MsixHost>((&raw mut state).cast(), 4, &raw mut first) },
+            expected
+        );
+        assert_eq!(state.configuration.msi, Some(failure));
+    }
+}
+#[test]
+fn hosts_refuse_msix_unless_they_route_it() {
+    let host = TestHost {
+        config: FaultConfig::new(0),
+        msi: Ok(()),
+        drops: Arc::new(AtomicUsize::new(0)),
+    };
+    assert!(!host.routes_msix());
+    let mut host = host;
+    assert_eq!(host.enable_msix(4), Err(MsiError::Native(EOPNOTSUPP)));
+}

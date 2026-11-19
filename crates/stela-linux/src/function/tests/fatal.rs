@@ -99,7 +99,7 @@ impl Platform for Reporter {
     unsafe fn unmap_device(&self, _: *mut c_void) {
         unreachable!()
     }
-    fn map_pages(&self, _: &[u64]) -> Option<*mut c_void> {
+    fn map_pages(&self, _: &[u64], _: bool) -> Option<*mut c_void> {
         unreachable!()
     }
     unsafe fn unmap_pages(&self, _: *mut c_void, _: usize) {

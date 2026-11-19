@@ -1492,7 +1492,12 @@ pub fn fatal(message: impl core::fmt::Display) -> ! {
 fn fatal_here(message: &dyn core::fmt::Display) -> ! {
     // The guest's last lines, which often explain the stop, before it.
     crate::engine::write_guest_output_at_stop();
-    let message = alloc::string::ToString::to_string(&message);
+    let mut message = alloc::string::ToString::to_string(&message);
+    // A stop inside a GPU driver's probe names the GPU, and another that
+    // could have drawn in its place: such a stop is not contained.
+    if let Some(probe) = crate::engine::gpu_probe_stop() {
+        message = alloc::format!("{message}; {probe}");
+    }
     arguments(format_args!("\nSTELA FATAL {message}\n"));
     // The reason reaches the port before any later step can stop for good.
     unqueue_serial();

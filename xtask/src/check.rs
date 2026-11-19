@@ -102,7 +102,7 @@ pub fn run(fix: bool, low_memory: bool) -> Result<()> {
             "-p",
             "stela-driver-gpu",
             "--features",
-            "metal-linked,nouveau-port,amdgpu-port",
+            "metal-linked,nouveau-port,amdgpu-port,xe-port,i915-port",
         ]),
     ];
     let mut nvk_clippy = uefi([BOOT[0], BOOT[1], "--features", "nvk"]);
@@ -111,9 +111,9 @@ pub fn run(fix: bool, low_memory: bool) -> Result<()> {
     // Stela's driver owners are checked separately above.
     nvk_clippy.env("RUSTFLAGS", BOOT_RUSTFLAGS);
     boot_lane.push(nvk_clippy);
-    // A development image's drivers, with the AMD port a release leaves out
-    // (`boot::linked_features`).
-    let mut ports_clippy = uefi([BOOT[0], BOOT[1], "--features", "nvk,amdgpu"]);
+    // A development image's drivers, with the AMD and Intel ports a release
+    // leaves out (`boot::linked_features`).
+    let mut ports_clippy = uefi([BOOT[0], BOOT[1], "--features", "nvk,amdgpu,intel"]);
     ports_clippy.env("RUSTFLAGS", BOOT_RUSTFLAGS);
     boot_lane.push(ports_clippy);
     let mut linked = command([
