@@ -110,11 +110,7 @@ impl Package {
                     "{} is neither a file nor a directory",
                     path.display()
                 );
-                let name = path
-                    .strip_prefix(app)?
-                    .to_str()
-                    .context("a file name is not UTF-8")?
-                    .to_owned();
+                let name = super::kext_path(path.strip_prefix(app)?)?;
                 ensure!(
                     name.bytes()
                         .all(|byte| { byte.is_ascii_graphic() && byte != b'"' && byte != b'\\' }),

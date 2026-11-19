@@ -232,6 +232,16 @@ fn build_kext(component: &Path, output: &Path, xnu: &Path, include: &Path) -> Re
     Ok(bundle)
 }
 
+/// A file's path in a bundle as the kext spells it: its components joined
+/// by `/`, whatever separator the host's paths use.
+pub(crate) fn kext_path(relative: &Path) -> Result<String> {
+    let parts = relative
+        .components()
+        .map(|part| part.as_os_str().to_str().context("a file name is not UTF-8"))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(parts.join("/"))
+}
+
 /// `stela/bundle.h`: the Metal plugin `bundle` as the kext installs it, each
 /// regular file's path in the bundle, mode, SHA-256 and bytes, in path order.
 /// Its executable is the code the boot's trust cache lists, so the kext and
@@ -259,10 +269,7 @@ fn bundle_header(bundle: &Path) -> Result<String> {
     let mut files: Vec<(String, Vec<u8>)> = files
         .into_iter()
         .map(|path| {
-            let name = path
-                .strip_prefix(bundle)?
-                .to_str()
-                .context("a file name is not UTF-8")?;
+            let name = &kext_path(path.strip_prefix(bundle)?)?;
             ensure!(
                 name.bytes()
                     .all(|byte| byte.is_ascii_graphic() && byte != b'"' && byte != b'\\'),
