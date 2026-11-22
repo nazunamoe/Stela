@@ -3,6 +3,8 @@
 #include <IOKit/IOLib.h>
 #include <sys/errno.h>
 #include <sys/fcntl.h>
+#include <sys/mount.h>
+#include <sys/vnode_if.h>
 
 /*
  * Opens `path` without following its last component, and only as a regular
@@ -75,29 +77,68 @@ stelaMatches(const char *path, const unsigned char sha256[SHA256_DIGEST_LENGTH],
 	return error;
 }
 
+namespace {
+/* The file a rewrite opens, through the vnode KPI. */
+struct Rewrite {
+	const char *path;
+	int mode;
+	vfs_context_t context;
+	vnode_t vnode;
+};
+} // namespace
+
+#define STELA_REWRITE_SHORT EIO
+
+static int
+stela_rewrite_open(void *file)
+{
+	auto rewrite = static_cast<Rewrite *>(file);
+	// No O_TRUNC, which vnode_open ignores: the rewrite sets the length.
+	return openRegular(rewrite->path, FWRITE | O_CREAT, rewrite->mode, &rewrite->vnode, rewrite->context);
+}
+
+static int
+stela_rewrite_write(void *file, const unsigned char *bytes, unsigned long offset, int count, int *left)
+{
+	auto rewrite = static_cast<Rewrite *>(file);
+	// A write does not modify its source.
+	return vn_rdwr(UIO_WRITE, rewrite->vnode, const_cast<char *>(reinterpret_cast<const char *>(bytes)), count,
+	    off_t(offset), UIO_SYSSPACE, IO_NOAUTH, vfs_context_ucred(rewrite->context), left,
+	    vfs_context_proc(rewrite->context));
+}
+
+static int
+stela_rewrite_resize(void *file, unsigned long length)
+{
+	auto rewrite = static_cast<Rewrite *>(file);
+	struct vnode_attr attributes;
+	VATTR_INIT(&attributes);
+	VATTR_SET(&attributes, va_data_size, off_t(length));
+	return vnode_setattr(rewrite->vnode, &attributes, rewrite->context);
+}
+
+static int
+stela_rewrite_sync(void *file)
+{
+	auto rewrite = static_cast<Rewrite *>(file);
+	return VNOP_FSYNC(rewrite->vnode, MNT_WAIT, rewrite->context);
+}
+
+static int
+stela_rewrite_close(void *file)
+{
+	auto rewrite = static_cast<Rewrite *>(file);
+	return vnode_close(rewrite->vnode, FWRITE, rewrite->context);
+}
+
+#include "file_rewrite.h"
+
 int
 stelaWriteFile(const char *path, const unsigned char *bytes, unsigned long length, unsigned mode,
-    vfs_context_t context)
+    vfs_context_t context, unsigned *step)
 {
-	vnode_t vnode = NULLVP;
-	int error = openRegular(path, FWRITE | O_CREAT | O_TRUNC, int(mode), &vnode, context);
-	if (error) {
-		return error;
-	}
-	for (unsigned long offset = 0; !error && offset < length;) {
-		int chunk = int(IOMin(length - offset, (unsigned long)kStelaChunk));
-		int left = 0;
-		// A write does not modify its source.
-		error = vn_rdwr(UIO_WRITE, vnode, const_cast<char *>(reinterpret_cast<const char *>(bytes + offset)),
-		    chunk, offset, UIO_SYSSPACE, IO_NOAUTH | IO_SYNC, vfs_context_ucred(context), &left,
-		    vfs_context_proc(context));
-		if (!error && left != 0) {
-			error = EIO;
-		}
-		offset += chunk;
-	}
-	int closed = vnode_close(vnode, FWRITE, context);
-	return error ? error : closed;
+	Rewrite rewrite{path, int(mode), context, NULLVP};
+	return stela_rewrite(&rewrite, bytes, length, step);
 }
 
 int
@@ -140,7 +181,8 @@ stelaStage(const char *path, const unsigned char *bytes, unsigned long length,
 	if (error && error != ENOENT) {
 		return error;
 	}
-	error = stelaWriteFile(path, bytes, length, mode, context);
+	unsigned step = 0;
+	error = stelaWriteFile(path, bytes, length, mode, context, &step);
 	if (!error) {
 		error = stelaMatches(path, sha256, length, context, buffer, &same);
 	}

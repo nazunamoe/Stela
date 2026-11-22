@@ -592,3 +592,590 @@ fn regions_time_their_programs() -> Result<()> {
     }
     Ok(())
 }
+
+/// Regions whose last loop runs to their end, as real code has them, end
+/// where their linked blocks do. An inline memcpy (64-byte, 8-byte and byte
+/// loops, from a shared cache function): the byte loop's last branch is the
+/// body's last row and falls out into the return, which the count tests
+/// before the loops reach too, so the loop's run ends before the return.
+/// Its run stayed open there, and the return stored the loop's locals from
+/// hosts the paths from before the loop never loaded: X9 and X10 took
+/// whatever those hosts held, a host address among them.
+#[test]
+fn regions_whose_last_loop_runs_to_their_end_run_as_their_blocks() -> Result<()> {
+    let data = Mapping::new()?;
+    let code = Mapping::new()?;
+    let programs: [&[u32]; 1] = [&[
+        0xb400_0562, //    cbz x2, 9f
+        0xd280_0008, //    mov x8, #0
+        0xf100_205f, //    cmp x2, #8
+        0x5400_0443, //    b.lo 7f
+        0xcb01_0009, //    sub x9, x0, x1
+        0xf100_fd3f, //    cmp x9, #63
+        0x5400_03e9, //    b.ls 7f
+        0xf101_005f, //    cmp x2, #64
+        0x5400_0062, //    b.hs 1f
+        0xd280_0008, //    mov x8, #0
+        0x1400_0011, //    b 5f
+        0xd280_0009, // 1: mov x9, #0
+        0x927a_e448, //    and x8, x2, #0xffffffffffffffc0
+        0xaa08_03ea, //    mov x10, x8
+        0x8b09_002b, // 2: add x11, x1, x9
+        0xad40_0560, //    ldp q0, q1, [x11]
+        0xad41_0d62, //    ldp q2, q3, [x11, #32]
+        0x8b09_000b, //    add x11, x0, x9
+        0xad00_0560, //    stp q0, q1, [x11]
+        0xad01_0d62, //    stp q2, q3, [x11, #32]
+        0x9101_0129, //    add x9, x9, #64
+        0xf101_014a, //    subs x10, x10, #64
+        0x54ff_ff01, //    b.ne 2b
+        0xeb08_005f, //    cmp x2, x8
+        0x5400_0260, //    b.eq 9f
+        0xf27d_085f, //    tst x2, #0x38
+        0x5400_0160, //    b.eq 7f
+        0xaa08_03e9, // 5: mov x9, x8
+        0x927d_f048, //    and x8, x2, #0xfffffffffffffff8
+        0xcb08_012a, //    sub x10, x9, x8
+        0xfc69_6820, // 6: ldr d0, [x1, x9]
+        0xfc29_6800, //    str d0, [x0, x9]
+        0x9100_2129, //    add x9, x9, #8
+        0xb100_214a, //    adds x10, x10, #8
+        0x54ff_ff81, //    b.ne 6b
+        0xeb08_005f, //    cmp x2, x8
+        0x5400_00e0, //    b.eq 9f
+        0xcb08_0049, // 7: sub x9, x2, x8
+        0x3868_682a, // 8: ldrb w10, [x1, x8]
+        0x3828_680a, //    strb w10, [x0, x8]
+        0x9100_0508, //    add x8, x8, #1
+        0xf100_0529, //    subs x9, x9, #1
+        0x54ff_ff81, //    b.ne 8b
+        0xd65f_03c0, // 9: ret
+        SUFFIX,
+    ]];
+    let mut rng = Rng(0x1319_8a2e_0370_7344);
+    for (index, words) in programs.iter().enumerate() {
+        let mut aborts = 0;
+        for case in 0..40 {
+            let mut initial = GuestState {
+                x: std::array::from_fn(|_| rng.next()),
+                nzcv: (rng.next() as u32) & 0xf000_0000,
+                ..GuestState::default()
+            };
+            for register in [0, 1] {
+                initial.x[register] = data.0 + rng.below(2 * PAGE);
+            }
+            // Counts that are zero now and then, and that run past the
+            // data at times.
+            initial.x[2] = rng.below(4) * rng.below(PAGE);
+            // The memcpy returns to its suffix.
+            initial.x[30] = code.0 + 4 * (words.len() as u64 - 1);
+            let contents: Vec<u8> = (0..BYTES).map(|_| rng.next() as u8).collect();
+            let start = Case {
+                initial: &initial,
+                contents: &contents,
+                protected: (case % 3 == 2).then(|| 1 + rng.below(3)),
+                masked: case % 2 == 1,
+            };
+            let (linked, _, _) = run(words, &code, &data, false, &start)?;
+            let (region, _, _) = run(words, &code, &data, true, &start)?;
+            assert_eq!(
+                (region.stop, region.pc, region.retired, region.abort),
+                (linked.stop, linked.pc, linked.retired, linked.abort),
+                "program {index} case {case}"
+            );
+            assert_eq!(region.state, linked.state, "program {index} case {case}");
+            assert!(
+                region.memory == linked.memory,
+                "program {index} case {case}: memory"
+            );
+            aborts += usize::from(linked.abort.is_some());
+        }
+        assert!(aborts > 2, "program {index}: {aborts} of 40 aborted");
+    }
+    Ok(())
+}
+
+/// The executable ranges of an image: a 64-bit Mach-O's executable
+/// segments (a kernelcache, TXM), or a dyld shared cache file's executable
+/// mappings, each with its unslid address.
+fn executable_ranges(file: &[u8]) -> Vec<(u64, &[u8])> {
+    let word = |at: usize| u32::from_le_bytes(file[at..at + 4].try_into().unwrap());
+    let quad = |at: usize| u64::from_le_bytes(file[at..at + 8].try_into().unwrap());
+    let range = |offset: u64, bytes: u64| {
+        let start = (offset as usize).min(file.len());
+        &file[start..(start + bytes as usize).min(file.len())]
+    };
+    let mut ranges = Vec::new();
+    if file.starts_with(b"dyld") {
+        let (offset, count) = (word(0x10) as usize, word(0x14) as usize);
+        for index in 0..count {
+            let at = offset + 32 * index;
+            // Address, size, file offset, maximum and initial protection.
+            if word(at + 28) & 4 != 0 {
+                ranges.push((quad(at), range(quad(at + 16), quad(at + 8))));
+            }
+        }
+    } else if word(0) == 0xfeed_facf {
+        let mut at = 32;
+        for _ in 0..word(16) {
+            if word(at) == 0x19 && word(at + 60) & 4 != 0 {
+                ranges.push((quad(at + 24), range(quad(at + 40), quad(at + 48))));
+            }
+            at += word(at + 4) as usize;
+        }
+    }
+    ranges
+}
+
+/// Word indices in `code` where blocks start: each direct branch's target,
+/// and the instruction after each branch, return or exception call.
+fn block_starts(code: &[u8]) -> Vec<usize> {
+    let words = code.len() / 4;
+    let mut start = vec![false; words + 1];
+    start[0] = true;
+    for index in 0..words {
+        let word = u32::from_le_bytes(code[4 * index..4 * index + 4].try_into().unwrap());
+        let signed = |bits: u32, shift: u32| {
+            let value = (word >> shift) & ((1 << bits) - 1);
+            (i64::from(value) << (64 - bits)) >> (64 - bits)
+        };
+        let offset = if word & 0x7c00_0000 == 0x1400_0000 {
+            Some(signed(26, 0))
+        } else if word & 0xff00_0010 == 0x5400_0000 || word & 0x7e00_0000 == 0x3400_0000 {
+            Some(signed(19, 5))
+        } else if word & 0x7e00_0000 == 0x3600_0000 {
+            Some(signed(14, 5))
+        } else {
+            None
+        };
+        if offset.is_some()
+            || word & 0xfe00_0000 == 0xd600_0000
+            || word & 0xff00_0000 == 0xd400_0000
+        {
+            start[index + 1] = true;
+        }
+        if let Some(target) = offset.and_then(|offset| usize::try_from(index as i64 + offset).ok())
+            && target < words
+        {
+            start[target] = true;
+        }
+    }
+    start.truncate(words);
+    (0..words).filter(|&index| start[index]).collect()
+}
+
+/// Whether the code at `pc` compiles as a region, with the options a
+/// kernel PE's blocks take.
+fn forms_region(source: &[u8], pc: u64) -> bool {
+    use stela_compiler::{
+        GuestAddress, Options,
+        block::{BlockProfile, CompilationPlan, Features},
+        x86_64::{MemoryChecks, NativeSystem, RangeCheck},
+    };
+    let options = Options::new(
+        BlockProfile::new(Features::SYSTEM_MODE),
+        TargetCpu::detect(),
+    )
+    .with_memory_checks(
+        MemoryChecks::system(true, false, true, false)
+            .with_range(RangeCheck::four_level(4).one_sided(true)),
+    )
+    .with_native_system(NativeSystem {
+        exclusive: true,
+        self_loops: true,
+        regions: true,
+        ..NativeSystem::NONE
+    });
+    CompilationPlan::new(source, GuestAddress(pc), &options)
+        .and_then(|plan| plan.compile())
+        .is_ok_and(|compiled| compiled.region)
+}
+
+/// A register value of the kinds real code meets: pointers into the data
+/// (aligned, unaligned, at a page's end), small counts, any word, tagged
+/// and upper-range pointers.
+fn real_value(rng: &mut Rng, base: u64) -> u64 {
+    let pointer = base + rng.below(BYTES);
+    match rng.below(32) {
+        0..=19 => pointer & !7,
+        20..=21 => pointer,
+        22..=23 => base + PAGE * (1 + rng.below(3)) - rng.below(24),
+        24..=26 => rng.below(64),
+        27 => rng.next(),
+        28..=29 => pointer & !7 | (rng.next() & 0xff) << 56,
+        30 => 0xffff_8000_0000_0000 | rng.next() & 0x7fff_ffff_fff8,
+        _ => rng.below(1 << 20) << 4,
+    }
+}
+
+/// One case of [`real_regions_end_where_their_linked_blocks_do`]: where it
+/// enters the code, its registers and data, the page made to fault, and
+/// SCTLR_EL1.SA0 and TCR_EL1.TBI0.
+struct RealCase<'a> {
+    entry: u64,
+    initial: &'a GuestState,
+    contents: &'a [u8],
+    protected: Option<u64>,
+    sa0: bool,
+    tbi0: bool,
+}
+
+/// Run `words`, placed at the code mapping's start, from `case`, with
+/// regions or blocks alone, until a stop or 20000 blocks.
+fn run_real(
+    code: &Mapping,
+    data: &Mapping,
+    words: &[u32],
+    case: &RealCase,
+    regions: bool,
+) -> Result<Outcome> {
+    let RealCase {
+        entry,
+        initial,
+        contents,
+        protected,
+        sa0,
+        tbi0,
+    } = *case;
+    let mut machine = machine(code, data, words, TargetCpu::detect())?;
+    machine.set_regions(regions);
+    let sctlr = machine.cpu.registers.get(Register::SCTLR_EL1, 0);
+    machine
+        .cpu
+        .registers
+        .set_raw(Register::SCTLR_EL1, 0, sctlr | u64::from(sa0) << 4);
+    let tcr = machine.cpu.registers.get(Register::TCR_EL1, 0);
+    machine
+        .cpu
+        .registers
+        .set_raw(Register::TCR_EL1, 0, tcr | u64::from(tbi0) << 37);
+    ensure!(data.write(data.0, contents), "write data");
+    if let Some(page) = protected {
+        data.protect(page as usize * PAGE as usize, PAGE as usize, false)?;
+    }
+    machine.cpu.state = initial.clone();
+    machine.cpu.pc = entry;
+    let retired = machine.cpu.retired;
+    let stop = machine.run(machine.statistics.blocks + 20_000);
+    if let Some(page) = protected {
+        data.protect(page as usize * PAGE as usize, PAGE as usize, true)?;
+    }
+    let vector = machine.host.lower_synchronous();
+    let (stop, pc) = match stop == Stop::Breakpoint(vector) {
+        true => (Stop::Breakpoint(0), machine.cpu.pc.wrapping_sub(vector)),
+        false => (stop, machine.cpu.pc.wrapping_sub(code.0)),
+    };
+    let abort = (stop == Stop::Breakpoint(0)).then(|| {
+        (
+            machine.cpu.registers.get(Register::ESR_EL1, 0),
+            machine.cpu.registers.get(Register::FAR_EL1, 0),
+            machine.cpu.registers.get(Register::ELR_EL1, 0),
+        )
+    });
+    Ok(Outcome {
+        stop,
+        pc,
+        state: machine.cpu.state.clone(),
+        retired: machine.cpu.retired - retired,
+        memory: data.read(data.0, BYTES as usize).expect("readable data"),
+        abort,
+    })
+}
+
+/// The X and V registers a load that aborted leaves UNKNOWN (Arm: a
+/// synchronous Data Abort on a load leaves its destination registers
+/// UNKNOWN, but for its base): those of the integer or vector load or load
+/// pair `word`, as masks.
+fn aborted_load_destinations(word: u32) -> (u32, u32) {
+    use stela_compiler::{
+        GuestAddress, Lifter,
+        aarch64::{Decoder, MemoryTransfer, Operation, Register, simd},
+    };
+    let x = |register: Register| match register {
+        Register::X(index) => 1 << index,
+        _ => 0,
+    };
+    match Decoder
+        .lift(GuestAddress(0), word)
+        .map(|lifted| lifted.operation)
+    {
+        Ok(Operation::Memory {
+            transfer: MemoryTransfer::Load { .. },
+            data,
+            base,
+            ..
+        }) => (x(data) & !x(base), 0),
+        Ok(Operation::MemoryPair {
+            transfer: MemoryTransfer::Load { .. },
+            data,
+            base,
+            ..
+        }) => ((x(data[0]) | x(data[1])) & !x(base), 0),
+        Ok(Operation::Simd(simd::Operand::Memory {
+            load: true, vector, ..
+        })) => (0, 1 << vector),
+        Ok(Operation::Simd(simd::Operand::MemoryPair {
+            load: true,
+            vectors,
+            ..
+        })) => (0, 1 << vectors[0] | 1 << vectors[1]),
+        _ => (0, 0),
+    }
+}
+
+/// Whether `blocks` and `regions` differ only in the registers the load
+/// both aborted at leaves UNKNOWN.
+fn differ_in_unknown(blocks: &Outcome, regions: &Outcome, words: &[u32], code: u64) -> bool {
+    let Some((_, _, elr)) = blocks.abort else {
+        return false;
+    };
+    let Some(&word) = elr
+        .checked_sub(code)
+        .and_then(|offset| words.get(usize::try_from(offset / 4).ok()?))
+    else {
+        return false;
+    };
+    let (xs, vs) = aborted_load_destinations(word);
+    let mut regions = regions.state.clone();
+    for index in 0..31 {
+        if xs & 1 << index != 0 {
+            regions.x[index] = blocks.state.x[index];
+        }
+    }
+    for index in 0..32 {
+        if vs & 1 << index != 0 {
+            regions.v[index] = blocks.state.v[index];
+        }
+    }
+    regions == blocks.state
+}
+
+/// What differs between two end states: each X register, SP, NZCV and V
+/// register by its values, or the other fields.
+fn state_difference(blocks: &GuestState, regions: &GuestState) -> String {
+    let mut out = String::new();
+    for (index, (a, b)) in blocks.x.iter().zip(&regions.x).enumerate() {
+        if a != b {
+            out += &format!(", x{index} {a:#x}/{b:#x}");
+        }
+    }
+    if blocks.sp != regions.sp {
+        out += &format!(", sp {:#x}/{:#x}", blocks.sp, regions.sp);
+    }
+    if blocks.nzcv != regions.nzcv {
+        out += &format!(", nzcv {:#x}/{:#x}", blocks.nzcv, regions.nzcv);
+    }
+    for (index, (a, b)) in blocks.v.iter().zip(&regions.v).enumerate() {
+        if a != b {
+            out += &format!(", v{index} {a:x?}/{b:x?}");
+        }
+    }
+    if out.is_empty() && blocks != regions {
+        out += ", other state fields differ";
+    }
+    out
+}
+
+/// Real regions end where their linked blocks do: regions sampled from the
+/// executable code of the images `REAL_IMAGES` names (Mach-O or dyld
+/// shared cache files, comma separated), each placed at its page offset
+/// in the test's code mapping with the pages after it and run from random
+/// registers of the kinds [`real_value`] gives (pointers into random data
+/// that holds pointers too, some pages protected), SP aligned or not under
+/// SCTLR_EL1.SA0, TBI0 on or off, as blocks and as regions. Cases that
+/// spend the block budget in either mode are not compared, nor the
+/// destinations of a load both abort at, which Arm leaves UNKNOWN.
+/// `REAL_PCS` (hex, comma separated) takes the regions that start at or up
+/// to 1 KiB before each PC (at it alone with `REAL_EXACT`) instead of a
+/// sample of `REAL_SAMPLE` (500); `REAL_CASES` (8) cases each;
+/// `REAL_VERBOSE` prints each case's start and end. Every mismatch is
+/// printed and fails the test at the end. Opt-in: `--ignored --nocapture`,
+/// in a release build: 4000 regions of the shared cache take about a
+/// minute and 650 MB.
+#[test]
+#[ignore = "manual: opt-in"]
+fn real_regions_end_where_their_linked_blocks_do() -> Result<()> {
+    let number = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .map_or(default, |value| value.parse().unwrap())
+    };
+    let images = std::env::var("REAL_IMAGES").expect("REAL_IMAGES names the images");
+    let pcs: Vec<u64> = std::env::var("REAL_PCS").ok().map_or(vec![], |list| {
+        list.split(',')
+            .map(|pc| u64::from_str_radix(pc.trim_start_matches("0x"), 16).unwrap())
+            .collect()
+    });
+    let (sample, cases) = (number("REAL_SAMPLE", 500), number("REAL_CASES", 8));
+    // Native accesses reach guest addresses as host addresses, and the
+    // guest maps only these mappings: an access past one must fault in the
+    // host too, as in a boot, whose shadow maps what the guest maps alone.
+    // Past a guard, an access reached the process's own memory, the
+    // installed translations of the other mode among them: a load read
+    // what the other mode's run had stored there, a store wrote the
+    // engine's state. ADRP and a load reach 4 GiB from the code, a 32-bit
+    // index scaled by 8 32 GiB from its base, and real code indexes its
+    // pointers with what random data gives it (a table of 10-byte rows at
+    // row 0x7a90, a word array at a count over 32): guards of their reach,
+    // address space alone.
+    let data = Mapping::guarded(32 << 30)?;
+    let code = Mapping::guarded(4 << 30)?;
+    // The regions: their PC and the code of their page and those after it.
+    let mut regions: Vec<(u64, Vec<u32>)> = Vec::new();
+    for path in images.split(',') {
+        let file = std::fs::read(path)?;
+        for (address, bytes) in executable_ranges(&file) {
+            let reach = if std::env::var("REAL_EXACT").is_ok() {
+                1
+            } else {
+                1024
+            };
+            let wanted =
+                |pc: u64| pcs.is_empty() || pcs.iter().any(|&at| pc <= at && at - pc < reach);
+            let candidates: Vec<usize> = block_starts(bytes)
+                .into_iter()
+                .filter(|&index| wanted(address + 4 * index as u64))
+                .collect();
+            // Every candidate near a named PC, or a stride through them.
+            let stride = match pcs.is_empty() {
+                true => (candidates.len() / (16 * sample as usize).max(1)).max(1),
+                false => 1,
+            };
+            for &index in candidates.iter().step_by(stride) {
+                let pc = address + 4 * index as u64;
+                let window = &bytes[4 * index..(4 * index + 1024).min(bytes.len())];
+                if !forms_region(window, pc) {
+                    continue;
+                }
+                let page = 4 * index - (pc & (PAGE - 1)) as usize;
+                let end = (page + 3 * PAGE as usize).min(bytes.len());
+                let words = bytes[page..end]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|word| u32::from_le_bytes(*word))
+                    .collect();
+                regions.push((pc, words));
+            }
+        }
+    }
+    let found = regions.len();
+    if pcs.is_empty() && regions.len() as u64 > sample {
+        let step = regions.len() / sample as usize;
+        regions = regions.into_iter().step_by(step).collect();
+    }
+    std::println!("{found} regions found, {} run", regions.len());
+    let mut rng = Rng(0x243f_6a88_85a3_08d3);
+    let (mut compared, mut budget, mut aborts) = (0, 0, 0);
+    let (mut mismatches, mut lengths) = (Vec::new(), Vec::new());
+    for (pc, words) in &regions {
+        for case in 0..cases {
+            let mut initial = GuestState {
+                v: std::array::from_fn(|_| [rng.next(), rng.next()]),
+                nzcv: (rng.next() as u32) & 0xf000_0000,
+                ..GuestState::default()
+            };
+            for register in 0..31 {
+                initial.x[register] = real_value(&mut rng, data.0);
+            }
+            let aligned = rng.below(4) != 0;
+            initial.sp = data.0 + 2 * PAGE + (rng.below(PAGE) & if aligned { !15 } else { !3 });
+            let contents: Vec<u8> = (0..BYTES / 8)
+                .flat_map(|_| {
+                    match rng.below(8) {
+                        0..=5 => real_value(&mut rng, data.0),
+                        6 => rng.below(256),
+                        _ => rng.next(),
+                    }
+                    .to_le_bytes()
+                })
+                .collect();
+            let protected = (case % 3 == 2).then(|| 1 + rng.below(3));
+            let (sa0, tbi0) = (rng.below(2) == 1, rng.below(2) == 1);
+            let entry = code.0 + (pc & (PAGE - 1));
+            let start = RealCase {
+                entry,
+                initial: &initial,
+                contents: &contents,
+                protected,
+                sa0,
+                tbi0,
+            };
+            let run = |regions| run_real(&code, &data, words, &start, regions);
+            let (linked, region) = (run(false)?, run(true)?);
+            let what = format!(
+                "region {pc:#x} case {case} sa0 {sa0} tbi0 {tbi0} sp {:#x}",
+                initial.sp
+            );
+            let what = match std::env::var("REAL_VERBOSE").is_ok() {
+                true => format!(
+                    "{what} x {:x?} nzcv {:#x} protected {protected:?}",
+                    initial.x, initial.nzcv
+                ),
+                false => what,
+            };
+            let failed = |outcome: &Outcome| {
+                matches!(outcome.stop, Stop::Unsupported(_) | Stop::NativeFailure(_))
+            };
+            if failed(&region) && !failed(&linked) {
+                mismatches.push(format!("{what}: regions stop {:?}", region.stop));
+                continue;
+            }
+            if linked.stop == Stop::Budget || region.stop == Stop::Budget {
+                budget += 1;
+                continue;
+            }
+            compared += 1;
+            aborts += usize::from(linked.abort.is_some());
+            lengths.push(linked.retired);
+            if std::env::var("REAL_VERBOSE").is_ok() {
+                std::println!(
+                    "{what}: {:?} at {:#x} after {} {:x?}",
+                    linked.stop,
+                    linked.pc,
+                    linked.retired,
+                    linked.abort
+                );
+            }
+            let end = |outcome: &Outcome| {
+                (
+                    outcome.stop.clone(),
+                    outcome.pc,
+                    outcome.retired,
+                    outcome.abort,
+                )
+            };
+            if end(&region) != end(&linked)
+                || (region.state != linked.state
+                    && !differ_in_unknown(&linked, &region, words, code.0))
+                || region.memory != linked.memory
+            {
+                mismatches.push(format!(
+                    "{what}: blocks {:?}, regions {:?}{}{}",
+                    end(&linked),
+                    end(&region),
+                    state_difference(&linked.state, &region.state),
+                    if region.memory != linked.memory {
+                        ", memory differs"
+                    } else {
+                        ""
+                    },
+                ));
+            }
+        }
+    }
+    for mismatch in &mismatches {
+        std::println!("MISMATCH {mismatch}");
+    }
+    lengths.sort_unstable();
+    std::println!(
+        "{} regions, {compared} cases compared ({aborts} aborted), {budget} spent the budget, {} \
+        mismatches; instructions retired per case: median {}, 90th percentile {}",
+        regions.len(),
+        mismatches.len(),
+        lengths.get(lengths.len() / 2).copied().unwrap_or(0),
+        lengths.get(lengths.len() * 9 / 10).copied().unwrap_or(0),
+    );
+    assert!(mismatches.is_empty(), "{} mismatches", mismatches.len());
+    Ok(())
+}

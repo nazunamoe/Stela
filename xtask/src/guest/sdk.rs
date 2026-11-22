@@ -205,7 +205,7 @@ fn without_parentheses(text: &str) -> String {
         .collect()
 }
 
-fn gate_header() -> String {
+pub(crate) fn gate_header() -> String {
     let mut header = String::from(
         "/* The StelaGPU gate window's layout, from stela_contracts::gate::window. */\n\
          #pragma once\n",

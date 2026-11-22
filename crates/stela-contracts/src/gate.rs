@@ -87,17 +87,132 @@ pub enum BundleReport {
     /// directories for a kext.
     Missing,
     /// Reading or writing a file failed.
-    Failed,
+    Failed(BundleFailure),
+}
+
+/// Where the kext's installation of the plugin failed, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BundleFailure {
+    pub step: BundleStep,
+    /// The guest kernel's errno; 0 for [`BundleStep::Differs`].
+    pub errno: u16,
+}
+
+/// A step of the kext's installation, by its `BUNDLE_STEP_` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BundleStep {
+    Allocate,
+    Path,
+    Read,
+    Open,
+    Write,
+    Length,
+    Sync,
+    Close,
+    Verify,
+    Differs,
+}
+
+impl BundleStep {
+    const ALL: [(u64, Self); 10] = [
+        (window::BUNDLE_STEP_ALLOCATE, Self::Allocate),
+        (window::BUNDLE_STEP_PATH, Self::Path),
+        (window::BUNDLE_STEP_READ, Self::Read),
+        (window::BUNDLE_STEP_OPEN, Self::Open),
+        (window::BUNDLE_STEP_WRITE, Self::Write),
+        (window::BUNDLE_STEP_LENGTH, Self::Length),
+        (window::BUNDLE_STEP_SYNC, Self::Sync),
+        (window::BUNDLE_STEP_CLOSE, Self::Close),
+        (window::BUNDLE_STEP_VERIFY, Self::Verify),
+        (window::BUNDLE_STEP_DIFFERS, Self::Differs),
+    ];
+
+    /// What the kext was doing, in the words of a stop line.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Allocate => "allocating its buffers",
+            Self::Path => "spelling a file's path",
+            Self::Read => "reading the installed file",
+            Self::Open => "opening the file to write it",
+            Self::Write => "writing the file",
+            Self::Length => "setting the file's length",
+            Self::Sync => "flushing the file to disk",
+            Self::Close => "closing the file",
+            Self::Verify => "reading the written file back",
+            Self::Differs => "checking the written file",
+        }
+    }
+}
+
+impl core::fmt::Display for BundleFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.step == BundleStep::Differs {
+            return f.write_str("a file it wrote reads back unlike its own");
+        }
+        f.write_str(self.step.describe())?;
+        f.write_str(" failed with ")?;
+        match darwin_errno_name(self.errno) {
+            Some(name) => write!(f, "{name} ({})", self.errno),
+            None => write!(f, "errno {}", self.errno),
+        }
+    }
+}
+
+/// The symbolic name of a Darwin errno a file operation answers.
+pub fn darwin_errno_name(errno: u16) -> Option<&'static str> {
+    Some(match errno {
+        1 => "EPERM",
+        2 => "ENOENT",
+        4 => "EINTR",
+        5 => "EIO",
+        6 => "ENXIO",
+        9 => "EBADF",
+        12 => "ENOMEM",
+        13 => "EACCES",
+        16 => "EBUSY",
+        17 => "EEXIST",
+        20 => "ENOTDIR",
+        21 => "EISDIR",
+        22 => "EINVAL",
+        26 => "ETXTBSY",
+        27 => "EFBIG",
+        28 => "ENOSPC",
+        30 => "EROFS",
+        35 => "EAGAIN",
+        45 => "ENOTSUP",
+        62 => "ELOOP",
+        63 => "ENAMETOOLONG",
+        69 => "EDQUOT",
+        70 => "ESTALE",
+        79 => "EFTYPE",
+        80 => "EAUTH",
+        _ => return None,
+    })
 }
 
 impl BundleReport {
-    /// The report a store of `value` to [`window::BUNDLE`] makes.
+    /// The report a store of `value` to [`window::BUNDLE`] makes. A failure
+    /// names its step in the bits at [`window::BUNDLE_STEP_SHIFT`] and its
+    /// errno in those at [`window::BUNDLE_ERRNO_SHIFT`]; no other report
+    /// sets them.
     pub fn from_raw(value: u64) -> Option<Self> {
-        match value {
+        let kind = value & 0xff;
+        let step = (value >> window::BUNDLE_STEP_SHIFT) & 0xff;
+        let errno = (value >> window::BUNDLE_ERRNO_SHIFT) & 0xffff;
+        if value >> 32 != 0 || (kind != window::BUNDLE_FAILED && value != kind) {
+            return None;
+        }
+        match kind {
             window::BUNDLE_CURRENT => Some(Self::Current),
             window::BUNDLE_UPDATED => Some(Self::Updated),
             window::BUNDLE_MISSING => Some(Self::Missing),
-            window::BUNDLE_FAILED => Some(Self::Failed),
+            window::BUNDLE_FAILED => {
+                let (_, step) = BundleStep::ALL.into_iter().find(|&(raw, _)| raw == step)?;
+                Some(Self::Failed(BundleFailure {
+                    step,
+                    errno: errno as u16,
+                }))
+            }
             _ => None,
         }
     }
@@ -275,7 +390,95 @@ pub mod window {
         BUNDLE_UPDATED = 2;
         /// `BUNDLE`: the plugin's directories are absent.
         BUNDLE_MISSING = 3;
-        /// `BUNDLE`: reading or writing a file of the plugin failed.
+        /// `BUNDLE`: reading or writing a file of the plugin failed. The
+        /// store also names the step, a `BUNDLE_STEP_` value, at
+        /// `BUNDLE_STEP_SHIFT` and the kernel's errno at
+        /// `BUNDLE_ERRNO_SHIFT`, 0 for `BUNDLE_STEP_DIFFERS`.
         BUNDLE_FAILED = 4;
+        /// `BUNDLE`: where a failure's step is, 8 bits.
+        BUNDLE_STEP_SHIFT = 8;
+        /// `BUNDLE`: where a failure's errno is, 16 bits.
+        BUNDLE_ERRNO_SHIFT = 16;
+        /// `BUNDLE` step: the installer's buffers could not be allocated.
+        BUNDLE_STEP_ALLOCATE = 1;
+        /// `BUNDLE` step: a file's path is longer than the kext's buffers.
+        BUNDLE_STEP_PATH = 2;
+        /// `BUNDLE` step: reading the file the plugin holds.
+        BUNDLE_STEP_READ = 3;
+        /// `BUNDLE` step: opening it for writing, or creating it.
+        BUNDLE_STEP_OPEN = 4;
+        /// `BUNDLE` step: writing its bytes.
+        BUNDLE_STEP_WRITE = 5;
+        /// `BUNDLE` step: setting its length, which cuts an older file's
+        /// tail.
+        BUNDLE_STEP_LENGTH = 6;
+        /// `BUNDLE` step: flushing it to disk.
+        BUNDLE_STEP_SYNC = 7;
+        /// `BUNDLE` step: closing it.
+        BUNDLE_STEP_CLOSE = 8;
+        /// `BUNDLE` step: reading it back.
+        BUNDLE_STEP_VERIFY = 9;
+        /// `BUNDLE` step: it read back with another length or digest.
+        BUNDLE_STEP_DIFFERS = 10;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bundle_failure_names_its_step_and_errno() {
+        let raw = |step: u64, errno: u64| {
+            window::BUNDLE_FAILED
+                | step << window::BUNDLE_STEP_SHIFT
+                | errno << window::BUNDLE_ERRNO_SHIFT
+        };
+        let failure = |value| match BundleReport::from_raw(value) {
+            Some(BundleReport::Failed(failure)) => failure,
+            other => panic!("{value:#x}: {other:?}"),
+        };
+        let write = failure(raw(window::BUNDLE_STEP_WRITE, 28));
+        assert_eq!(
+            write,
+            BundleFailure {
+                step: BundleStep::Write,
+                errno: 28
+            }
+        );
+        assert_eq!(
+            alloc::format!("{write}"),
+            "writing the file failed with ENOSPC (28)"
+        );
+        let differs = failure(raw(window::BUNDLE_STEP_DIFFERS, 0));
+        assert_eq!(
+            alloc::format!("{differs}"),
+            "a file it wrote reads back unlike its own"
+        );
+        let odd = failure(raw(window::BUNDLE_STEP_LENGTH, 0x1234));
+        assert_eq!(
+            alloc::format!("{odd}"),
+            "setting the file's length failed with errno 4660"
+        );
+        for (value, step) in BundleStep::ALL {
+            assert_eq!(failure(raw(value, 5)).step, step);
+        }
+        // A failure names a known step; no other report has the fields.
+        for value in [
+            window::BUNDLE_FAILED,
+            raw(0, 5),
+            raw(11, 5),
+            raw(window::BUNDLE_STEP_WRITE, 5) | 1 << 32,
+            window::BUNDLE_CURRENT | window::BUNDLE_STEP_WRITE << window::BUNDLE_STEP_SHIFT,
+            window::BUNDLE_UPDATED | 5 << window::BUNDLE_ERRNO_SHIFT,
+            0,
+            5,
+        ] {
+            assert_eq!(BundleReport::from_raw(value), None, "{value:#x}");
+        }
+        assert_eq!(
+            BundleReport::from_raw(window::BUNDLE_UPDATED),
+            Some(BundleReport::Updated)
+        );
     }
 }

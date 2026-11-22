@@ -213,6 +213,14 @@ struct Case<'a> {
     regions: bool,
 }
 
+/// The offset of the lower-level synchronous vector in the vector table.
+const LOWER_SYNCHRONOUS: u64 = 0x400;
+/// Bytes of the vector table.
+const VECTORS_BYTES: u64 = 0x800;
+/// Marks an [`Outcome::pc`] in the machine's own vector table, an offset
+/// from it.
+const IN_VECTORS: u64 = 1 << 63;
+
 /// Run a case: `blocks` blocks at most in native runs that chain as far
 /// as the limit lets them, or with `single`, one block per native run. What
 /// each run's stop left, the native runs' transfers in all.
@@ -233,6 +241,7 @@ fn run(
     machine.cpu.pc = code.0;
     let (start, retired) = (machine.statistics.blocks, machine.cpu.retired);
     let vector = machine.host.lower_synchronous();
+    let vectors = vector - LOWER_SYNCHRONOUS;
     let mut outcomes = Vec::new();
     loop {
         let limit = match single {
@@ -240,13 +249,18 @@ fn run(
             false => start + blocks,
         };
         let stop = machine.run(limit);
-        // Each machine maps its own vector page: an abort stops at its
-        // vector, and the program's end at its own address.
+        // Each machine maps its own vector page, wherever the process's
+        // other mappings leave room: an abort stops at its vector, a run
+        // whose budget ran out as it took the exception stops in its table,
+        // each an offset from it, and the program's end at its own address.
         let (stop, pc) = match stop {
             Stop::Breakpoint(at) if at == vector => {
                 (Stop::Breakpoint(0), machine.cpu.pc.wrapping_sub(vector))
             }
             Stop::Breakpoint(at) => (Stop::Breakpoint(1), at.wrapping_sub(code.0)),
+            stop if machine.cpu.pc.wrapping_sub(vectors) < VECTORS_BYTES => {
+                (stop, IN_VECTORS | machine.cpu.pc.wrapping_sub(vectors))
+            }
             stop => (stop, machine.cpu.pc.wrapping_sub(code.0)),
         };
         let abort = (stop == Stop::Breakpoint(0)).then(|| {
@@ -292,6 +306,30 @@ fn run(
 
 #[test]
 fn chained_runs_stop_where_single_blocks_do_at_every_transfer() -> Result<()> {
+    chained_differential()
+}
+
+/// Two machines in one process, as a board's PEs are, run the differential
+/// at once and each agrees with single blocks: neither takes state of the
+/// other. Their mappings interleave, so a PC in a machine's vector table
+/// is an offset from it: an offset from the code named where the process
+/// had room for the table, and disagreed in about half the runs.
+#[test]
+fn two_machines_at_once_stop_where_single_blocks_do() -> Result<()> {
+    let runs: Vec<_> = (0..2)
+        .map(|_| std::thread::spawn(chained_differential))
+        .collect();
+    for run in runs {
+        run.join().expect("a differential's thread")?;
+    }
+    Ok(())
+}
+
+/// Each case's single-block reference and its chained runs, with another
+/// mapping made between them, as another machine of the process makes
+/// them: the chained runs' machines map their vector tables elsewhere than
+/// the reference's did.
+fn chained_differential() -> Result<()> {
     let data = Mapping::new()?;
     let code = Mapping::new()?;
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
@@ -322,6 +360,7 @@ fn chained_runs_stop_where_single_blocks_do_at_every_transfer() -> Result<()> {
                 )
             };
             let (single, _) = run(&code, &data, &case, MOST_BLOCKS as u64, true)?;
+            let _elsewhere = Mapping::new()?;
             for (index, expected) in single.iter().enumerate() {
                 let blocks = index + 1;
                 let (outcome, transfers) = run(&code, &data, &case, blocks as u64, false)?;

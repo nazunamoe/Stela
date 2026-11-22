@@ -104,6 +104,14 @@
     "reason": "host instruction trace of real blocks named by DENSITY_IN; run on request"
   },
   {
+    "package": "stela-engine",
+    "test": "real_regions_end_where_their_linked_blocks_do",
+    "source": "crates/stela-engine/tests/regions.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "runs sampled regions of the images REAL_IMAGES names against their linked blocks; run on request in a release build"
+  },
+  {
     "package": "stela-compiler",
     "test": "allocator_bound_census",
     "source": "crates/stela-compiler/src/x86_64/executed_paths.rs",

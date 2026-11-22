@@ -294,14 +294,24 @@ fn the_job_installs_only_on_the_kexts_staged_report() {
 }
 
 /// Builds `guest/stela-gpu/kext/tests/<name>.c` with the `clang` on PATH, a
-/// hosted program that needs none of the build's other LLVM tools.
+/// hosted program that needs none of the build's other LLVM tools, against
+/// the `stela/gate.h` the kext builds with.
 fn kext_test(name: &str, built: &Path) -> PathBuf {
     let clang = crate::tools::which("clang").expect("a clang on PATH for the kext's host tests");
     let source = crate::tools::root().join(format!("guest/stela-gpu/kext/tests/{name}.c"));
+    let include = built.join("include");
+    fs::create_dir_all(include.join("stela")).unwrap();
+    fs::write(
+        include.join("stela/gate.h"),
+        crate::guest::sdk::gate_header(),
+    )
+    .unwrap();
     let program = built.join(name);
     crate::tools::exec(
         Command::new(clang)
-            .args(["-std=c17", "-Wall", "-Wextra", "-Werror", "-o"])
+            .args(["-std=c17", "-Wall", "-Wextra", "-Werror", "-I"])
+            .arg(&include)
+            .arg("-o")
             .arg(&program)
             .arg(source),
     )
@@ -315,6 +325,7 @@ fn the_kext_c_code_passes_its_host_tests() {
     for name in [
         "app_policy",
         "compression_policy",
+        "file_rewrite",
         "host_record",
         "plugin_report",
     ] {

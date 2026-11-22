@@ -166,6 +166,24 @@ fn without_tbi_a_tagged_base_faults_and_teaches_nothing() {
     assert_eq!(machine.statistics.tagged_pages, 0);
 }
 
+/// A non-canonical base in RBP or RSP (lender hosts of a loop's locals)
+/// faults with #SS where any other base faults with #GP: the engine takes
+/// it as the same failed check, here a Data Abort with the guest's FAR,
+/// where it stopped the PE.
+#[test]
+fn a_stack_segment_fault_is_a_non_canonical_access() {
+    let mut machine = setup(false);
+    let (_, offset, _) = block_at_base(&mut machine);
+    let NativeExit::Fault(mut stack) = fault(offset, FaultCause::NonCanonical, 0) else {
+        unreachable!()
+    };
+    stack.trap = 12;
+    run(&mut machine, DATA | TAG, vec![NativeExit::Fault(stack)]);
+    let (esr, far) = taken(&machine);
+    assert_eq!(far, DATA | TAG);
+    assert_eq!(esr >> 26, 0x25, "a Data Abort at EL1");
+}
+
 /// A tagged address that does not translate faults with the same syndrome
 /// and tagged FAR from the tagged variant (whose host access ran stripped)
 /// as from the engine's own check of an unlearnt page.

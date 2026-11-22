@@ -6,6 +6,8 @@
  * The kernel exports vnode_open, vn_rdwr and vnode_lookup to kexts, but
  * nothing that creates, renames or removes a directory or a name: a kext can
  * create a file in an existing directory and rewrite one in place, no more.
+ * vnode_open also leaves O_TRUNC to the open syscall, so a rewrite sets the
+ * file's length through vnode_setattr (file_rewrite.h).
  * VNOP_MKDIR, VNOP_CREATE, VNOP_RENAME, VNOP_REMOVE and VNOP_SYMLINK are
  * XNU_KERNEL_PRIVATE in sys/vnode_if.h and absent from com.apple.kernel's
  * symbol table, which the auxiliary collection binds a kext's undefined
@@ -39,9 +41,13 @@ int stelaDigestFile(const char *path, vfs_context_t context, char *buffer,
 int stelaMatches(const char *path, const unsigned char sha256[SHA256_DIGEST_LENGTH], unsigned long length,
     vfs_context_t context, char *buffer, bool *same);
 
-/* Writes `length` bytes to `path` in place, creating it with `mode` if absent. */
+/*
+ * Makes `path` hold exactly `length` bytes, rewriting it in place or creating
+ * it with `mode`; a failure sets `step` to the gate's `BUNDLE_STEP_` value of
+ * the step that failed (file_rewrite.h).
+ */
 int stelaWriteFile(const char *path, const unsigned char *bytes, unsigned long length, unsigned mode,
-    vfs_context_t context);
+    vfs_context_t context, unsigned *step);
 
 /*
  * Reads all of `path` into `buffer` of `capacity` bytes, answering EFBIG

@@ -776,7 +776,9 @@ pub(crate) extern "sysv64" fn interrupt(frame: &mut Frame, saved: &SavedState<'_
                 host::pmu::fill_end();
             }
         }
-        13 | 6 => {
+        // A non-canonical address faults with #SS where RSP or RBP is the
+        // base, with #GP elsewhere.
+        12 | 13 | 6 => {
             if !host::pmu::fixup(frame) {
                 host::native_exception(frame, saved);
             }

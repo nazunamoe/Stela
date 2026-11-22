@@ -24,15 +24,16 @@ const GUARD: usize = 16 * PAGE;
 
 struct Region {
     address: u64,
+    guard: usize,
     readable: [Cell<bool>; PAGES],
 }
 impl Drop for Region {
     fn drop(&mut self) {
-        let reservation = (self.address - GUARD as u64) as *mut libc::c_void;
+        let reservation = (self.address - self.guard as u64) as *mut libc::c_void;
         // SAFETY: this owner reserved the complete OS mapping, guards
         // included, and all clones keeping its address have dropped before
         // this final Rc owner.
-        let unmapped = unsafe { libc::munmap(reservation, GUARD + BYTES + GUARD) };
+        let unmapped = unsafe { libc::munmap(reservation, self.guard + BYTES + self.guard) };
         assert_eq!(unmapped, 0);
     }
 }
@@ -72,12 +73,20 @@ impl Region {
 pub struct Mapping(pub u64, Rc<Region>);
 impl Mapping {
     pub fn new() -> Result<Self> {
+        Self::guarded(GUARD)
+    }
+
+    /// A mapping with `guard` inaccessible bytes on each side, a page
+    /// multiple: real code reaches PC-relative data far past [`GUARD`].
+    #[allow(dead_code, reason = "not every test that includes this host uses it")]
+    pub fn guarded(guard: usize) -> Result<Self> {
+        ensure!(guard.is_multiple_of(PAGE), "guard of whole pages");
         // SAFETY: a fresh private reservation, never a fixed-address
         // overwrite: inaccessible guards around the region's bytes.
         let reservation = unsafe {
             libc::mmap(
                 core::ptr::null_mut(),
-                GUARD + BYTES + GUARD,
+                guard + BYTES + guard,
                 libc::PROT_NONE,
                 libc::MAP_PRIVATE | libc::MAP_ANON,
                 -1,
@@ -89,20 +98,21 @@ impl Mapping {
             "reserve test RAM: {}",
             std::io::Error::last_os_error()
         );
-        let address = reservation as u64 + GUARD as u64;
+        let address = reservation as u64 + guard as u64;
         // SAFETY: the region's bytes inside the reservation just made.
         if unsafe { libc::mprotect(address as *mut _, BYTES, libc::PROT_READ | libc::PROT_WRITE) }
             != 0
         {
             let error = std::io::Error::last_os_error();
             // SAFETY: the reservation above, which nothing else refers to.
-            unsafe { libc::munmap(reservation, GUARD + BYTES + GUARD) };
+            unsafe { libc::munmap(reservation, guard + BYTES + guard) };
             anyhow::bail!("map test RAM: {error}");
         }
         let mapping = Self(
             address,
             Rc::new(Region {
                 address,
+                guard,
                 readable: std::array::from_fn(|_| Cell::new(true)),
             }),
         );

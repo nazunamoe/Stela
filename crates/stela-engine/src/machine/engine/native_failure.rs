@@ -220,7 +220,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     fault.error_code & !0b111 == 0
                         && !matches!(fault.cause, FaultCause::InvalidOpcode)
                 }
-                13 => fault.error_code == 0 && matches!(fault.cause, FaultCause::NonCanonical),
+                // #GP, or #SS where RSP or RBP is the base: a non-canonical
+                // address.
+                12 | 13 => fault.error_code == 0 && matches!(fault.cause, FaultCause::NonCanonical),
                 _ => false,
             },
             (NativeFaultOrigin::Exception, RecoverySiteKind::GuestCheck) => {

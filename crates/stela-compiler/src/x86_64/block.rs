@@ -1488,6 +1488,18 @@ fn emit_selected(
         }
         // The back edge, the terminal and their exits read the state.
         code.flush_vectors();
+        // A loop of the region whose last branch is the body's last row
+        // falls out of it into the terminal's row, which edges from before
+        // the loop reach too: its run ends here, as where any other loop
+        // falls out. A run over the whole region or a self-loop's goes on.
+        if inner_loop
+            && run
+                .as_ref()
+                .is_some_and(|(_, end)| *end <= instructions.len())
+        {
+            inner_loop = false;
+            loop_run = false;
+        }
         if loop_run {
             if let Some((active, _)) = run.as_mut() {
                 active.emitted(code, &instructions[run_emitted..]);

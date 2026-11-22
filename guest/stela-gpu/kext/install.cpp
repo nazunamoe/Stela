@@ -4,14 +4,21 @@
  * ever loads the plugin whose code this boot's trust cache lists.
  *
  * The kernel lets a kext open, create and write files but not create
- * directories. The kext rewrites a stale file in place, which keeps its
- * inode with its restricted flag and extended attributes, and creates a
+ * directories or rename. The kext rewrites a stale file in place, which keeps
+ * its inode with its restricted flag and extended attributes, and creates a
  * missing one; a plugin whose directories are absent it reports instead.
+ *
+ * A failed rewrite leaves a file that is neither the old plugin nor the new,
+ * which the boot then stops for, naming the step and errno. Keeping the old
+ * bytes would not let this boot go on, since its trust cache lists only the
+ * new plugin's code, and every later boot finds the file unlike its own and
+ * rewrites it whole, so nothing a failure leaves outlasts the next boot.
  */
 #include "StelaGPU.h"
 #include "app_delivery.h"
 #include "compression.h"
 #include "files.h"
+#include "install_report.h"
 
 #include <IOKit/IOLib.h>
 #include <kern/thread.h>
@@ -29,6 +36,18 @@ static const char kPlugin[] = "/System/Volumes/Data/Library/GPUBundles/StelaGPU.
 /* How often the installer looks for the Data volume, in milliseconds. */
 static const unsigned kMountPoll = 50;
 
+/* Logs a failure at `step` of `path` with `error` and answers its report. */
+static uint64_t
+failed(unsigned step, const char *path, int error)
+{
+	if (step == STELA_GATE_BUNDLE_STEP_DIFFERS) {
+		IOLog("StelaGPU: %s reads back unlike stela.efi's after it was written\n", path);
+	} else {
+		IOLog("StelaGPU: %s %s failed: %d\n", stela_bundle_step_name(step), path, error);
+	}
+	return stela_bundle_failure(step, error);
+}
+
 /* Installs each file that differs, answering the gate's BUNDLE report. */
 static uint64_t
 install(vfs_context_t context, char *buffer)
@@ -38,8 +57,7 @@ install(vfs_context_t context, char *buffer)
 		char path[256];
 		int written = snprintf(path, sizeof path, "%s%s", kPlugin, file.path);
 		if (written < 0 || size_t(written) >= sizeof path) {
-			IOLog("StelaGPU: the plugin path for %s is too long\n", file.path);
-			return STELA_GATE_BUNDLE_FAILED;
+			return failed(STELA_GATE_BUNDLE_STEP_PATH, file.path, ENAMETOOLONG);
 		}
 		bool same = false;
 		int error = stelaMatches(path, file.sha256, file.length, context, buffer, &same);
@@ -47,23 +65,23 @@ install(vfs_context_t context, char *buffer)
 			continue;
 		}
 		if (error && error != ENOENT) {
-			IOLog("StelaGPU: reading %s failed: %d\n", path, error);
-			return STELA_GATE_BUNDLE_FAILED;
+			return failed(STELA_GATE_BUNDLE_STEP_READ, path, error);
 		}
-		error = stelaWriteFile(path, file.bytes, file.length, file.mode, context);
-		if (error == ENOENT) {
+		unsigned step = 0;
+		error = stelaWriteFile(path, file.bytes, file.length, file.mode, context, &step);
+		if (error == ENOENT && step == STELA_GATE_BUNDLE_STEP_OPEN) {
 			IOLog("StelaGPU: %s cannot be created: its directory is absent\n", path);
 			return STELA_GATE_BUNDLE_MISSING;
 		}
-		if (!error) {
-			error = stelaMatches(path, file.sha256, file.length, context, buffer, &same);
-		}
-		if (!error && !same) {
-			error = EIO;
-		}
 		if (error) {
-			IOLog("StelaGPU: writing %s failed: %d\n", path, error);
-			return STELA_GATE_BUNDLE_FAILED;
+			return failed(step, path, error);
+		}
+		error = stelaMatches(path, file.sha256, file.length, context, buffer, &same);
+		if (error) {
+			return failed(STELA_GATE_BUNDLE_STEP_VERIFY, path, error);
+		}
+		if (!same) {
+			return failed(STELA_GATE_BUNDLE_STEP_DIFFERS, path, 0);
 		}
 		IOLog("StelaGPU: installed %s from stela.efi\n", path);
 		report = STELA_GATE_BUNDLE_UPDATED;
@@ -84,7 +102,7 @@ void
 StelaGPU::installPlugin(void *parameter, wait_result_t)
 {
 	auto gpu = static_cast<StelaGPU *>(parameter);
-	uint64_t report = STELA_GATE_BUNDLE_FAILED;
+	uint64_t report = stela_bundle_failure(STELA_GATE_BUNDLE_STEP_ALLOCATE, ENOMEM);
 	vfs_context_t context = vfs_context_create(nullptr);
 	auto buffer = static_cast<char *>(IOMallocData(kStelaChunk));
 	bool stopping = false;

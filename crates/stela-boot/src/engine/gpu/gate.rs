@@ -585,7 +585,7 @@ fn bundle(report: BundleReport) {
         BundleReport::Current => Report::Current,
         BundleReport::Updated => Report::Updated,
         BundleReport::Missing => Report::Missing,
-        BundleReport::Failed => Report::Failed,
+        BundleReport::Failed(_) => Report::Failed,
     });
     match (decided, report) {
         (Decision::Continue(_), BundleReport::Updated) => {
@@ -609,6 +609,10 @@ fn bundle(report: BundleReport) {
             super::super::service::request_restart();
         }
         (Decision::StopMissing { attempted }, _) => stop(&bundle_repair::missing(attempted)),
+        (Decision::StopFailed, BundleReport::Failed(failure)) => stop(&format!(
+            "the StelaGPU kext could not install StelaGPU.bundle: {failure}; \
+             its StelaGPU lines above name the file"
+        )),
         (Decision::StopFailed, _) => stop(
             "the StelaGPU kext could not install StelaGPU.bundle; its StelaGPU lines above say why",
         ),
