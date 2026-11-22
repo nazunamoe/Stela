@@ -394,7 +394,9 @@ impl Linux {
                 .expect("common source placement");
                 linux.captured.push(linux_capture::compile(
                     &captured_build,
-                    &Path::new(COMPAT).join("stela/registration.h"),
+                    // Spelled with `/` on every host: stela-driver-gpu's
+                    // reviewed profile names this header the same way.
+                    Path::new(&format!("{COMPAT}/stela/registration.h")),
                     *spec,
                     &placement,
                 ));
